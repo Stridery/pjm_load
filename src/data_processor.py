@@ -1,6 +1,7 @@
 # src/data_processor.py
 import pandas as pd
 import numpy as np
+import os
 from pandas.tseries.holiday import USFederalHolidayCalendar as calendar
 
 def merge_raw_data(load_path, weather_path, output_path):
@@ -15,6 +16,7 @@ def merge_raw_data(load_path, weather_path, output_path):
     df_weather = df_weather.set_index('time')
 
     df = df_load.join(df_weather, how='inner')
+    os.makedirs(output_path, exist_ok=True)
     df.to_csv(output_path)
     print(f"- Merged data saved to {output_path}. Shape: {df.shape}")
     return df
@@ -54,6 +56,7 @@ def clean_and_engineer(input_path, output_path):
     df['is_valid'] = (df['z_score'].abs() <= 3.0).astype(int)
     
     df = df.drop(columns=['group_mean', 'group_std', 'z_score'])
+    os.makedirs(output_path, exist_ok=True)
     df.to_csv(output_path)
     print(f"- Cleaned data saved to {output_path}. Outliers tagged.")
     return df

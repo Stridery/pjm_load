@@ -6,9 +6,7 @@ from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 import joblib
 
-# ==========================================
-# 1. 2D 矩阵构建 (专供 XGBoost / LightGBM)
-# ==========================================
+
 def build_or_load_matrix(cleaned_path, matrix_dir):
     """生成 2D CSV 矩阵，特征是打平的 (Flattened)"""
     x_path = os.path.join(matrix_dir, 'X_opt.csv')
@@ -55,20 +53,15 @@ def build_or_load_matrix(cleaned_path, matrix_dir):
     X_opt.to_csv(x_path); y_opt.to_csv(y_path)
     return X_opt, y_opt
 
-# ==========================================
-# 2. 3D 矩阵构建 (专供 TimeSeries Transformer)
-# ==========================================
+
 def build_timeseries_matrix(cleaned_path, matrix_dir, seq_len=72, pred_len=24):
-    """
-    生成 3D NumPy 矩阵 [Batch, Seq, Feature]
-    严格遵循 9 AM 截断逻辑：用今天 9 AM 之前的数据，预测明天全天 (24h)
-    """
     x_path = os.path.join(matrix_dir, f'X_3d_9am_seq{seq_len}.npy')
     y_path = os.path.join(matrix_dir, f'y_3d_9am_seq{seq_len}.npy')
     mask_path = os.path.join(matrix_dir, f'mask_3d_9am_seq{seq_len}.npy')
     scaler_path = os.path.join(matrix_dir, 'scaler_ts.pkl')
 
     timestamp_path = os.path.join(matrix_dir, f'timestamps_3d_9am_seq{seq_len}.npy')
+    os.makedirs(matrix_dir, exist_ok=True)
 
     if all(os.path.exists(p) for p in [x_path, y_path, mask_path, timestamp_path]):
         print(f"=== Loading 9 AM Cutoff Matrix (Seq={seq_len}) ===")
@@ -107,22 +100,19 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, seq_len=72, pred_len=24):
     is_valid_array = df['is_valid'].values 
     timestamps = df.index
 
-    # 2. 核心循环：寻找每天 9:00 AM
-    # 我们需要留够 15h (Gap) + 24h (Target) = 39 小时的尾部空间
+
     for i in tqdm(range(seq_len, len(df) - 39), desc="9AM Anchoring"):
-        # 🌟 只有在当天 9:00 AM 这一刻才生成样本
+
         if timestamps[i].hour != 9:
             continue
             
-        # X: 截至今天 9 AM 的前 seq_len 小时 [i-72 : i]
+
         X_window = data_array[i - seq_len : i]
         
-        # y: 明天 00:00 - 23:00 的 24 小时
-        # i+1 到 i+15 是今天剩下的时间 (15h)，所以 y 从 i+15 开始
+
         y_window = load_array[i + 15 : i + 39]
         
-        # Mask: 检查整段 111 小时 (72 + 15 + 24) 的有效性
-        # 只要这段时间内有一个 Outlier，这整天就标记为 False (训练时剔除)
+
         is_seq_valid = is_valid_array[i - seq_len : i + 39].all()
         
         X_list.append(X_window)
@@ -135,7 +125,7 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, seq_len=72, pred_len=24):
     mask_3d = np.array(valid_mask_list, dtype=bool)
     timestamps_3d = np.array(timestamps_list)
     
-    # 存储
+
     np.save(x_path, X_3d)
     np.save(y_path, y_3d)
     np.save(mask_path, mask_3d)
@@ -149,11 +139,11 @@ def get_train_test_split(X_opt, y_opt):
     X_train_raw, X_test_raw = X_opt.iloc[:split_idx], X_opt.iloc[split_idx:]
     y_train_raw, y_test = y_opt.iloc[:split_idx], y_opt.iloc[split_idx:]
 
-    # Train exclusively on valid days
+
     train_mask = X_train_raw['is_target_valid'] == 1
     X_train = X_train_raw[train_mask].drop(columns=['is_target_valid'])
     y_train = y_train_raw[train_mask]
     
-    # Test on all days
+
     X_test = X_test_raw.drop(columns=['is_target_valid'])
     return X_train, y_train, X_test, y_test
