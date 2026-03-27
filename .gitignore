@@ -1,0 +1,19 @@
+# Python 虚拟环境
+.venv/
+__pycache__/
+
+# 数据文件 (绝对不能传)
+*.csv
+*.npy
+*.pkl
+data/
+
+# 模型权重和结果
+models/*.pth
+models/*.pkl
+results/
+
+# 日志文件
+logs/
+*.out
+*.err
