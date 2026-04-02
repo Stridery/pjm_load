@@ -39,26 +39,11 @@ LGBM_PARAMS = {
 }
 
 TRANSFORMER_PARAMS = {
-    # --- Architecture Parameters ---
-    'd_model': 32,           
-    'nhead': 4,             
-    'num_layers': 2,         
-    'dropout': 0.3,          
-    'out_dim': 24,         
-    
-    # --- Training Parameters ---
-    'epochs': 100,           
-    'batch_size': 128,        
-    'learning_rate': 5e-4,  
-    'weight_decay': 1e-3    
-}
-
-TRANSFORMER_PARAMS = {
     'd_model': 64,
     'nhead': 4,
     'num_layers': 2,         
     'dropout': 0.5,
-    'seq_len': 72,           
+    'seq_len': 168,           
     'out_dim': 24,           
     'epochs': 200,
     'batch_size': 32,      
