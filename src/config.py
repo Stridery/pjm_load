@@ -7,6 +7,23 @@ MERGED_PATH = 'data/joined/merged_pjm_load_weather.csv'
 CLEANED_PATH = 'data/cleaned/cleaned_pjm_load_weather.csv'
 MATRIX_DIR = 'data/matrix/'
 
+# --- Models to Train (1 = train, 0 = skip) ---
+TRAIN_CONFIG = {
+    'xgboost':     1,
+    'lightgbm':    0,
+    'transformer': 0,
+}
+
+# --- Tree Model Feature Generation ---
+TREE_FEATURE_CONFIG = {
+    'lookback_hours': 168,      # number of past hours used as features (e.g. 168 = 7 days)
+    'latest_info_hour': 0,      # cutoff hour for available data when making the forecast:
+                                #   <= 9 → today at that hour (e.g. 0 = midnight, 9 = 9am)
+                                #   > 9  → previous day at that hour (e.g. 18 = yesterday 6pm)
+    'split_strategy': 'tail',   # 'random' | 'head' | 'tail'
+    'test_frac': 0.1,
+}
+
 # --- Best Model Hyperparameters ---
 XGB_PARAMS = {
     'n_estimators': 1000,
@@ -38,15 +55,26 @@ LGBM_PARAMS = {
     'n_jobs': -1
 }
 
+# --- Transformer Feature Generation ---
+TRANSFORMER_FEATURE_CONFIG = {
+    'lookback_hours': 168,      # number of past hours used as input sequence (formerly seq_len)
+    'latest_info_hour': 0,      # cutoff hour for available data when making the forecast:
+                                #   <= 9 → today at that hour (e.g. 0 = midnight, 9 = 9am)
+                                #   > 9  → previous day at that hour (e.g. 18 = yesterday 6pm)
+    'split_strategy': 'tail',   # 'random' | 'head' | 'tail'
+    'test_frac': 0.1,
+    'val_strategy': 'random',     # 'random' | 'head' | 'tail' — how to split val from train pool
+    'val_frac': 0.1,            # fraction of train pool used as validation
+}
+
 TRANSFORMER_PARAMS = {
     'd_model': 64,
     'nhead': 4,
-    'num_layers': 2,         
+    'num_layers': 2,
     'dropout': 0.5,
-    'seq_len': 168,           
-    'out_dim': 24,           
+    'out_dim': 24,
     'epochs': 200,
-    'batch_size': 32,      
+    'batch_size': 32,
     'learning_rate': 3e-4,
     'weight_decay': 0.1
 }

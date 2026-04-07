@@ -9,8 +9,7 @@ __pycache__/
 data/
 
 # 模型权重和结果
-models/*.pth
-models/*.pkl
+models/
 results/
 
 # 日志文件

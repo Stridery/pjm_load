@@ -1,6 +1,7 @@
 # src/model_trainer.py
 import numpy as np
-from src.feature_engine import random_split_indices
+from src.feature_engine import _split_indices
+from src.config import TRANSFORMER_FEATURE_CONFIG, TREE_FEATURE_CONFIG
 import xgboost as xgb
 import lightgbm as lgb
 from tqdm import tqdm
@@ -14,6 +15,17 @@ import math
 import os
 import joblib
 import matplotlib.pyplot as plt
+
+
+def _make_run_dir(base, model_type, cfg):
+    """根据 config 参数生成并创建实验子目录。"""
+    tag = f"{cfg['split_strategy']}_test{cfg['test_frac']}"
+    if 'val_strategy' in cfg:
+        tag += f"_{cfg['val_strategy']}_val{cfg['val_frac']}"
+    path = os.path.join(base, model_type, tag)
+    os.makedirs(path, exist_ok=True)
+    return path
+
 
 class PowerForecaster:
     def __init__(self, X_train, y_train, X_test, y_test):
@@ -29,7 +41,7 @@ class PowerForecaster:
         self.lgb_preds = None
         self.transformer_preds = None
 
-    def _plot_error_distributions(self, model_name, hourly_mape, dow_mape, dom_mape):
+    def _plot_error_distributions(self, model_name, hourly_mape, dow_mape, dom_mape, run_dir):
         plt.figure(figsize=(15, 12))
         
         # ----------------------------------------
@@ -71,15 +83,13 @@ class PowerForecaster:
 
         plt.tight_layout()
 
-        save_dir = "results/"
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f'{model_name}_error_dashboard.png')
+        save_path = os.path.join(run_dir, f'{model_name}_error_dashboard.png')
 
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"Error distribution plots saved to: {save_path}")
 
-    def _plot_best_worst_days(self, model_name, detailed_df, daily_mape):
+    def _plot_best_worst_days(self, model_name, detailed_df, daily_mape, run_dir):
         worst_days = list(daily_mape.head(3).index)
         best_days = list(daily_mape.tail(3).index[::-1])
         hours = range(24)
@@ -108,12 +118,12 @@ class PowerForecaster:
             ax.legend(); ax.grid(linestyle='--', alpha=0.6)
 
         plt.tight_layout()
-        save_path = os.path.join('results', f'{model_name}_best_worst_days.png')
+        save_path = os.path.join(run_dir, f'{model_name}_best_worst_days.png')
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"Best/worst day plots saved to: {save_path}")
 
-    def _evaluate_and_save(self, model_name, y_true_df, y_pred_np):
+    def _evaluate_and_save(self, model_name, y_true_df, y_pred_np, run_dir):
         print(f"\n====== {model_name} Error Analysis ======")
         
 
@@ -123,20 +133,11 @@ class PowerForecaster:
         print(f"Global -> MAPE: {mape*100:.2f}% | MAE: {mae:.2f} | RMSE: {rmse:.2f}")
 
 
-        print(f"\n[1] Hourly MAPE (%):")
-        hourly_mape = []
-        for h in range(24):
-            h_mape = mean_absolute_percentage_error(y_true_df.iloc[:, h], y_pred_np[:, h])
-            hourly_mape.append(h_mape * 100)
-            
+        hourly_mape = [mean_absolute_percentage_error(y_true_df.iloc[:, h], y_pred_np[:, h]) * 100
+                       for h in range(24)]
 
-        for h in range(0, 24, 8):
-            formatted = ", ".join([f"h{i:02d}: {hourly_mape[i]:.2f}" for i in range(h, min(h+8, 24))])
-            print(f"  {formatted}")
-
-
-        dates = pd.to_datetime(y_true_df.index).repeat(24) 
-        hours = np.tile(np.arange(24), len(y_true_df)) 
+        dates = pd.to_datetime(y_true_df.index).repeat(24)
+        hours = np.tile(np.arange(24), len(y_true_df))
         datetimes = dates + pd.to_timedelta(hours, unit='h')
 
         detailed_df = pd.DataFrame({
@@ -144,69 +145,28 @@ class PowerForecaster:
             'true_load': y_true_df.values.flatten(),
             f'{model_name}_pred': y_pred_np.flatten()
         })
-        
-
         detailed_df['datetime'] = pd.to_datetime(detailed_df['datetime'])
-        
         detailed_df['abs_error'] = np.abs(detailed_df['true_load'] - detailed_df[f'{model_name}_pred'])
         detailed_df['mape_pct'] = (detailed_df['abs_error'] / detailed_df['true_load']) * 100
+        detailed_df['day_of_week'] = detailed_df['datetime'].dt.dayofweek
+        detailed_df['day_of_month'] = detailed_df['datetime'].dt.day
+        detailed_df['date'] = detailed_df['datetime'].dt.date
 
-
-        detailed_df['day_of_week'] = detailed_df['datetime'].dt.dayofweek  
-        detailed_df['day_of_month'] = detailed_df['datetime'].dt.day       
-        detailed_df['date'] = detailed_df['datetime'].dt.date             
-
-
-        print(f"\n[2] Day of Week MAPE (%)  *0=Mon, 6=Sun* :")
         dow_mape = detailed_df.groupby('day_of_week')['mape_pct'].mean()
-        dow_formatted = ", ".join([f"Day {dow}: {mape:.2f}" for dow, mape in dow_mape.items()])
-        print(f"  {dow_formatted}")
-
-
-        print(f"\n[3] Day of Month MAPE (%)  *1st to 31st* :")
         dom_mape = detailed_df.groupby('day_of_month')['mape_pct'].mean()
-        dom_items = list(dom_mape.items())
-        for i in range(0, len(dom_items), 10):
-            dom_formatted = ", ".join([f"{d:02d}th: {mape:.2f}" for d, mape in dom_items[i:i+10]])
-            print(f"  {dom_formatted}")
 
 
-        print(f"\n[4] Top 3 Worst Performing Days (Detailed Hourly Logs):")
         daily_mape = detailed_df.groupby('date')['mape_pct'].mean().sort_values(ascending=False)
-        worst_days = daily_mape.head(3).index
 
-        for i, w_date in enumerate(worst_days):
-            w_mape = daily_mape.loc[w_date]
-            print(f"  No.{i+1} Worst Day: {w_date} (Daily Avg MAPE: {w_mape:.2f}%)")
-            print(f"    {'Time':<20} | {'True Load':<10} | {'Predicted':<10} | {'MAPE(%)':<8}")
-            print(f"    {'-'*60}")
-            day_data = detailed_df[detailed_df['date'] == w_date]
-            for _, row in day_data.iterrows():
-                print(f"    {row['datetime'].strftime('%Y-%m-%d %H:%00'):<20} | {row['true_load']:<10.2f} | {row[f'{model_name}_pred']:<10.2f} | {row['mape_pct']:<8.2f}")
-            print("")
-
-        print(f"\n[5] Top 3 Best Performing Days (Detailed Hourly Logs):")
-        best_days = daily_mape.tail(3).index[::-1]
-        for i, b_date in enumerate(best_days):
-            b_mape = daily_mape.loc[b_date]
-            print(f"  No.{i+1} Best Day: {b_date} (Daily Avg MAPE: {b_mape:.2f}%)")
-            print(f"    {'Time':<20} | {'True Load':<10} | {'Predicted':<10} | {'MAPE(%)':<8}")
-            print(f"    {'-'*60}")
-            day_data = detailed_df[detailed_df['date'] == b_date]
-            for _, row in day_data.iterrows():
-                print(f"    {row['datetime'].strftime('%Y-%m-%d %H:%00'):<20} | {row['true_load']:<10.2f} | {row[f'{model_name}_pred']:<10.2f} | {row['mape_pct']:<8.2f}")
-            print("")
-
-        os.makedirs('results', exist_ok=True)
-        save_path = f'results/{model_name}_detailed_errors.csv'
+        save_path = os.path.join(run_dir, f'{model_name}_detailed_errors.csv')
         detailed_df.drop(columns=['date']).to_csv(save_path, index=False)
 
-        self._plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape)
-        self._plot_best_worst_days(model_name, detailed_df, daily_mape)
+        self._plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, run_dir)
+        self._plot_best_worst_days(model_name, detailed_df, daily_mape, run_dir)
         print(f"Detailed predictions and errors saved to: {save_path}\n")
 
 
-    def _evaluate_and_save_3d(self, model_name, y_true_np, y_pred_np, test_timestamps):
+    def _evaluate_and_save_3d(self, model_name, y_true_np, y_pred_np, test_timestamps, run_dir):
         print(f"\n====== {model_name} Error Analysis ======")
         
 
@@ -216,16 +176,8 @@ class PowerForecaster:
         print(f"Global -> MAPE: {mape*100:.2f}% | MAE: {mae:.2f} | RMSE: {rmse:.2f}")
 
 
-        print(f"\n[1] Hourly MAPE (%):")
-        hourly_mape = []
-        for h in range(24):
-            h_mape = mean_absolute_percentage_error(y_true_np[:, h], y_pred_np[:, h])
-            hourly_mape.append(h_mape * 100)
-            
-        for h in range(0, 24, 8):
-            formatted = ", ".join([f"h{i:02d}: {hourly_mape[i]:.2f}" for i in range(h, min(h+8, 24))])
-            print(f"  {formatted}")
-
+        hourly_mape = [mean_absolute_percentage_error(y_true_np[:, h], y_pred_np[:, h]) * 100
+                       for h in range(24)]
 
         dates = pd.to_datetime(test_timestamps).repeat(24)
         hours = np.tile(np.arange(24), len(test_timestamps))
@@ -236,69 +188,31 @@ class PowerForecaster:
             'true_load': y_true_np.flatten(),
             f'{model_name}_pred': y_pred_np.flatten()
         })
-        
-
         detailed_df['datetime'] = pd.to_datetime(detailed_df['datetime'])
-        
         detailed_df['abs_error'] = np.abs(detailed_df['true_load'] - detailed_df[f'{model_name}_pred'])
         detailed_df['mape_pct'] = (detailed_df['abs_error'] / detailed_df['true_load']) * 100
+        detailed_df['day_of_week'] = detailed_df['datetime'].dt.dayofweek
+        detailed_df['day_of_month'] = detailed_df['datetime'].dt.day
+        detailed_df['date'] = detailed_df['datetime'].dt.date
 
-
-        detailed_df['day_of_week'] = detailed_df['datetime'].dt.dayofweek  
-        detailed_df['day_of_month'] = detailed_df['datetime'].dt.day       
-        detailed_df['date'] = detailed_df['datetime'].dt.date              
-
-
-        print(f"\n[2] Day of Week MAPE (%)  *0=Mon, 6=Sun* :")
         dow_mape = detailed_df.groupby('day_of_week')['mape_pct'].mean()
-        dow_formatted = ", ".join([f"Day {dow}: {mape:.2f}" for dow, mape in dow_mape.items()])
-        print(f"  {dow_formatted}")
-
-
-        print(f"\n[3] Day of Month MAPE (%)  *1st to 31st* :")
         dom_mape = detailed_df.groupby('day_of_month')['mape_pct'].mean()
-        dom_items = list(dom_mape.items())
-        for i in range(0, len(dom_items), 10):
-            dom_formatted = ", ".join([f"{d:02d}th: {mape:.2f}" for d, mape in dom_items[i:i+10]])
-            print(f"  {dom_formatted}")
 
 
-        print(f"\n[4] Top 3 Worst Performing Days (Detailed Hourly Logs):")
         daily_mape = detailed_df.groupby('date')['mape_pct'].mean().sort_values(ascending=False)
-        worst_days = daily_mape.head(3).index
 
-        for i, w_date in enumerate(worst_days):
-            w_mape = daily_mape.loc[w_date]
-            print(f"  No.{i+1} Worst Day: {w_date} (Daily Avg MAPE: {w_mape:.2f}%)")
-            print(f"    {'Time':<20} | {'True Load':<10} | {'Predicted':<10} | {'MAPE(%)':<8}")
-            print(f"    {'-'*60}")
-            day_data = detailed_df[detailed_df['date'] == w_date]
-            for _, row in day_data.iterrows():
-                print(f"    {row['datetime'].strftime('%Y-%m-%d %H:%00'):<20} | {row['true_load']:<10.2f} | {row[f'{model_name}_pred']:<10.2f} | {row['mape_pct']:<8.2f}")
-            print("")
-
-        print(f"\n[5] Top 3 Best Performing Days (Detailed Hourly Logs):")
-        best_days = daily_mape.tail(3).index[::-1]
-        for i, b_date in enumerate(best_days):
-            b_mape = daily_mape.loc[b_date]
-            print(f"  No.{i+1} Best Day: {b_date} (Daily Avg MAPE: {b_mape:.2f}%)")
-            print(f"    {'Time':<20} | {'True Load':<10} | {'Predicted':<10} | {'MAPE(%)':<8}")
-            print(f"    {'-'*60}")
-            day_data = detailed_df[detailed_df['date'] == b_date]
-            for _, row in day_data.iterrows():
-                print(f"    {row['datetime'].strftime('%Y-%m-%d %H:%00'):<20} | {row['true_load']:<10.2f} | {row[f'{model_name}_pred']:<10.2f} | {row['mape_pct']:<8.2f}")
-            print("")
-
-        os.makedirs('results', exist_ok=True)
-        save_path = f'results/{model_name}_detailed_errors.csv'
+        save_path = os.path.join(run_dir, f'{model_name}_detailed_errors.csv')
         detailed_df.drop(columns=['date']).to_csv(save_path, index=False)
 
-        self._plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape)
-        self._plot_best_worst_days(model_name, detailed_df, daily_mape)
+        self._plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, run_dir)
+        self._plot_best_worst_days(model_name, detailed_df, daily_mape, run_dir)
         print(f"Detailed predictions and errors saved to: {save_path}\n")
 
     def train_xgboost(self, params):
         print("\n--- Training XGBoost Experts ---")
+        model_dir  = _make_run_dir('models',  'xgboost', TREE_FEATURE_CONFIG)
+        result_dir = _make_run_dir('results', 'xgboost', TREE_FEATURE_CONFIG)
+
         use_gpu = torch.cuda.is_available()
         xgb_params = {**params, 'device': 'cuda'} if use_gpu else params
         print(f"XGBoost device: {'cuda' if use_gpu else 'cpu'}")
@@ -307,20 +221,22 @@ class PowerForecaster:
             model = xgb.XGBRegressor(**xgb_params)
             model.fit(self.X_train, self.y_train[f'h{h}'])
             self.xgb_models.append(model)
-        
-        joblib.dump(self.xgb_models, 'models/xgboost_24_models.pkl')
-        
+
+        joblib.dump(self.xgb_models, os.path.join(model_dir, 'xgboost_24_models.pkl'))
+
         self.xgb_preds = np.array([m.predict(self.X_test) for m in self.xgb_models]).T
         mape = mean_absolute_percentage_error(self.y_test, self.xgb_preds)
         print(f"XGBoost MAPE: {mape*100:.2f}%")
-        self._evaluate_and_save("XGBoost", self.y_test, self.xgb_preds)
+        self._evaluate_and_save("XGBoost", self.y_test, self.xgb_preds, result_dir)
         return self.xgb_preds
 
     def train_lightgbm(self, params):
         print("\n--- Training LightGBM Experts ---")
-        use_gpu = torch.cuda.is_available()
-        lgb_params = {**params, 'device': 'gpu'} if use_gpu else params
-        print(f"LightGBM device: {'gpu' if use_gpu else 'cpu'}")
+        model_dir  = _make_run_dir('models',  'lightgbm', TREE_FEATURE_CONFIG)
+        result_dir = _make_run_dir('results', 'lightgbm', TREE_FEATURE_CONFIG)
+
+        print(f"LightGBM device: cpu (LightGBM GPU requires custom build, using CPU)")
+        lgb_params = params
         self.lgb_models = []
         cat_features = ['today_dayofweek', 'tmrw_is_weekend']
 
@@ -329,56 +245,59 @@ class PowerForecaster:
             model.fit(self.X_train, self.y_train[f'h{h}'], categorical_feature=cat_features)
             self.lgb_models.append(model)
 
-        joblib.dump(self.lgb_models, 'models/lightgbm_24_models.pkl')
-            
+        joblib.dump(self.lgb_models, os.path.join(model_dir, 'lightgbm_24_models.pkl'))
+
         self.lgb_preds = np.array([m.predict(self.X_test) for m in self.lgb_models]).T
         mape = mean_absolute_percentage_error(self.y_test, self.lgb_preds)
         print(f"LightGBM MAPE: {mape*100:.2f}%")
-        self._evaluate_and_save("LightGBM", self.y_test, self.lgb_preds)
+        self._evaluate_and_save("LightGBM", self.y_test, self.lgb_preds, result_dir)
         return self.lgb_preds
     
 
     def train_transformer_3d(self, X_3d, y_3d, mask_3d, timestamps_3d, scaler_ts, params):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"\GPU Acceleration: {device}")
+        print(f"\nGPU Acceleration: {device}")
+        model_dir  = _make_run_dir('models',  'transformer', TRANSFORMER_FEATURE_CONFIG)
+        result_dir = _make_run_dir('results', 'transformer', TRANSFORMER_FEATURE_CONFIG)
 
+        random_state  = params.get('random_state', 42)
+        strategy      = TRANSFORMER_FEATURE_CONFIG['split_strategy']
+        test_frac     = TRANSFORMER_FEATURE_CONFIG['test_frac']
+        val_strategy  = TRANSFORMER_FEATURE_CONFIG['val_strategy']
+        val_frac      = TRANSFORMER_FEATURE_CONFIG['val_frac']
 
-        random_state = params.get('random_state', 42)
-        train_idx, test_idx = random_split_indices(len(X_3d), test_frac=0.1, random_state=random_state)
-        val_size = int(len(train_idx) * 0.1)
-        val_idx, train_idx = train_idx[:val_size], train_idx[val_size:]
+        # 第一步：切 test
+        train_pool_idx, test_idx = _split_indices(len(X_3d), strategy, test_frac, random_state)
+
+        # 第二步：在 train pool 内切 val
+        rel_train_idx, rel_val_idx = _split_indices(len(train_pool_idx), val_strategy, val_frac, random_state)
+        train_idx = train_pool_idx[rel_train_idx]
+        val_idx   = train_pool_idx[rel_val_idx]
 
         test_timestamps = timestamps_3d[test_idx]
+        X_te       = torch.FloatTensor(X_3d[test_idx])
+        y_te_scaled = y_3d[test_idx]
 
-        X_tr_raw = X_3d[train_idx]
-        y_tr_raw = y_3d[train_idx]
-        mask_tr = mask_3d[train_idx]
-
-        X_tr_filtered = X_tr_raw[mask_tr]
-        y_tr_filtered = y_tr_raw[mask_tr]
-        print(f"Training Set Denoising: Reduced from {len(X_tr_raw)} to {len(X_tr_filtered)} samples")
-
-        X_tr = torch.FloatTensor(X_tr_filtered)
-        y_tr = torch.FloatTensor(y_tr_filtered)
+        # 训练集过滤无效样本
+        train_mask = mask_3d[train_idx]
+        X_tr = torch.FloatTensor(X_3d[train_idx][train_mask])
+        y_tr = torch.FloatTensor(y_3d[train_idx][train_mask])
+        print(f"Train after denoising: {len(X_tr)} samples | Val: {len(val_idx)} | Test: {len(test_idx)}")
 
         X_val = torch.FloatTensor(X_3d[val_idx])
         y_val = torch.FloatTensor(y_3d[val_idx])
 
-        X_te = torch.FloatTensor(X_3d[test_idx])
-        y_te_scaled = y_3d[test_idx]  # shape: [N_test, 24]
-
         loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=params['batch_size'], shuffle=True)
-        
-
         model = TimeSeriesTransformer3D(num_features=X_3d.shape[2], params=params).to(device)
         criterion = nn.L1Loss()
         optimizer = optim.AdamW(model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'])
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
+        save_path = os.path.join(model_dir, 'transformer_best.pth')
 
         best_val_loss = float('inf')
-        early_stop_patience = 15  
+        early_stop_patience = 15
         epochs_no_improve = 0
         for epoch in range(params['epochs']):
             model.train()
@@ -386,70 +305,57 @@ class PowerForecaster:
             for bx, by in loader:
                 bx, by = bx.to(device), by.to(device)
                 optimizer.zero_grad()
-                
-
-                out = model(bx) 
-                loss = criterion(out, by) 
-                
+                loss = criterion(model(bx), by)
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
-            
+
             model.eval()
             with torch.no_grad():
-                v_out = model(X_val.to(device)) # 同样去掉 squeeze
-                v_loss = criterion(v_out, y_val.to(device)).item()
-            
+                v_loss = criterion(model(X_val.to(device)), y_val.to(device)).item()
             scheduler.step(v_loss)
 
             if v_loss < best_val_loss:
                 best_val_loss = v_loss
-                model_save_path = os.path.join('models', 'transformer_9am_full_features.pth')
-                os.makedirs('models/', exist_ok=True)
-                torch.save(model.state_dict(), model_save_path)
-                epochs_no_improve = 0  
+                torch.save(model.state_dict(), save_path)
+                epochs_no_improve = 0
             else:
-                epochs_no_improve += 1 
+                epochs_no_improve += 1
 
-            if (epoch+1) % 5 == 0:
+            if (epoch + 1) % 5 == 0:
                 print(f"Epoch {epoch+1:03d} | Train: {train_loss/len(loader):.4f} | Val: {v_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
-            
 
             if epochs_no_improve >= early_stop_patience:
-                print(f"\nEarly stopping triggered at Epoch {epoch+1}! Validation loss hasn't improved for {early_stop_patience} epochs.")
+                print(f"\nEarly stopping at Epoch {epoch+1}")
                 break
 
-
-        model.load_state_dict(torch.load('models/transformer_9am_full_features.pth'))
+        model.load_state_dict(torch.load(save_path))
         model.eval()
         with torch.no_grad():
-            # preds_scaled shape: [N_test, 24]
             preds_scaled = model(X_te.to(device)).cpu().numpy()
-        
 
         num_features = X_3d.shape[2]
         def inverse_transform_load_2d(scaled_data_2d):
             N, P = scaled_data_2d.shape
-            flat_data = scaled_data_2d.flatten() # 展平成 1D 数组 [N * 24]
+            flat_data = scaled_data_2d.flatten()
             dummy = np.zeros((len(flat_data), num_features))
-            dummy[:, 0] = flat_data # 放入 Load 列
+            dummy[:, 0] = flat_data
             inv_flat = scaler_ts.inverse_transform(dummy)[:, 0]
-            return inv_flat.reshape(N, P) # 重新变回 [N, 24]
+            return inv_flat.reshape(N, P)
 
         all_preds_mw = inverse_transform_load_2d(preds_scaled)
-        all_true_mw = inverse_transform_load_2d(y_te_scaled)
-        
+        all_true_mw  = inverse_transform_load_2d(y_te_scaled)
 
         mape = mean_absolute_percentage_error(all_true_mw.flatten(), all_preds_mw.flatten())
-        mae = mean_absolute_error(all_true_mw.flatten(), all_preds_mw.flatten())
+        mae  = mean_absolute_error(all_true_mw.flatten(), all_preds_mw.flatten())
         rmse = np.sqrt(mean_squared_error(all_true_mw.flatten(), all_preds_mw.flatten()))
-        
+
         self.transformer_preds = all_preds_mw
-        self._evaluate_and_save_3d("Transformer", all_true_mw, all_preds_mw, test_timestamps)
+        self._evaluate_and_save_3d("Transformer", all_true_mw, all_preds_mw, test_timestamps, result_dir)
         print(f"\nMAPE: {mape*100:.2f}%")
         print(f"MAE : {mae:.2f}")
         print(f"RMSE: {rmse:.2f}")
-        
+
         return self.transformer_preds
     
 
@@ -489,7 +395,7 @@ class TimeSeriesTransformer3D(nn.Module):
 
         self.fc_out = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(params['seq_len'] * d_model, 128),
+            nn.Linear(TRANSFORMER_FEATURE_CONFIG['lookback_hours'] * d_model, 128),
             nn.ReLU(),
             nn.Dropout(params['dropout']),
             nn.Linear(128, params['out_dim'])
