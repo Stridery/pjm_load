@@ -261,7 +261,7 @@ class PowerForecaster:
         model_dir  = _make_run_dir('models',  'transformer', TRANSFORMER_FEATURE_CONFIG)
         result_dir = _make_run_dir('results', 'transformer', TRANSFORMER_FEATURE_CONFIG)
 
-        random_state  = params.get('random_state', 42)
+        random_state  = TRANSFORMER_FEATURE_CONFIG['random_state']
         strategy      = TRANSFORMER_FEATURE_CONFIG['split_strategy']
         test_frac     = TRANSFORMER_FEATURE_CONFIG['test_frac']
         val_strategy  = TRANSFORMER_FEATURE_CONFIG['val_strategy']

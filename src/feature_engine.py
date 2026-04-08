@@ -57,7 +57,7 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
 
         past_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]  # (lookback_hours, n_features)
 
-        f = {'timestamp': today}
+        f = {'timestamp': tomorrow}
         for k in range(lookback_hours):
             f[f'load_h{k}'] = past_window[k, 0]
         for j, col in enumerate(weather_cols):
@@ -75,7 +75,7 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
             'is_target_valid': tmrw_valid
         })
 
-        y_dict = {'timestamp': today}
+        y_dict = {'timestamp': tomorrow}
         for h in range(24): y_dict[f'h{h}'] = y_tomorrow[h]
         X_list.append(f); y_list.append(y_dict)
 
@@ -193,11 +193,13 @@ def _split_indices(n, strategy, test_frac, random_state=42):
     return train_pos, test_pos
 
 
-def get_train_test_split(X_opt, y_opt, strategy=None, test_frac=None, random_state=42):
+def get_train_test_split(X_opt, y_opt, strategy=None, test_frac=None, random_state=None):
     if strategy is None:
         strategy = TREE_FEATURE_CONFIG['split_strategy']
     if test_frac is None:
         test_frac = TREE_FEATURE_CONFIG['test_frac']
+    if random_state is None:
+        random_state = TREE_FEATURE_CONFIG['random_state']
 
     train_pos, test_pos = _split_indices(len(X_opt), strategy, test_frac, random_state)
     train_idx = X_opt.index[train_pos]

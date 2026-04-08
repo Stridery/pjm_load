@@ -22,6 +22,7 @@ TREE_FEATURE_CONFIG = {
                                 #   > 9  → previous day at that hour (e.g. 18 = yesterday 6pm)
     'split_strategy': 'tail',   # 'random' | 'head' | 'tail'
     'test_frac': 0.1,
+    'random_state': 42,         # only used when split_strategy='random'
 }
 
 # --- Best Model Hyperparameters ---
@@ -65,6 +66,7 @@ TRANSFORMER_FEATURE_CONFIG = {
     'test_frac': 0.1,
     'val_strategy': 'random',     # 'random' | 'head' | 'tail' — how to split val from train pool
     'val_frac': 0.1,            # fraction of train pool used as validation
+    'random_state': 42,         # only used when split_strategy or val_strategy='random'
 }
 
 TRANSFORMER_PARAMS = {
