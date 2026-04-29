@@ -52,3 +52,29 @@ if cfg.TRAIN_CONFIG['transformer']:
                 scaler_ts=scaler_ts,
                 params=cfg.TRANSFORMER_PARAMS
             )
+
+# --- LSTM ---
+if cfg.TRAIN_CONFIG['lstm']:
+    X_3d, y_3d, mask_3d, timestamps_3d = build_timeseries_matrix(cfg.CLEANED_PATH, cfg.MATRIX_DIR)
+    _lb = cfg.LSTM_FEATURE_CONFIG['lookback_hours']
+    _h  = cfg.LSTM_FEATURE_CONFIG['latest_info_hour']
+    scaler_ts = joblib.load(os.path.join(cfg.MATRIX_DIR, f'scaler_ts_lb{_lb}_h{_h}.pkl'))
+
+    for test_strategy in TEST_STRATEGIES:
+        for val_strategy in VAL_STRATEGIES:
+            print(f"\n{'='*60}")
+            print(f"LSTM | test split: {test_strategy} | val split: {val_strategy}")
+            print(f"{'='*60}")
+
+            cfg.LSTM_FEATURE_CONFIG['split_strategy'] = test_strategy
+            cfg.LSTM_FEATURE_CONFIG['val_strategy']   = val_strategy
+
+            lstm_forecaster = PowerForecaster(None, None, None, None)
+            lstm_preds = lstm_forecaster.train_lstm_3d(
+                X_3d=X_3d,
+                y_3d=y_3d,
+                mask_3d=mask_3d,
+                timestamps_3d=timestamps_3d,
+                scaler_ts=scaler_ts,
+                params=cfg.LSTM_PARAMS
+            )

@@ -159,6 +159,18 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
         y_window = load_array[target_start : target_start + 24]
         is_seq_valid = is_valid_array[target_start : target_start + 24].all()
 
+        # 次日元特征（广播到整个lookback窗口）：dayofweek sin/cos, is_weekend, is_holiday
+        tmrw_row = df.loc[df.index.date == tomorrow].iloc[0]
+        tmrw_dow = tmrw_row['dayofweek']
+        tmrw_meta = np.array([
+            np.sin(2 * np.pi * tmrw_dow / 7),
+            np.cos(2 * np.pi * tmrw_dow / 7),
+            float(tmrw_row['is_weekend']),
+            float(tmrw_row['is_holiday']),
+        ], dtype='float32')
+        tmrw_broadcast = np.tile(tmrw_meta, (lookback_hours, 1))  # (lookback_hours, 4)
+        X_window = np.concatenate([X_window, tmrw_broadcast], axis=1)  # (lookback_hours, 21)
+
         X_list.append(X_window)
         y_list.append(y_window)
         valid_mask_list.append(is_seq_valid)

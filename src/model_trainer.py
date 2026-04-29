@@ -1,7 +1,7 @@
 # src/model_trainer.py
 import numpy as np
 from src.feature_engine import _split_indices
-from src.config import TRANSFORMER_FEATURE_CONFIG, TREE_FEATURE_CONFIG
+from src.config import TRANSFORMER_FEATURE_CONFIG, TREE_FEATURE_CONFIG, LSTM_FEATURE_CONFIG
 import xgboost as xgb
 import lightgbm as lgb
 from tqdm import tqdm
@@ -40,6 +40,7 @@ class PowerForecaster:
         self.xgb_preds = None
         self.lgb_preds = None
         self.transformer_preds = None
+        self.lstm_preds = None
 
     def _plot_error_distributions(self, model_name, hourly_mape, dow_mape, dom_mape, run_dir):
         plt.figure(figsize=(15, 12))
@@ -329,16 +330,16 @@ class PowerForecaster:
                 print(f"\nEarly stopping at Epoch {epoch+1}")
                 break
 
-        model.load_state_dict(torch.load(save_path))
+        model.load_state_dict(torch.load(save_path, weights_only=True))
         model.eval()
         with torch.no_grad():
             preds_scaled = model(X_te.to(device)).cpu().numpy()
 
-        num_features = X_3d.shape[2]
         def inverse_transform_load_2d(scaled_data_2d):
             N, P = scaled_data_2d.shape
             flat_data = scaled_data_2d.flatten()
-            dummy = np.zeros((len(flat_data), num_features))
+            # 用 scaler 的特征数（17），而不是 X_3d 的维度（含次日元特征后为21）
+            dummy = np.zeros((len(flat_data), scaler_ts.n_features_in_))
             dummy[:, 0] = flat_data
             inv_flat = scaler_ts.inverse_transform(dummy)[:, 0]
             return inv_flat.reshape(N, P)
@@ -357,7 +358,106 @@ class PowerForecaster:
         print(f"RMSE: {rmse:.2f}")
 
         return self.transformer_preds
-    
+
+    def train_lstm_3d(self, X_3d, y_3d, mask_3d, timestamps_3d, scaler_ts, params):
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"\nGPU Acceleration: {device}")
+        model_dir  = _make_run_dir('models',  'lstm', LSTM_FEATURE_CONFIG)
+        result_dir = _make_run_dir('results', 'lstm', LSTM_FEATURE_CONFIG)
+
+        random_state = LSTM_FEATURE_CONFIG['random_state']
+        strategy     = LSTM_FEATURE_CONFIG['split_strategy']
+        test_frac    = LSTM_FEATURE_CONFIG['test_frac']
+        val_strategy = LSTM_FEATURE_CONFIG['val_strategy']
+        val_frac     = LSTM_FEATURE_CONFIG['val_frac']
+
+        train_pool_idx, test_idx = _split_indices(len(X_3d), strategy, test_frac, random_state)
+        rel_train_idx, rel_val_idx = _split_indices(len(train_pool_idx), val_strategy, val_frac, random_state)
+        train_idx = train_pool_idx[rel_train_idx]
+        val_idx   = train_pool_idx[rel_val_idx]
+
+        test_timestamps = timestamps_3d[test_idx]
+        X_te        = torch.FloatTensor(X_3d[test_idx])
+        y_te_scaled = y_3d[test_idx]
+
+        train_mask = mask_3d[train_idx]
+        X_tr = torch.FloatTensor(X_3d[train_idx][train_mask])
+        y_tr = torch.FloatTensor(y_3d[train_idx][train_mask])
+        print(f"Train after denoising: {len(X_tr)} samples | Val: {len(val_idx)} | Test: {len(test_idx)}")
+
+        X_val = torch.FloatTensor(X_3d[val_idx])
+        y_val = torch.FloatTensor(y_3d[val_idx])
+
+        loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=params['batch_size'], shuffle=True)
+        model = LSTMModel(num_features=X_3d.shape[2], params=params).to(device)
+        criterion = nn.L1Loss()
+        optimizer = optim.AdamW(model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'])
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+
+        save_path = os.path.join(model_dir, 'lstm_best.pth')
+
+        best_val_loss = float('inf')
+        early_stop_patience = 15
+        epochs_no_improve = 0
+        for epoch in range(params['epochs']):
+            model.train()
+            train_loss = 0
+            for bx, by in loader:
+                bx, by = bx.to(device), by.to(device)
+                optimizer.zero_grad()
+                loss = criterion(model(bx), by)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+
+            model.eval()
+            with torch.no_grad():
+                v_loss = criterion(model(X_val.to(device)), y_val.to(device)).item()
+            scheduler.step(v_loss)
+
+            if v_loss < best_val_loss:
+                best_val_loss = v_loss
+                torch.save(model.state_dict(), save_path)
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+
+            if (epoch + 1) % 5 == 0:
+                print(f"Epoch {epoch+1:03d} | Train: {train_loss/len(loader):.4f} | Val: {v_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+            if epochs_no_improve >= early_stop_patience:
+                print(f"\nEarly stopping at Epoch {epoch+1}")
+                break
+
+        model.load_state_dict(torch.load(save_path, weights_only=True))
+        model.eval()
+        with torch.no_grad():
+            preds_scaled = model(X_te.to(device)).cpu().numpy()
+
+        def inverse_transform_load_2d(scaled_data_2d):
+            N, P = scaled_data_2d.shape
+            flat_data = scaled_data_2d.flatten()
+            dummy = np.zeros((len(flat_data), scaler_ts.n_features_in_))
+            dummy[:, 0] = flat_data
+            inv_flat = scaler_ts.inverse_transform(dummy)[:, 0]
+            return inv_flat.reshape(N, P)
+
+        all_preds_mw = inverse_transform_load_2d(preds_scaled)
+        all_true_mw  = inverse_transform_load_2d(y_te_scaled)
+
+        mape = mean_absolute_percentage_error(all_true_mw.flatten(), all_preds_mw.flatten())
+        mae  = mean_absolute_error(all_true_mw.flatten(), all_preds_mw.flatten())
+        rmse = np.sqrt(mean_squared_error(all_true_mw.flatten(), all_preds_mw.flatten()))
+
+        self.lstm_preds = all_preds_mw
+        self._evaluate_and_save_3d("LSTM", all_true_mw, all_preds_mw, test_timestamps, result_dir)
+        print(f"\nMAPE: {mape*100:.2f}%")
+        print(f"MAE : {mae:.2f}")
+        print(f"RMSE: {rmse:.2f}")
+
+        return self.lstm_preds
+
 
 
 
@@ -394,8 +494,7 @@ class TimeSeriesTransformer3D(nn.Module):
         
 
         self.fc_out = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(TRANSFORMER_FEATURE_CONFIG['lookback_hours'] * d_model, 128),
+            nn.Linear(d_model, 128),
             nn.ReLU(),
             nn.Dropout(params['dropout']),
             nn.Linear(128, params['out_dim'])
@@ -403,8 +502,34 @@ class TimeSeriesTransformer3D(nn.Module):
 
     def forward(self, x):
         # x: [Batch, Seq, Features]
-        x = self.input_projection(x) # -> [Batch, Seq, d_model]
+        x = self.input_projection(x)      # -> [Batch, Seq, d_model]
         x = self.pos_encoder(x)
-        x = self.transformer_encoder(x)
+        x = self.transformer_encoder(x)   # -> [Batch, Seq, d_model]
+        x = x[:, -1, :]                   # 取最后一步: [Batch, d_model]
         return self.fc_out(x)
+
+
+class LSTMModel(nn.Module):
+    def __init__(self, num_features, params):
+        super().__init__()
+        hidden = params['hidden_size']
+        self.lstm = nn.LSTM(
+            input_size=num_features,
+            hidden_size=hidden,
+            num_layers=params['num_layers'],
+            batch_first=True,
+            dropout=params['dropout'] if params['num_layers'] > 1 else 0.0,
+        )
+        self.fc_out = nn.Sequential(
+            nn.Linear(hidden, 128),
+            nn.ReLU(),
+            nn.Dropout(params['dropout']),
+            nn.Linear(128, params['out_dim']),
+        )
+
+    def forward(self, x):
+        # x: [Batch, Seq, Features]
+        out, _ = self.lstm(x)   # out: [Batch, Seq, hidden]
+        out = out[:, -1, :]     # 取最后时间步: [Batch, hidden]
+        return self.fc_out(out)
 

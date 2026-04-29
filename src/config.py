@@ -9,9 +9,10 @@ MATRIX_DIR = 'data/matrix/'
 
 # --- Models to Train (1 = train, 0 = skip) ---
 TRAIN_CONFIG = {
-    'xgboost':     1,
+    'xgboost':     0,
     'lightgbm':    0,
     'transformer': 0,
+    'lstm':        1,
 }
 
 # --- Tree Model Feature Generation ---
@@ -73,10 +74,69 @@ TRANSFORMER_PARAMS = {
     'd_model': 64,
     'nhead': 4,
     'num_layers': 2,
-    'dropout': 0.5,
+    'dropout': 0.3,
     'out_dim': 24,
     'epochs': 200,
     'batch_size': 32,
     'learning_rate': 3e-4,
-    'weight_decay': 0.1
+    'weight_decay': 0.05
+}
+
+# --- LSTM Feature Generation (shares the same 3D matrix as Transformer) ---
+LSTM_FEATURE_CONFIG = {
+    'lookback_hours': 168,
+    'latest_info_hour': 0,
+    'split_strategy': 'tail',
+    'test_frac': 0.1,
+    'val_strategy': 'random',
+    'val_frac': 0.1,
+    'random_state': 42,
+}
+
+LSTM_PARAMS = {
+    'hidden_size': 128,
+    'num_layers': 2,
+    'dropout': 0.3,
+    'out_dim': 24,
+    'epochs': 200,
+    'batch_size': 32,
+    'learning_rate': 1e-3,
+    'weight_decay': 1e-4,
+}
+
+# --- Evaluation Config ---
+EVAL_CONFIG = {
+    # Shared test split (all models use the same split)
+    'split_strategy': 'tail',   # 'head' | 'tail' | 'random'
+    'test_frac': 0.1,
+    'random_state': 42,
+    'result_dir': 'results/evaluation',
+
+    # Which models to evaluate and where their saved files are
+    'models': {
+        'xgboost': {
+            'enabled': 0,
+            'model_path': 'models/xgboost/tail_test0.1/xgboost_24_models.pkl',
+        },
+        'lightgbm': {
+            'enabled': 0,
+            'model_path': 'models/lightgbm/tail_test0.1/lightgbm_24_models.pkl',
+        },
+        'transformer': {
+            'enabled': 0,
+            'model_path': 'models/transformer/tail_test0.1_random_val0.1/transformer_best.pth',
+        },
+        'lstm': {
+            'enabled': 0,
+            'model_path': 'models/lstm/tail_test0.1_random_val0.1/lstm_best.pth',
+        },
+    },
+
+    # Single-day plot mode: load model, find date in matrix, show plot interactively
+    'single_day': {
+        'enabled': 1,
+        'model': 'lstm',
+        'model_path': 'models/lstm/tail_test0.1_random_val0.1/lstm_best.pth',
+        'date': '2025-08-15',
+    },
 }
