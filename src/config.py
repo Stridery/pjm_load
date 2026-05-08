@@ -1,11 +1,27 @@
 # src/config.py
+import os
+
+# --- Dataset Selection (controls all data / model / result paths) ---
+DATASET = os.environ.get('PJM_DATASET', 'bge')   # override: PJM_DATASET=dom python ...
+
+# --- Weather Features (per dataset) ---
+_WEATHER_COLS = {
+    'dom': [
+        'Temp_F', 'Dewpoint_F', 'HeatIndex_F', 'SolarRadiation_Wm2', 'Windchill_F',
+        'WindSpeed_mph', 'WindDirection_deg', 'CloudCover_pct', 'Precip_in', 'RelativeHumidity_pct',
+    ],
+    'bge': [
+        'Temp_F', 'RelativeHumidity_pct', 'WindSpeed_mph', 'CloudCover_pct',
+    ],
+}
+WEATHER_COLS = _WEATHER_COLS[DATASET]
 
 # --- File Paths ---
-RAW_LOAD_PATH = 'data/raw/dom_load.csv'
-RAW_WEATHER_PATH = 'data/raw/pjm_dominionhub_hourly_2015_2025_openmeteo.csv'
-MERGED_PATH = 'data/joined/merged_pjm_load_weather.csv'
-CLEANED_PATH = 'data/cleaned/cleaned_pjm_load_weather.csv'
-MATRIX_DIR = 'data/matrix/'
+RAW_LOAD_PATH    = f'data/{DATASET}/raw/dom_load.csv'
+RAW_WEATHER_PATH = f'data/{DATASET}/raw/pjm_dominionhub_hourly_2015_2025_openmeteo.csv'
+MERGED_PATH      = f'data/{DATASET}/joined/merged_load_weather.csv'
+CLEANED_PATH     = f'data/{DATASET}/cleaned/cleaned_load_weather.csv'
+MATRIX_DIR       = f'data/{DATASET}/matrix/'
 
 # --- Models to Train (1 = train, 0 = skip) ---
 TRAIN_CONFIG = {
@@ -109,26 +125,28 @@ EVAL_CONFIG = {
     # Shared test split (all models use the same split)
     'split_strategy': 'tail',   # 'head' | 'tail' | 'random'
     'test_frac': 0.1,
+    'val_strategy': 'random',   # sequence model result path only; 'head' | 'tail' | 'random'
+    'val_frac': 0.1,
     'random_state': 42,
-    'result_dir': 'results/evaluation',
+    'result_dir': f'results/{DATASET}/evaluation',
 
     # Which models to evaluate and where their saved files are
     'models': {
         'xgboost': {
             'enabled': 0,
-            'model_path': 'models/xgboost/tail_test0.1/xgboost_24_models.pkl',
+            'model_path': f'models/{DATASET}/xgboost/tail_test0.1/xgboost_24_models.pkl',
         },
         'lightgbm': {
             'enabled': 0,
-            'model_path': 'models/lightgbm/tail_test0.1/lightgbm_24_models.pkl',
+            'model_path': f'models/{DATASET}/lightgbm/tail_test0.1/lightgbm_24_models.pkl',
         },
         'transformer': {
             'enabled': 0,
-            'model_path': 'models/transformer/tail_test0.1_random_val0.1/transformer_best.pth',
+            'model_path': f'models/{DATASET}/transformer/tail_test0.1_random_val0.1/transformer_best.pth',
         },
         'lstm': {
             'enabled': 0,
-            'model_path': 'models/lstm/tail_test0.1_random_val0.1/lstm_best.pth',
+            'model_path': f'models/{DATASET}/lstm/tail_test0.1_random_val0.1/lstm_best.pth',
         },
     },
 
@@ -136,7 +154,7 @@ EVAL_CONFIG = {
     'single_day': {
         'enabled': 1,
         'model': 'lstm',
-        'model_path': 'models/lstm/tail_test0.1_random_val0.1/lstm_best.pth',
+        'model_path': f'models/{DATASET}/lstm/tail_test0.1_random_val0.1/lstm_best.pth',
         'date': '2025-08-15',
     },
 }

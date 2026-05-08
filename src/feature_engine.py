@@ -5,7 +5,7 @@ import os
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 import joblib
-from src.config import TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG
+from src.config import TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG, WEATHER_COLS
 
 
 def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_info_hour=None):
@@ -29,8 +29,7 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     X_list, y_list = [], []
     unique_days = pd.Series(df_final.index.date).unique()
 
-    weather_cols = ['Temp_F', 'Dewpoint_F', 'HeatIndex_F', 'SolarRadiation_Wm2', 'Windchill_F',
-                    'WindSpeed_mph', 'WindDirection_deg', 'CloudCover_pct', 'Precip_in', 'RelativeHumidity_pct']
+    weather_cols = WEATHER_COLS
     feature_cols = ['Load'] + weather_cols
     data_array = df_final[feature_cols].values
 
@@ -107,18 +106,10 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     df = pd.read_csv(cleaned_path, index_col=0, parse_dates=True)
     df = df.sort_index()
 
-    feature_cols = [
-        'Load',
-        'Temp_F', 'Dewpoint_F', 'HeatIndex_F',
-        'SolarRadiation_Wm2', 'Windchill_F',
-        'WindSpeed_mph', 'WindDirection_deg',
-        'CloudCover_pct', 'Precip_in',
-        'RelativeHumidity_pct',
-        'hour_sin', 'hour_cos',
-        'month_sin', 'month_cos',
-        'dayofweek',
-        'is_weekend'
-    ]
+    feature_cols = (
+        ['Load'] + WEATHER_COLS +
+        ['hour_sin', 'hour_cos', 'month_sin', 'month_cos', 'dayofweek', 'is_weekend']
+    )
     split_idx = int(len(df) * (1 - TRANSFORMER_FEATURE_CONFIG['test_frac']))
     scaler = StandardScaler()
     scaler.fit(df.iloc[:split_idx][feature_cols])

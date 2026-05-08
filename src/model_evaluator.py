@@ -9,9 +9,8 @@ from sklearn.metrics import mean_absolute_percentage_error, mean_absolute_error,
 
 from src.feature_engine import build_or_load_matrix, build_timeseries_matrix, _split_indices
 from src.config import (
-    CLEANED_PATH, MATRIX_DIR,
-    TRANSFORMER_FEATURE_CONFIG, TRANSFORMER_PARAMS,
-    LSTM_PARAMS,
+    CLEANED_PATH, MATRIX_DIR, DATASET,
+    TRANSFORMER_PARAMS, LSTM_PARAMS,
 )
 from src.model_trainer import TimeSeriesTransformer3D, LSTMModel
 
@@ -84,11 +83,11 @@ class ModelEvaluator:
             self.X_3d, self.y_3d, self.mask_3d, self.timestamps_3d = build_timeseries_matrix(
                 CLEANED_PATH, MATRIX_DIR
             )
-            _lb = TRANSFORMER_FEATURE_CONFIG['lookback_hours']
-            _h  = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
-            self.scaler_ts = joblib.load(
-                os.path.join(MATRIX_DIR, f'scaler_ts_lb{_lb}_h{_h}.pkl')
-            )
+            import glob
+            scaler_files = glob.glob(os.path.join(MATRIX_DIR, 'scaler_ts_*.pkl'))
+            if not scaler_files:
+                raise FileNotFoundError(f"No scaler file found in {MATRIX_DIR}")
+            self.scaler_ts = joblib.load(scaler_files[0])
 
     # --- Test split helpers ---
 
@@ -228,6 +227,57 @@ class ModelEvaluator:
         plt.close()
         print(f"Best/worst day plots saved to: {save_path}")
 
+    def _plot_error_histogram(self, model_name, detailed_df, result_dir):
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle(f'{model_name} — Error Distribution', fontsize=14, fontweight='bold')
+
+        axes[0].hist(detailed_df['abs_error'], bins=50, color='#4C72B0', edgecolor='black', alpha=0.8)
+        axes[0].set_title('Absolute Error (MW)', fontsize=12)
+        axes[0].set_xlabel('Absolute Error (MW)')
+        axes[0].set_ylabel('Count')
+        axes[0].grid(axis='y', linestyle='--', alpha=0.7)
+
+        axes[1].hist(detailed_df['mape_pct'], bins=50, color='#C44E52', edgecolor='black', alpha=0.8)
+        axes[1].set_title('Absolute Percentage Error (%)', fontsize=12)
+        axes[1].set_xlabel('APE (%)')
+        axes[1].set_ylabel('Count')
+        axes[1].grid(axis='y', linestyle='--', alpha=0.7)
+
+        plt.tight_layout()
+        save_path = os.path.join(result_dir, f'{model_name}_error_histogram.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Error histogram saved to: {save_path}")
+
+    def _plot_error_cdf(self, model_name, detailed_df, result_dir):
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle(f'{model_name} — Error CDF (Reliability Curve)', fontsize=14, fontweight='bold')
+
+        for ax, col, label, color in [
+            (axes[0], 'abs_error', 'Absolute Error (MW)', '#4C72B0'),
+            (axes[1], 'mape_pct', 'APE (%)',              '#C44E52'),
+        ]:
+            sorted_vals = np.sort(detailed_df[col].values)
+            cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals) * 100
+            ax.plot(sorted_vals, cdf, color=color, linewidth=2)
+            ax.set_xlabel(label)
+            ax.set_ylabel('Cumulative % of Hours')
+            ax.set_title(f'CDF of {label}', fontsize=12)
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0f}%'))
+            ax.grid(linestyle='--', alpha=0.7)
+
+            for pct in [50, 90, 95]:
+                threshold = np.percentile(sorted_vals, pct)
+                ax.axvline(threshold, linestyle='--', linewidth=1, alpha=0.7,
+                           label=f'P{pct}: {threshold:.2f}')
+            ax.legend(fontsize=9)
+
+        plt.tight_layout()
+        save_path = os.path.join(result_dir, f'{model_name}_error_cdf.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Error CDF saved to: {save_path}")
+
     # --- Core single-model evaluation ---
 
     def _evaluate_one(self, model_name, y_true_np, y_pred_np, timestamps, result_dir):
@@ -253,6 +303,8 @@ class ModelEvaluator:
         print(f"Detailed errors saved to: {csv_path}")
 
         self._plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, result_dir)
+        self._plot_error_histogram(model_name, detailed_df, result_dir)
+        self._plot_error_cdf(model_name, detailed_df, result_dir)
         self._plot_best_worst_days(model_name, detailed_df, daily_mape, result_dir)
 
     # --- Public API ---
@@ -272,13 +324,17 @@ class ModelEvaluator:
                 y_pred_np = self._predict_tree(
                     self.cfg['models'][model_name]['model_path'], X_test
                 )
-                result_dir = os.path.join(result_base, model_name, strategy)
+                run_tag = f"{strategy}_test{self.cfg['test_frac']}"
+                result_dir = os.path.join(result_base, model_name, run_tag)
                 self._evaluate_one(model_name.upper(), y_true_np, y_pred_np, timestamps, result_dir)
 
         seq_enabled = [m for m in ['transformer', 'lstm'] if self.cfg['models'][m]['enabled']]
         if seq_enabled:
             X_te, y_te_scaled, test_timestamps = self._seq_test_split()
             y_true_mw = self._inverse_transform(y_te_scaled)
+
+            val_strategy = self.cfg.get('val_strategy', '')
+            val_frac     = self.cfg.get('val_frac', '')
 
             for model_name in seq_enabled:
                 print(f"\n====== Loading {model_name.upper()} ======")
@@ -287,7 +343,11 @@ class ModelEvaluator:
                     self.cfg['models'][model_name]['model_path'],
                     X_te,
                 )
-                result_dir = os.path.join(result_base, model_name, strategy)
+                if val_strategy:
+                    run_tag = f"{strategy}_test{self.cfg['test_frac']}_{val_strategy}_val{val_frac}"
+                else:
+                    run_tag = strategy
+                result_dir = os.path.join(result_base, model_name, run_tag)
                 self._evaluate_one(model_name.upper(), y_true_mw, y_pred_mw, test_timestamps, result_dir)
 
     def show_single_day(self, model_name, model_path, date_str):
@@ -312,9 +372,9 @@ class ModelEvaluator:
             pred_24h = self._predict_sequence(model_name, model_path, self.X_3d[idx]).flatten()
             true_24h = self._inverse_transform(self.y_3d[idx]).flatten()
 
-        # model_path e.g. models/lstm/tail_test0.1_random_val0.1/lstm_best.pth
-        # → save to results/singleday/lstm/tail_test0.1_random_val0.1/2023-08-15.png
+        # model_path e.g. models/dom/lstm/tail_test0.1_random_val0.1/lstm_best.pth
+        # → save to results/dom/singleday/lstm/tail_test0.1_random_val0.1/2023-08-15.png
         from pathlib import Path
-        model_subdir = os.path.join(*Path(model_path).parts[1:-1])
-        save_path = os.path.join('results', 'singleday', model_subdir, f'{date_str}.png')
+        model_subdir = os.path.join(*Path(model_path).parts[2:-1])  # skip 'models/<dataset>'
+        save_path = os.path.join('results', DATASET, 'singleday', model_subdir, f'{date_str}.png')
         plot_single_day(model_name.upper(), date_str, true_24h, pred_24h, save_path=save_path)
