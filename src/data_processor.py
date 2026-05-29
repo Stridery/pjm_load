@@ -34,20 +34,21 @@ def clean_and_engineer(input_path, output_path):
         df.loc[invalid_mask, 'Load'] = np.nan
         df['Load'] = df['Load'].interpolate(method='linear')
 
-    # Temporal features
-    df['hour'] = df.index.hour
-    df['month'] = df.index.month
+    # Temporal features — derived from EPT (local Eastern time), not UTC index
+    ept = pd.to_datetime(df['Datetime_EPT'])
+    df['hour'] = ept.dt.hour
+    df['month'] = ept.dt.month
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
-    df['dayofweek'] = df.index.dayofweek
+    df['dayofweek'] = ept.dt.dayofweek
     df['is_weekend'] = (df['dayofweek'] >= 5).astype(int)
 
     # Holidays
     cal = calendar()
-    holidays = cal.holidays(start=df.index.min(), end=df.index.max())
-    df['is_holiday'] = df.index.normalize().isin(holidays).astype(int)
+    holidays = cal.holidays(start=ept.min(), end=ept.max())
+    df['is_holiday'] = ept.dt.normalize().isin(holidays).astype(int)
 
     # Outlier detection (3-sigma)
     df['group_mean'] = df.groupby(['month', 'hour'])['Load'].transform('mean')

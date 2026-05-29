@@ -8,6 +8,38 @@ import joblib
 from src.config import TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG, WEATHER_COLS
 
 
+def _normalize_to_24h(load_vals, ept_hour_vals):
+    """
+    Normalize a DST transition day's load to exactly 24 EPT-hour slots.
+
+    Fall Back  (25 rows): the repeated 1:00 AM is averaged into one value.
+    Spring Fwd (23 rows): the missing 2:00 AM is linearly interpolated.
+    Returns a length-24 float array, or None for unexpected day lengths.
+    """
+    n = len(load_vals)
+    if n == 24:
+        return np.array(load_vals, dtype=float)
+
+    if n == 25:  # Fall Back: average duplicate EPT hour
+        sums   = np.zeros(24)
+        counts = np.zeros(24, dtype=int)
+        for val, h in zip(load_vals, ept_hour_vals):
+            sums[h]   += val
+            counts[h] += 1
+        return sums / np.maximum(counts, 1)
+
+    if n == 23:  # Spring Forward: interpolate missing EPT hour (2:00 AM)
+        hour_to_val = {int(h): float(v) for h, v in zip(ept_hour_vals, load_vals)}
+        vals = np.array([hour_to_val.get(h, np.nan) for h in range(24)])
+        nans = np.isnan(vals)
+        if nans.any():
+            x = np.arange(24)
+            vals[nans] = np.interp(x[nans], x[~nans], vals[~nans])
+        return vals
+
+    return None  # unexpected length — caller skips this day
+
+
 def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_info_hour=None):
     """生成 2D CSV 矩阵，特征是打平的 (Flattened)"""
     if lookback_hours is None:
@@ -26,17 +58,23 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     print("=== Constructing 2D Matrix from Cleaned Data ===")
     df_final = pd.read_csv(cleaned_path, index_col=0, parse_dates=True)
     df_final = df_final.sort_index()
-    X_list, y_list = [], []
-    unique_days = pd.Series(df_final.index.date).unique()
+
+    ept_dt    = pd.to_datetime(df_final['Datetime_EPT'])
+    ept_dates = ept_dt.dt.date.values
+    ept_hours = ept_dt.dt.hour.values
 
     weather_cols = WEATHER_COLS
     feature_cols = ['Load'] + weather_cols
-    data_array = df_final[feature_cols].values
+    data_array   = df_final[feature_cols].values
+    load_raw     = df_final['Load'].values
+    valid_raw    = df_final['is_valid'].values
+
+    unique_days = np.unique(ept_dates)
+    X_list, y_list = [], []
 
     for i in tqdm(range(len(unique_days) - 1), desc="Building 2D Samples"):
-        today, tomorrow = unique_days[i], unique_days[i+1]
+        today, tomorrow = unique_days[i], unique_days[i + 1]
 
-        # 确定cutoff时间点：<=9取当天该小时，>9取前一天该小时
         if latest_info_hour <= 9:
             cutoff_date, cutoff_hour = today, latest_info_hour
         else:
@@ -44,17 +82,18 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
                 continue
             cutoff_date, cutoff_hour = unique_days[i - 1], latest_info_hour
 
-        cutoff_rows = np.where((df_final.index.date == cutoff_date) & (df_final.index.hour == cutoff_hour))[0]
+        cutoff_rows = np.where((ept_dates == cutoff_date) & (ept_hours == cutoff_hour))[0]
         if len(cutoff_rows) == 0 or cutoff_rows[0] < lookback_hours:
             continue
         cutoff_pos = cutoff_rows[0]
 
-        y_tomorrow = df_final.loc[df_final.index.date == tomorrow, 'Load'].values
-        if len(y_tomorrow) != 24: continue
+        tmrw_pos  = np.where(ept_dates == tomorrow)[0]
+        y_tomorrow = _normalize_to_24h(load_raw[tmrw_pos], ept_hours[tmrw_pos])
+        if y_tomorrow is None:
+            continue
 
-        tmrw_valid = 1 if df_final.loc[df_final.index.date == tomorrow, 'is_valid'].all() else 0
-
-        past_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]  # (lookback_hours, n_features)
+        tmrw_valid = 1 if valid_raw[tmrw_pos].all() else 0
+        past_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]
 
         f = {'timestamp': tomorrow}
         for k in range(lookback_hours):
@@ -63,25 +102,31 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
             for k in range(lookback_hours):
                 f[f'{col}_h{k}'] = past_window[k, j + 1]
 
-        today_meta = df_final.loc[df_final.index.date == today].iloc[0]
-        tmrw_meta = df_final.loc[df_final.index.date == tomorrow].iloc[0]
+        today_meta = df_final[ept_dates == today].iloc[0]
+        tmrw_meta  = df_final.iloc[tmrw_pos[0]]
         f.update({
-            'today_month': today_meta['month'],
-            'today_hour_sin': today_meta['hour_sin'], 'today_hour_cos': today_meta['hour_cos'],
-            'today_month_sin': today_meta['month_sin'], 'today_month_cos': today_meta['month_cos'],
-            'today_dayofweek': today_meta['dayofweek'],
-            'tmrw_is_weekend': tmrw_meta['is_weekend'], 'tmrw_is_holiday': tmrw_meta['is_holiday'],
-            'is_target_valid': tmrw_valid
+            'today_month':      today_meta['month'],
+            'today_hour_sin':   today_meta['hour_sin'],
+            'today_hour_cos':   today_meta['hour_cos'],
+            'today_month_sin':  today_meta['month_sin'],
+            'today_month_cos':  today_meta['month_cos'],
+            'today_dayofweek':  today_meta['dayofweek'],
+            'tmrw_is_weekend':  tmrw_meta['is_weekend'],
+            'tmrw_is_holiday':  tmrw_meta['is_holiday'],
+            'is_target_valid':  tmrw_valid,
         })
 
         y_dict = {'timestamp': tomorrow}
-        for h in range(24): y_dict[f'h{h}'] = y_tomorrow[h]
-        X_list.append(f); y_list.append(y_dict)
+        for h in range(24):
+            y_dict[f'h{h}'] = y_tomorrow[h]
+        X_list.append(f)
+        y_list.append(y_dict)
 
     X_opt = pd.DataFrame(X_list).set_index('timestamp')
     y_opt = pd.DataFrame(y_list).set_index('timestamp')
     os.makedirs(matrix_dir, exist_ok=True)
-    X_opt.to_csv(x_path); y_opt.to_csv(y_path)
+    X_opt.to_csv(x_path)
+    y_opt.to_csv(y_path)
     return X_opt, y_opt
 
 
@@ -91,11 +136,11 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     if latest_info_hour is None:
         latest_info_hour = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
 
-    x_path = os.path.join(matrix_dir, f'X_3d_lb{lookback_hours}_h{latest_info_hour}.npy')
-    y_path = os.path.join(matrix_dir, f'y_3d_lb{lookback_hours}_h{latest_info_hour}.npy')
-    mask_path = os.path.join(matrix_dir, f'mask_3d_lb{lookback_hours}_h{latest_info_hour}.npy')
+    x_path         = os.path.join(matrix_dir, f'X_3d_lb{lookback_hours}_h{latest_info_hour}.npy')
+    y_path         = os.path.join(matrix_dir, f'y_3d_lb{lookback_hours}_h{latest_info_hour}.npy')
+    mask_path      = os.path.join(matrix_dir, f'mask_3d_lb{lookback_hours}_h{latest_info_hour}.npy')
     timestamp_path = os.path.join(matrix_dir, f'timestamps_3d_lb{lookback_hours}_h{latest_info_hour}.npy')
-    scaler_path = os.path.join(matrix_dir, f'scaler_ts_lb{lookback_hours}_h{latest_info_hour}.pkl')
+    scaler_path    = os.path.join(matrix_dir, f'scaler_ts_lb{lookback_hours}_h{latest_info_hour}.pkl')
     os.makedirs(matrix_dir, exist_ok=True)
 
     if all(os.path.exists(p) for p in [x_path, y_path, mask_path, timestamp_path]):
@@ -117,17 +162,21 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     df_scaled[feature_cols] = scaler.transform(df[feature_cols])
     joblib.dump(scaler, scaler_path)
 
-    X_list, y_list, valid_mask_list, timestamps_list = [], [], [], []
-    data_array = df_scaled[feature_cols].values
-    load_array = df_scaled['Load'].values
+    ept_dt    = pd.to_datetime(df['Datetime_EPT'])
+    ept_dates = ept_dt.dt.date.values
+    ept_hours = ept_dt.dt.hour.values
+
+    data_array    = df_scaled[feature_cols].values
+    load_array    = df_scaled['Load'].values
     is_valid_array = df['is_valid'].values
-    timestamps = df.index
-    unique_days = pd.Series(timestamps.date).unique()
+    timestamps    = df.index
+    unique_days   = np.unique(ept_dates)
+
+    X_list, y_list, valid_mask_list, timestamps_list = [], [], [], []
 
     for i in tqdm(range(len(unique_days) - 1), desc="Building 3D Samples"):
         today, tomorrow = unique_days[i], unique_days[i + 1]
 
-        # cutoff：<=9取当天该小时，>9取前一天该小时
         if latest_info_hour <= 9:
             cutoff_date, cutoff_hour = today, latest_info_hour
         else:
@@ -135,23 +184,20 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
                 continue
             cutoff_date, cutoff_hour = unique_days[i - 1], latest_info_hour
 
-        cutoff_rows = np.where((timestamps.date == cutoff_date) & (timestamps.hour == cutoff_hour))[0]
+        cutoff_rows = np.where((ept_dates == cutoff_date) & (ept_hours == cutoff_hour))[0]
         if len(cutoff_rows) == 0 or cutoff_rows[0] < lookback_hours:
             continue
         cutoff_pos = cutoff_rows[0]
 
-        # y永远是tomorrow（unique_days[i+1]）的完整24小时，从0点开始
-        tmrw_midnight_rows = np.where((timestamps.date == tomorrow) & (timestamps.hour == 0))[0]
-        if len(tmrw_midnight_rows) == 0 or tmrw_midnight_rows[0] + 24 > len(df):
+        tmrw_pos = np.where(ept_dates == tomorrow)[0]
+        y_window = _normalize_to_24h(load_array[tmrw_pos], ept_hours[tmrw_pos])
+        if y_window is None:
             continue
-        target_start = tmrw_midnight_rows[0]
 
-        X_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]
-        y_window = load_array[target_start : target_start + 24]
-        is_seq_valid = is_valid_array[target_start : target_start + 24].all()
+        is_seq_valid = bool(is_valid_array[tmrw_pos].all())
+        X_window     = data_array[cutoff_pos - lookback_hours : cutoff_pos]
 
-        # 次日元特征（广播到整个lookback窗口）：dayofweek sin/cos, is_weekend, is_holiday
-        tmrw_row = df.loc[df.index.date == tomorrow].iloc[0]
+        tmrw_row = df.iloc[tmrw_pos[0]]
         tmrw_dow = tmrw_row['dayofweek']
         tmrw_meta = np.array([
             np.sin(2 * np.pi * tmrw_dow / 7),
@@ -159,13 +205,13 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
             float(tmrw_row['is_weekend']),
             float(tmrw_row['is_holiday']),
         ], dtype='float32')
-        tmrw_broadcast = np.tile(tmrw_meta, (lookback_hours, 1))  # (lookback_hours, 4)
-        X_window = np.concatenate([X_window, tmrw_broadcast], axis=1)  # (lookback_hours, 21)
+        tmrw_broadcast = np.tile(tmrw_meta, (lookback_hours, 1))
+        X_window = np.concatenate([X_window, tmrw_broadcast], axis=1)
 
         X_list.append(X_window)
         y_list.append(y_window)
         valid_mask_list.append(is_seq_valid)
-        timestamps_list.append(timestamps[target_start])
+        timestamps_list.append(tomorrow)  # EPT date, consistent with tree-model index
 
     X_3d = np.array(X_list, dtype='float32')
     y_3d = np.array(y_list, dtype='float32')
@@ -179,6 +225,7 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
 
     print(f"Done. Generated {len(X_3d)} daily samples. Valid samples: {mask_3d.sum()}")
     return X_3d, y_3d, mask_3d, timestamps_3d
+
 
 def _split_indices(n, strategy, test_frac, random_state=42):
     n_test = int(n * test_frac)
@@ -206,10 +253,10 @@ def get_train_test_split(X_opt, y_opt, strategy=None, test_frac=None, random_sta
 
     train_pos, test_pos = _split_indices(len(X_opt), strategy, test_frac, random_state)
     train_idx = X_opt.index[train_pos]
-    test_idx = X_opt.index[test_pos]
+    test_idx  = X_opt.index[test_pos]
 
-    X_test_raw = X_opt.loc[test_idx]
-    y_test = y_opt.loc[test_idx]
+    X_test_raw  = X_opt.loc[test_idx]
+    y_test      = y_opt.loc[test_idx]
     X_train_raw = X_opt.loc[train_idx]
     y_train_raw = y_opt.loc[train_idx]
 

@@ -16,24 +16,71 @@ from src.model_trainer import TimeSeriesTransformer3D, LSTMModel
 
 
 # ---------------------------------------------------------------------------
+# DST helper
+# ---------------------------------------------------------------------------
+
+def _dst_type(date):
+    """Return 'spring_forward', 'fall_back', or None for a given EPT date."""
+    start = pd.Timestamp(date).tz_localize('America/New_York')
+    end   = pd.Timestamp(date + pd.Timedelta(days=1)).tz_localize('America/New_York')
+    hours = int((end - start).total_seconds() / 3600)
+    if hours == 23: return 'spring_forward'
+    if hours == 25: return 'fall_back'
+    return None
+
+
+def _restore_dst_hours(true_24h, pred_24h, dst):
+    """
+    Undo the 24h normalization for plotting:
+      spring_forward → remove interpolated 2AM → 23 points, x=[0,1,3,...,23]
+      fall_back      → duplicate averaged 1AM  → 25 points, x_labels=[0,1,1,2,...,23]
+    Returns (true_plot, pred_plot, x_positions, x_labels, dst_note).
+    """
+    if dst == 'spring_forward':
+        idx = [i for i in range(24) if i != 2]
+        x_labels = [str(h) for h in ([0, 1] + list(range(3, 24)))]
+        return (true_24h[idx], pred_24h[idx],
+                range(23), x_labels, ' [Spring Fwd]')
+
+    if dst == 'fall_back':
+        true_plot = np.insert(true_24h, 2, true_24h[1])
+        pred_plot = np.insert(pred_24h, 2, pred_24h[1])
+        x_labels  = ['0', '1', '1*'] + [str(h) for h in range(2, 24)]
+        return (true_plot, pred_plot,
+                range(25), x_labels, ' [Fall Back, *=2nd 1AM]')
+
+    return true_24h, pred_24h, range(24), [str(h) for h in range(24)], ''
+
+
+# ---------------------------------------------------------------------------
 # Standalone single-day plot function (public interface)
 # ---------------------------------------------------------------------------
 
 def plot_single_day(model_name, date_str, true_24h, pred_24h, ax=None, pred_color='#C44E52', save_path=None):
     """
-    Plot 24-hour true vs predicted load for one day.
+    Plot true vs predicted load for one day.
+    DST transition days are automatically detected and plotted with the correct
+    number of EPT hours (23 for spring-forward, 25 for fall-back).
 
     ax=None  → creates its own figure and saves to save_path
     ax=<Axes> → draws into that axes (for embedding in subplots, save_path ignored)
     """
-    hours = range(24)
+    dst  = _dst_type(pd.Timestamp(date_str).date())
+    true_plot, pred_plot, x_pos, x_labels, dst_note = _restore_dst_hours(
+        np.asarray(true_24h, dtype=float),
+        np.asarray(pred_24h, dtype=float),
+        dst,
+    )
+
     standalone = ax is None
     if standalone:
         _, ax = plt.subplots(figsize=(10, 4))
 
-    ax.plot(hours, true_24h, label='True', color='#4C72B0', linewidth=2)
-    ax.plot(hours, pred_24h, label='Pred', color=pred_color, linewidth=2, linestyle='--')
-    ax.set_xlabel('Hour')
+    ax.plot(x_pos, true_plot, label='True', color='#4C72B0', linewidth=2)
+    ax.plot(x_pos, pred_plot, label='Pred', color=pred_color, linewidth=2, linestyle='--')
+    ax.set_xticks(list(x_pos))
+    ax.set_xticklabels(x_labels, fontsize=7)
+    ax.set_xlabel('Hour (EPT)')
     ax.set_ylabel('Load (MW)')
     ax.legend()
     ax.grid(linestyle='--', alpha=0.6)
@@ -42,7 +89,7 @@ def plot_single_day(model_name, date_str, true_24h, pred_24h, ax=None, pred_colo
         if save_path is None:
             raise ValueError("save_path is required when calling plot_single_day without an ax.")
         mape = mean_absolute_percentage_error(true_24h, pred_24h) * 100
-        ax.set_title(f'{model_name} | {date_str} | MAPE: {mape:.2f}%', fontsize=12)
+        ax.set_title(f'{model_name} | {date_str}{dst_note} | MAPE: {mape:.2f}%', fontsize=12)
         plt.tight_layout()
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')

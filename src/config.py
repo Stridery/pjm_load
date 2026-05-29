@@ -2,13 +2,21 @@
 import os
 
 # --- Dataset Selection (controls all data / model / result paths) ---
-DATASET = os.environ.get('PJM_DATASET', 'bge')   # override: PJM_DATASET=dom python ...
+DATASET = os.environ.get('PJM_DATASET', 'dom2')   # override: PJM_DATASET=dom python ...
 
 # --- Weather Features (per dataset) ---
+# dom columns match the output of data_crawler (Open-Meteo native variables).
+# bge columns match the legacy manually-prepared weather file.
 _WEATHER_COLS = {
     'dom': [
-        'Temp_F', 'Dewpoint_F', 'HeatIndex_F', 'SolarRadiation_Wm2', 'Windchill_F',
-        'WindSpeed_mph', 'WindDirection_deg', 'CloudCover_pct', 'Precip_in', 'RelativeHumidity_pct',
+        'Temp_F', 'ApparentTemp_F', 'Dewpoint_F', 'RelativeHumidity_pct',
+        'SolarRadiation_Wm2', 'WindSpeed_mph', 'WindDirection_deg',
+        'WindGusts_mph', 'Precip_in', 'CloudCover_pct', 'SoilTemp0_7cm_F',
+    ],
+    'dom2': [
+        'Temp_F', 'ApparentTemp_F', 'Dewpoint_F', 'RelativeHumidity_pct',
+        'SolarRadiation_Wm2', 'WindSpeed_mph', 'WindDirection_deg',
+        'WindGusts_mph', 'Precip_in', 'CloudCover_pct', 'SoilTemp0_7cm_F',
     ],
     'bge': [
         'Temp_F', 'RelativeHumidity_pct', 'WindSpeed_mph', 'CloudCover_pct',
@@ -19,9 +27,36 @@ WEATHER_COLS = _WEATHER_COLS[DATASET]
 # --- File Paths ---
 RAW_LOAD_PATH    = f'data/{DATASET}/raw/dom_load.csv'
 RAW_WEATHER_PATH = f'data/{DATASET}/raw/pjm_dominionhub_hourly_2015_2025_openmeteo.csv'
-MERGED_PATH      = f'data/{DATASET}/joined/merged_load_weather.csv'
-CLEANED_PATH     = f'data/{DATASET}/cleaned/cleaned_load_weather.csv'
+MERGED_PATH      = f'data/{DATASET}/joined/merged_pjm_load_weather.csv'
+CLEANED_PATH     = f'data/{DATASET}/cleaned/cleaned_pjm_load_weather.csv'
 MATRIX_DIR       = f'data/{DATASET}/matrix/'
+
+# ---------------------------------------------------------------------------
+# Data Crawler Configuration
+# ---------------------------------------------------------------------------
+# Controls src/data_crawler.run_pipeline().
+# Set PJM_API_KEY in your environment (or directly here for local runs).
+CRAWLER_CONFIG = {
+    # PJM zone abbreviation used in both metered-load and forecast endpoints.
+    # Common values: 'DOM', 'BGE', 'PECO', 'PPL', 'PSEG', 'AEP', 'DAY', 'DUQ'
+    'pjm_zone': os.environ.get('PJM_DATASET', 'DOM2').upper(),
+
+    # PJM Dataminer 2 API subscription key.
+    # Obtain a free key at https://dataminer2.pjm.com/
+    'pjm_api_key': os.environ.get('PJM_API_KEY', ''),
+
+    # Location name passed to Open-Meteo Geocoding API.
+    # Should be a city / region representative of the load area's geography.
+    'location_name': os.environ.get('OPENMETEO_LOCATION', 'Richmond'),
+
+    # IANA timezone string for Open-Meteo requests and timezone alignment.
+    # All output timestamps are normalised to this local time (naive).
+    'timezone': 'America/New_York',
+
+    # Inclusive year range for batch crawling.
+    'start_year': int(os.environ.get('CRAWLER_START_YEAR', 2020)),
+    'end_year':   int(os.environ.get('CRAWLER_END_YEAR',   2024)),
+}
 
 # --- Models to Train (1 = train, 0 = skip) ---
 TRAIN_CONFIG = {
@@ -153,8 +188,8 @@ EVAL_CONFIG = {
     # Single-day plot mode: load model, find date in matrix, show plot interactively
     'single_day': {
         'enabled': 1,
-        'model': 'lstm',
-        'model_path': f'models/{DATASET}/lstm/tail_test0.1_random_val0.1/lstm_best.pth',
-        'date': '2025-08-15',
+        'model': 'xgboost',
+        'model_path': f'models/{DATASET}/xgboost/head_test0.1/xgboost_24_models.pkl',
+        'date': '2025-11-02',
     },
 }
