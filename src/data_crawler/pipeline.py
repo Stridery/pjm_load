@@ -24,6 +24,7 @@ import os
 import re
 import sys
 
+import numpy as np
 import pandas as pd
 
 from . import open_meteo as om
@@ -110,7 +111,7 @@ def load_preliminary(preliminary_dir: str) -> pd.DataFrame:
 
     Returns UTC-aware single-column DataFrame: Load_Estimated.
     """
-    files = _sorted_csvs(preliminary_dir, "hrl_load_prelim_*.csv")
+    files = _sorted_csvs(preliminary_dir, "hrl_load_prelim*.csv")
     logger.info("Found %d preliminary load file(s): %s – %s",
                 len(files), os.path.basename(files[0]), os.path.basename(files[-1]))
 
@@ -122,6 +123,12 @@ def load_preliminary(preliminary_dir: str) -> pd.DataFrame:
     df.index.name = "Datetime_UTC"
     df = df.rename(columns={"prelim_load_avg_hourly": "Load_Estimated"})
     df = df[["Load_Estimated"]]
+    # Replace outliers beyond median ± 10×IQR with linear interpolation
+    q1, q3 = df["Load_Estimated"].quantile([0.25, 0.75])
+    iqr = q3 - q1
+    upper = q3 + 10 * iqr
+    df.loc[df["Load_Estimated"] > upper, "Load_Estimated"] = np.nan
+    df["Load_Estimated"] = df["Load_Estimated"].interpolate(method="linear").ffill().bfill()
     df = df[~df.index.duplicated(keep="first")].sort_index()
     logger.info("Preliminary load: %d rows  (%s → %s)",
                 len(df), df.index[0], df.index[-1])

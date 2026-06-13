@@ -14,11 +14,11 @@ import os
 import joblib
 
 
-def _make_run_dir(base, model_type, cfg):
+def _make_run_dir(base, model_type, cfg, dataset=None):
     tag = f"{cfg['split_strategy']}_test{cfg['test_frac']}"
     if 'val_strategy' in cfg:
         tag += f"_{cfg['val_strategy']}_val{cfg['val_frac']}"
-    path = os.path.join(base, DATASET, model_type, tag)
+    path = os.path.join(base, dataset or DATASET, model_type, tag)
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -67,16 +67,18 @@ class PowerForecaster:
         joblib.dump(self.lgb_models, save_path)
         print(f"Model saved to: {save_path}")
 
-    def train_transformer_3d(self, X_3d, y_3d, mask_3d, params):
+    def train_transformer_3d(self, X_3d, y_3d, mask_3d, params,
+                              feature_cfg=None, dataset=None):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"\nGPU Acceleration: {device}")
-        model_dir = _make_run_dir('models', 'transformer', TRANSFORMER_FEATURE_CONFIG)
+        _cfg = feature_cfg or TRANSFORMER_FEATURE_CONFIG
+        model_dir = _make_run_dir('models', 'transformer', _cfg, dataset)
 
-        random_state = TRANSFORMER_FEATURE_CONFIG['random_state']
-        strategy     = TRANSFORMER_FEATURE_CONFIG['split_strategy']
-        test_frac    = TRANSFORMER_FEATURE_CONFIG['test_frac']
-        val_strategy = TRANSFORMER_FEATURE_CONFIG['val_strategy']
-        val_frac     = TRANSFORMER_FEATURE_CONFIG['val_frac']
+        random_state = _cfg['random_state']
+        strategy     = _cfg['split_strategy']
+        test_frac    = _cfg['test_frac']
+        val_strategy = _cfg['val_strategy']
+        val_frac     = _cfg['val_frac']
 
         train_pool_idx, test_idx = _split_indices(len(X_3d), strategy, test_frac, random_state)
         rel_train_idx, rel_val_idx = _split_indices(len(train_pool_idx), val_strategy, val_frac, random_state)
@@ -95,12 +97,12 @@ class PowerForecaster:
         model     = TimeSeriesTransformer3D(num_features=X_3d.shape[2], params=params).to(device)
         criterion = nn.L1Loss()
         optimizer = optim.AdamW(model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'])
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
         save_path       = os.path.join(model_dir, 'transformer_best.pth')
         best_val_loss   = float('inf')
         epochs_no_improve = 0
-        early_stop_patience = 15
+        early_stop_patience = params.get('early_stop_patience', 30)
 
         for epoch in range(params['epochs']):
             model.train()
@@ -110,6 +112,7 @@ class PowerForecaster:
                 optimizer.zero_grad()
                 loss = criterion(model(bx), by)
                 loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 train_loss += loss.item()
 
@@ -134,16 +137,18 @@ class PowerForecaster:
 
         print(f"Best model saved to: {save_path}")
 
-    def train_lstm_3d(self, X_3d, y_3d, mask_3d, params):
+    def train_lstm_3d(self, X_3d, y_3d, mask_3d, params,
+                       feature_cfg=None, dataset=None):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"\nGPU Acceleration: {device}")
-        model_dir = _make_run_dir('models', 'lstm', LSTM_FEATURE_CONFIG)
+        _cfg = feature_cfg or LSTM_FEATURE_CONFIG
+        model_dir = _make_run_dir('models', 'lstm', _cfg, dataset)
 
-        random_state = LSTM_FEATURE_CONFIG['random_state']
-        strategy     = LSTM_FEATURE_CONFIG['split_strategy']
-        test_frac    = LSTM_FEATURE_CONFIG['test_frac']
-        val_strategy = LSTM_FEATURE_CONFIG['val_strategy']
-        val_frac     = LSTM_FEATURE_CONFIG['val_frac']
+        random_state = _cfg['random_state']
+        strategy     = _cfg['split_strategy']
+        test_frac    = _cfg['test_frac']
+        val_strategy = _cfg['val_strategy']
+        val_frac     = _cfg['val_frac']
 
         train_pool_idx, test_idx = _split_indices(len(X_3d), strategy, test_frac, random_state)
         rel_train_idx, rel_val_idx = _split_indices(len(train_pool_idx), val_strategy, val_frac, random_state)
@@ -162,12 +167,12 @@ class PowerForecaster:
         model     = LSTMModel(num_features=X_3d.shape[2], params=params).to(device)
         criterion = nn.L1Loss()
         optimizer = optim.AdamW(model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'])
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
         save_path         = os.path.join(model_dir, 'lstm_best.pth')
         best_val_loss     = float('inf')
         epochs_no_improve = 0
-        early_stop_patience = 15
+        early_stop_patience = params.get('early_stop_patience', 30)
 
         for epoch in range(params['epochs']):
             model.train()
@@ -177,6 +182,7 @@ class PowerForecaster:
                 optimizer.zero_grad()
                 loss = criterion(model(bx), by)
                 loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 train_loss += loss.item()
 
@@ -227,11 +233,12 @@ class TimeSeriesTransformer3D(nn.Module):
             dim_feedforward=d_model*4, dropout=params['dropout'], batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=params['num_layers'])
+        fc_hidden = params.get('fc_hidden', 128)
         self.fc_out = nn.Sequential(
-            nn.Linear(d_model, 128),
+            nn.Linear(d_model, fc_hidden),
             nn.ReLU(),
             nn.Dropout(params['dropout']),
-            nn.Linear(128, params['out_dim'])
+            nn.Linear(fc_hidden, params['out_dim'])
         )
 
     def forward(self, x):
@@ -253,11 +260,12 @@ class LSTMModel(nn.Module):
             batch_first=True,
             dropout=params['dropout'] if params['num_layers'] > 1 else 0.0,
         )
+        fc_hidden = params.get('fc_hidden', 128)
         self.fc_out = nn.Sequential(
-            nn.Linear(hidden, 128),
+            nn.Linear(hidden, fc_hidden),
             nn.ReLU(),
             nn.Dropout(params['dropout']),
-            nn.Linear(128, params['out_dim']),
+            nn.Linear(fc_hidden, params['out_dim']),
         )
 
     def forward(self, x):

@@ -2,7 +2,7 @@
 import os
 
 # --- Dataset Selection (controls all data / model / result paths) ---
-DATASET = os.environ.get('PJM_DATASET', 'dom2')   # override: PJM_DATASET=dom python ...
+DATASET = os.environ.get('PJM_DATASET', 'bge')   # override: PJM_DATASET=dom python ...
 
 # --- Weather Features (per dataset) ---
 # dom columns match the output of data_crawler (Open-Meteo native variables).
@@ -13,16 +13,13 @@ _WEATHER_COLS = {
         'SolarRadiation_Wm2', 'WindSpeed_mph', 'WindDirection_deg',
         'WindGusts_mph', 'Precip_in', 'CloudCover_pct', 'SoilTemp0_7cm_F',
     ],
-    'dom2': [
+    'bge': [
         'Temp_F', 'ApparentTemp_F', 'Dewpoint_F', 'RelativeHumidity_pct',
         'SolarRadiation_Wm2', 'WindSpeed_mph', 'WindDirection_deg',
         'WindGusts_mph', 'Precip_in', 'CloudCover_pct', 'SoilTemp0_7cm_F',
     ],
-    'bge': [
-        'Temp_F', 'RelativeHumidity_pct', 'WindSpeed_mph', 'CloudCover_pct',
-    ],
 }
-WEATHER_COLS = _WEATHER_COLS[DATASET]
+WEATHER_COLS = _WEATHER_COLS.get(DATASET, [])  # empty for 'joint'; joint uses _WEATHER_COLS per zone
 
 # --- File Paths ---
 RAW_LOAD_PATH    = f'data/{DATASET}/raw/dom_load.csv'
@@ -39,7 +36,7 @@ MATRIX_DIR       = f'data/{DATASET}/matrix/'
 CRAWLER_CONFIG = {
     # PJM zone abbreviation used in both metered-load and forecast endpoints.
     # Common values: 'DOM', 'BGE', 'PECO', 'PPL', 'PSEG', 'AEP', 'DAY', 'DUQ'
-    'pjm_zone': os.environ.get('PJM_DATASET', 'DOM2').upper(),
+    'pjm_zone': os.environ.get('PJM_DATASET', 'BGE').upper(),
 
     # PJM Dataminer 2 API subscription key.
     # Obtain a free key at https://dataminer2.pjm.com/
@@ -47,7 +44,7 @@ CRAWLER_CONFIG = {
 
     # Location name passed to Open-Meteo Geocoding API.
     # Should be a city / region representative of the load area's geography.
-    'location_name': os.environ.get('OPENMETEO_LOCATION', 'Richmond'),
+    'location_name': os.environ.get('OPENMETEO_LOCATION', 'Baltimore'),
 
     # IANA timezone string for Open-Meteo requests and timezone alignment.
     # All output timestamps are normalised to this local time (naive).
@@ -62,7 +59,7 @@ CRAWLER_CONFIG = {
 TRAIN_CONFIG = {
     'xgboost':     0,
     'lightgbm':    0,
-    'transformer': 0,
+    'transformer': 1,
     'lstm':        1,
 }
 
@@ -125,7 +122,7 @@ TRANSFORMER_PARAMS = {
     'd_model': 64,
     'nhead': 4,
     'num_layers': 2,
-    'dropout': 0.3,
+    'dropout': 0.4,
     'out_dim': 24,
     'epochs': 200,
     'batch_size': 32,
@@ -152,7 +149,40 @@ LSTM_PARAMS = {
     'epochs': 200,
     'batch_size': 32,
     'learning_rate': 1e-3,
-    'weight_decay': 1e-4,
+    'weight_decay': 1e-3,
+}
+
+# --- Joint Model Configuration ---
+# Add/remove zone abbreviations here; everything else is derived automatically.
+JOINT_ZONES   = ['dom', 'bge']
+JOINT_DATASET = 'joint_' + '_'.join(JOINT_ZONES)
+JOINT_CLEANED_PATH = f'data/{JOINT_DATASET}/cleaned/joint_cleaned.csv'
+JOINT_MATRIX_DIR   = f'data/{JOINT_DATASET}/matrix/'
+
+JOINT_FEATURE_CONFIG = {
+    'lookback_hours':  168,
+    'latest_info_hour': 0,
+    'split_strategy':  'tail',
+    'test_frac':        0.1,
+    'val_strategy':    'random',
+    'val_frac':         0.1,
+    'random_state':     42,
+}
+
+JOINT_TRANSFORMER_PARAMS = {
+    **TRANSFORMER_PARAMS,
+    'out_dim':              24 * len(JOINT_ZONES),
+    'fc_hidden':            256,   # wider output head for 48-dim joint prediction
+    'epochs':               400,
+    'early_stop_patience':  50,
+}
+
+JOINT_LSTM_PARAMS = {
+    **LSTM_PARAMS,
+    'out_dim':              24 * len(JOINT_ZONES),
+    'fc_hidden':            256,
+    'epochs':               400,
+    'early_stop_patience':  50,
 }
 
 # --- Evaluation Config ---
@@ -160,7 +190,7 @@ EVAL_CONFIG = {
     # Shared test split (all models use the same split)
     'split_strategy': 'tail',   # 'head' | 'tail' | 'random'
     'test_frac': 0.1,
-    'val_strategy': 'random',   # sequence model result path only; 'head' | 'tail' | 'random'
+    'val_strategy': 'tail',   # sequence model result path only; 'head' | 'tail' | 'random'
     'val_frac': 0.1,
     'random_state': 42,
     'result_dir': f'results/{DATASET}/evaluation',
@@ -168,28 +198,54 @@ EVAL_CONFIG = {
     # Which models to evaluate and where their saved files are
     'models': {
         'xgboost': {
-            'enabled': 0,
+            'enabled': 1,
             'model_path': f'models/{DATASET}/xgboost/tail_test0.1/xgboost_24_models.pkl',
         },
         'lightgbm': {
-            'enabled': 0,
+            'enabled': 1,
             'model_path': f'models/{DATASET}/lightgbm/tail_test0.1/lightgbm_24_models.pkl',
         },
         'transformer': {
-            'enabled': 0,
-            'model_path': f'models/{DATASET}/transformer/tail_test0.1_random_val0.1/transformer_best.pth',
+            'enabled': 1,
+            'model_path': f'models/{DATASET}/transformer/tail_test0.1_tail_val0.1/transformer_best.pth',
         },
         'lstm': {
-            'enabled': 0,
-            'model_path': f'models/{DATASET}/lstm/tail_test0.1_random_val0.1/lstm_best.pth',
+            'enabled': 1,
+            'model_path': f'models/{DATASET}/lstm/tail_test0.1_tail_val0.1/lstm_best.pth',
         },
     },
 
     # Single-day plot mode: load model, find date in matrix, show plot interactively
     'single_day': {
-        'enabled': 1,
+        'enabled': 0,
         'model': 'xgboost',
         'model_path': f'models/{DATASET}/xgboost/head_test0.1/xgboost_24_models.pkl',
         'date': '2025-11-02',
+    },
+}
+
+# --- Joint Evaluation Config ---
+JOINT_EVAL_CONFIG = {
+    'split_strategy': 'tail',
+    'test_frac':       0.1,
+    'val_strategy':   'tail',
+    'val_frac':        0.1,
+    'random_state':    42,
+    'result_dir':     f'results/{JOINT_DATASET}/evaluation',
+    'models': {
+        'transformer': {
+            'enabled': 1,
+            'model_path': f'models/{JOINT_DATASET}/transformer/tail_test0.1_tail_val0.1/transformer_best.pth',
+        },
+        'lstm': {
+            'enabled': 1,
+            'model_path': f'models/{JOINT_DATASET}/lstm/tail_test0.1_tail_val0.1/lstm_best.pth',
+        },
+    },
+    'single_day': {
+        'enabled':    0,
+        'model_type': 'transformer',
+        'model_path': f'models/{JOINT_DATASET}/transformer/tail_test0.1_random_val0.1/transformer_best.pth',
+        'date':       '2024-08-15',
     },
 }

@@ -131,10 +131,10 @@ class ModelEvaluator:
                 CLEANED_PATH, MATRIX_DIR
             )
             import glob
-            scaler_files = glob.glob(os.path.join(MATRIX_DIR, 'scaler_ts_*.pkl'))
-            if not scaler_files:
-                raise FileNotFoundError(f"No scaler file found in {MATRIX_DIR}")
-            self.scaler_ts = joblib.load(scaler_files[0])
+            y_scaler_files = glob.glob(os.path.join(MATRIX_DIR, 'y_scaler_*.pkl'))
+            if not y_scaler_files:
+                raise FileNotFoundError(f"No y_scaler file found in {MATRIX_DIR}")
+            self.y_scaler = joblib.load(y_scaler_files[0])
 
     # --- Test split helpers ---
 
@@ -180,10 +180,8 @@ class ModelEvaluator:
 
     def _inverse_transform(self, scaled_2d):
         N, P = scaled_2d.shape
-        flat = scaled_2d.flatten()
-        dummy = np.zeros((len(flat), self.scaler_ts.n_features_in_))
-        dummy[:, 0] = flat
-        return self.scaler_ts.inverse_transform(dummy)[:, 0].reshape(N, P)
+        flat = scaled_2d.flatten().reshape(-1, 1)
+        return self.y_scaler.inverse_transform(flat).reshape(N, P)
 
     # --- Metrics & detailed df ---
 
@@ -196,7 +194,8 @@ class ModelEvaluator:
             'true_load': y_true_np.flatten(),
             f'{model_name}_pred': y_pred_np.flatten(),
         })
-        df['abs_error'] = (df['true_load'] - df[f'{model_name}_pred']).abs()
+        df['signed_error'] = df[f'{model_name}_pred'] - df['true_load']
+        df['abs_error'] = df['signed_error'].abs()
         df['mape_pct'] = df['abs_error'] / df['true_load'] * 100
         df['day_of_week'] = df['datetime'].dt.dayofweek
         df['day_of_month'] = df['datetime'].dt.day
@@ -275,20 +274,22 @@ class ModelEvaluator:
         print(f"Best/worst day plots saved to: {save_path}")
 
     def _plot_error_histogram(self, model_name, detailed_df, result_dir):
+        signed_err = detailed_df['signed_error'].values
+        signed_pct = (detailed_df['signed_error'] / detailed_df['true_load'] * 100).values
+
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        fig.suptitle(f'{model_name} — Error Distribution', fontsize=14, fontweight='bold')
+        fig.suptitle(f'{model_name} — Error Distribution  (+) = over-predict', fontsize=14, fontweight='bold')
 
-        axes[0].hist(detailed_df['abs_error'], bins=50, color='#4C72B0', edgecolor='black', alpha=0.8)
-        axes[0].set_title('Absolute Error (MW)', fontsize=12)
-        axes[0].set_xlabel('Absolute Error (MW)')
-        axes[0].set_ylabel('Count')
-        axes[0].grid(axis='y', linestyle='--', alpha=0.7)
-
-        axes[1].hist(detailed_df['mape_pct'], bins=50, color='#C44E52', edgecolor='black', alpha=0.8)
-        axes[1].set_title('Absolute Percentage Error (%)', fontsize=12)
-        axes[1].set_xlabel('APE (%)')
-        axes[1].set_ylabel('Count')
-        axes[1].grid(axis='y', linestyle='--', alpha=0.7)
+        for ax, vals, label, color in [
+            (axes[0], signed_err, 'Signed Error (MW)', '#4C72B0'),
+            (axes[1], signed_pct, 'Signed Percentage Error (%)', '#C44E52'),
+        ]:
+            ax.hist(vals, bins=50, color=color, edgecolor='black', alpha=0.8)
+            ax.axvline(0, color='black', linewidth=1.2, linestyle='--')
+            ax.set_xlabel(label)
+            ax.set_ylabel('Count')
+            ax.set_title(label, fontsize=12)
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
 
         plt.tight_layout()
         save_path = os.path.join(result_dir, f'{model_name}_error_histogram.png')
@@ -297,26 +298,30 @@ class ModelEvaluator:
         print(f"Error histogram saved to: {save_path}")
 
     def _plot_error_cdf(self, model_name, detailed_df, result_dir):
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        fig.suptitle(f'{model_name} — Error CDF (Reliability Curve)', fontsize=14, fontweight='bold')
+        signed_err = detailed_df['signed_error'].values
+        signed_pct = (detailed_df['signed_error'] / detailed_df['true_load'] * 100).values
 
-        for ax, col, label, color in [
-            (axes[0], 'abs_error', 'Absolute Error (MW)', '#4C72B0'),
-            (axes[1], 'mape_pct', 'APE (%)',              '#C44E52'),
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle(f'{model_name} — Error CDF  (+) = over-predict', fontsize=14, fontweight='bold')
+
+        for ax, vals, label, color in [
+            (axes[0], signed_err, 'Signed Error (MW)', '#4C72B0'),
+            (axes[1], signed_pct, 'Signed Percentage Error (%)', '#C44E52'),
         ]:
-            sorted_vals = np.sort(detailed_df[col].values)
+            sorted_vals = np.sort(vals)
             cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals) * 100
             ax.plot(sorted_vals, cdf, color=color, linewidth=2)
+            ax.axvline(0, color='black', linewidth=1.2, linestyle='--', label='Zero bias')
             ax.set_xlabel(label)
             ax.set_ylabel('Cumulative % of Hours')
             ax.set_title(f'CDF of {label}', fontsize=12)
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0f}%'))
             ax.grid(linestyle='--', alpha=0.7)
 
-            for pct in [50, 90, 95]:
+            for pct in [10, 50, 90]:
                 threshold = np.percentile(sorted_vals, pct)
-                ax.axvline(threshold, linestyle='--', linewidth=1, alpha=0.7,
-                           label=f'P{pct}: {threshold:.2f}')
+                ax.axvline(threshold, linestyle=':', linewidth=1, alpha=0.7,
+                           label=f'P{pct}: {threshold:+.2f}')
             ax.legend(fontsize=9)
 
         plt.tight_layout()
@@ -325,16 +330,57 @@ class ModelEvaluator:
         plt.close()
         print(f"Error CDF saved to: {save_path}")
 
+    def _plot_signed_error_vs_load(self, model_name, detailed_df, result_dir):
+        """Scatter plot of signed error (pred - true) vs true load, coloured by hour of day."""
+        fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+        fig.suptitle(f'{model_name} — Signed Error vs Load', fontsize=14, fontweight='bold')
+
+        true_load = detailed_df['true_load'].values
+        signed_err = detailed_df['signed_error'].values
+        hours = detailed_df['datetime'].dt.hour.values
+
+        # Left: scatter coloured by hour of day
+        sc = axes[0].scatter(true_load, signed_err, c=hours, cmap='twilight_shifted',
+                             s=4, alpha=0.4, rasterized=True)
+        axes[0].axhline(0, color='black', linewidth=1.0, linestyle='--')
+        cbar = fig.colorbar(sc, ax=axes[0])
+        cbar.set_label('Hour of Day (EPT)')
+        axes[0].set_xlabel('True Load (MW)')
+        axes[0].set_ylabel('Signed Error (MW)\n(+) = over-predict')
+        axes[0].set_title('Scatter by Hour of Day')
+        axes[0].grid(linestyle='--', alpha=0.5)
+
+        # Right: hourly mean signed error bar chart (bias profile)
+        hourly_me = detailed_df.groupby(detailed_df['datetime'].dt.hour)['signed_error'].mean()
+        colors = ['#C44E52' if v > 0 else '#4C72B0' for v in hourly_me.values]
+        axes[1].bar(hourly_me.index, hourly_me.values, color=colors, edgecolor='black', alpha=0.8)
+        axes[1].axhline(0, color='black', linewidth=1.0)
+        axes[1].set_xlabel('Hour of Day (EPT)')
+        axes[1].set_ylabel('Mean Signed Error (MW)')
+        axes[1].set_title('Mean Bias by Hour')
+        axes[1].set_xticks(range(24))
+        axes[1].grid(axis='y', linestyle='--', alpha=0.6)
+
+        plt.tight_layout()
+        save_path = os.path.join(result_dir, f'{model_name}_signed_error_vs_load.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Signed error scatter saved to: {save_path}")
+
     # --- Core single-model evaluation ---
 
     def _evaluate_one(self, model_name, y_true_np, y_pred_np, timestamps, result_dir):
         os.makedirs(result_dir, exist_ok=True)
         print(f"\n====== {model_name} Error Analysis ======")
 
-        mape = mean_absolute_percentage_error(y_true_np.flatten(), y_pred_np.flatten()) * 100
-        mae  = mean_absolute_error(y_true_np.flatten(), y_pred_np.flatten())
-        rmse = np.sqrt(mean_squared_error(y_true_np.flatten(), y_pred_np.flatten()))
-        print(f"Global -> MAPE: {mape:.2f}% | MAE: {mae:.2f} | RMSE: {rmse:.2f}")
+        flat_true = y_true_np.flatten()
+        flat_pred = y_pred_np.flatten()
+        mape = mean_absolute_percentage_error(flat_true, flat_pred) * 100
+        mae  = mean_absolute_error(flat_true, flat_pred)
+        rmse = np.sqrt(mean_squared_error(flat_true, flat_pred))
+        me   = float(np.mean(flat_pred - flat_true))
+        bias_dir = 'over' if me > 0 else 'under'
+        print(f"Global -> MAPE: {mape:.2f}% | MAE: {mae:.2f} | RMSE: {rmse:.2f} | ME: {me:+.2f} MW ({bias_dir})")
 
         hourly_mape = [
             mean_absolute_percentage_error(y_true_np[:, h], y_pred_np[:, h]) * 100
@@ -352,6 +398,7 @@ class ModelEvaluator:
         self._plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, result_dir)
         self._plot_error_histogram(model_name, detailed_df, result_dir)
         self._plot_error_cdf(model_name, detailed_df, result_dir)
+        self._plot_signed_error_vs_load(model_name, detailed_df, result_dir)
         self._plot_best_worst_days(model_name, detailed_df, daily_mape, result_dir)
 
     # --- Public API ---

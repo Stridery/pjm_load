@@ -64,7 +64,7 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     ept_hours = ept_dt.dt.hour.values
 
     weather_cols = WEATHER_COLS
-    feature_cols = ['Load'] + weather_cols
+    feature_cols = ['Load_Estimated'] + weather_cols
     data_array   = df_final[feature_cols].values
     load_raw     = df_final['Load'].values
     valid_raw    = df_final['is_valid'].values
@@ -96,11 +96,9 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
         past_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]
 
         f = {'timestamp': tomorrow}
-        for k in range(lookback_hours):
-            f[f'load_h{k}'] = past_window[k, 0]
-        for j, col in enumerate(weather_cols):
+        for j, col in enumerate(feature_cols):
             for k in range(lookback_hours):
-                f[f'{col}_h{k}'] = past_window[k, j + 1]
+                f[f'{col.lower()}_h{k}'] = past_window[k, j]
 
         today_meta = df_final[ept_dates == today].iloc[0]
         tmrw_meta  = df_final.iloc[tmrw_pos[0]]
@@ -141,6 +139,7 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     mask_path      = os.path.join(matrix_dir, f'mask_3d_lb{lookback_hours}_h{latest_info_hour}.npy')
     timestamp_path = os.path.join(matrix_dir, f'timestamps_3d_lb{lookback_hours}_h{latest_info_hour}.npy')
     scaler_path    = os.path.join(matrix_dir, f'scaler_ts_lb{lookback_hours}_h{latest_info_hour}.pkl')
+    y_scaler_path  = os.path.join(matrix_dir, f'y_scaler_lb{lookback_hours}_h{latest_info_hour}.pkl')
     os.makedirs(matrix_dir, exist_ok=True)
 
     if all(os.path.exists(p) for p in [x_path, y_path, mask_path, timestamp_path]):
@@ -152,22 +151,28 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     df = df.sort_index()
 
     feature_cols = (
-        ['Load'] + WEATHER_COLS +
+        ['Load_Estimated'] + WEATHER_COLS +
         ['hour_sin', 'hour_cos', 'month_sin', 'month_cos', 'dayofweek', 'is_weekend']
     )
     split_idx = int(len(df) * (1 - TRANSFORMER_FEATURE_CONFIG['test_frac']))
+
     scaler = StandardScaler()
     scaler.fit(df.iloc[:split_idx][feature_cols])
     df_scaled = df.copy()
     df_scaled[feature_cols] = scaler.transform(df[feature_cols])
     joblib.dump(scaler, scaler_path)
 
+    y_scaler = StandardScaler()
+    y_scaler.fit(df.iloc[:split_idx][['Load']])
+    load_scaled = y_scaler.transform(df[['Load']])[:, 0]
+    joblib.dump(y_scaler, y_scaler_path)
+
     ept_dt    = pd.to_datetime(df['Datetime_EPT'])
     ept_dates = ept_dt.dt.date.values
     ept_hours = ept_dt.dt.hour.values
 
     data_array    = df_scaled[feature_cols].values
-    load_array    = df_scaled['Load'].values
+    load_array    = load_scaled
     is_valid_array = df['is_valid'].values
     timestamps    = df.index
     unique_days   = np.unique(ept_dates)

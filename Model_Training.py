@@ -3,8 +3,8 @@ from src.feature_engine import build_or_load_matrix, get_train_test_split, build
 from src.model_trainer import PowerForecaster
 from src.model_evaluator import ModelEvaluator
 
-TEST_STRATEGIES = ['head', 'tail', 'random']
-VAL_STRATEGIES  = ['head', 'tail', 'random']
+TEST_STRATEGIES = ['tail', 'random']
+VAL_STRATEGIES  = ['tail', 'random']
 
 
 def _run_eval(model_name, model_path, split_strategy, feature_cfg):
