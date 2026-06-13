@@ -2,7 +2,7 @@
 import os
 
 # --- Dataset Selection (controls all data / model / result paths) ---
-DATASET = os.environ.get('PJM_DATASET', 'bge')   # override: PJM_DATASET=dom python ...
+DATASET = os.environ.get('PJM_DATASET', 'dom')   # override: PJM_DATASET=dom python ...
 
 # --- Weather Features (per dataset) ---
 # dom columns match the output of data_crawler (Open-Meteo native variables).

@@ -1,111 +1,28 @@
 # src/model_evaluator.py
+import glob
 import os
+
 import joblib
 import numpy as np
 import pandas as pd
-import torch
-import matplotlib.pyplot as plt
-from sklearn.metrics import mean_absolute_percentage_error, mean_absolute_error, mean_squared_error
 
 from src.feature_engine import build_or_load_matrix, build_timeseries_matrix, _split_indices
 from src.config import (
     CLEANED_PATH, MATRIX_DIR, DATASET,
     TRANSFORMER_PARAMS, LSTM_PARAMS,
 )
-from src.model_trainer import TimeSeriesTransformer3D, LSTMModel
+from src.models import transformer as transformer_mod
+from src.models import lstm as lstm_mod
+from src.models import xgboost as xgboost_mod
+from src.models import lightgbm as lightgbm_mod
+from src.models._eval_utils import plot_single_day
 
-
-# ---------------------------------------------------------------------------
-# DST helper
-# ---------------------------------------------------------------------------
-
-def _dst_type(date):
-    """Return 'spring_forward', 'fall_back', or None for a given EPT date."""
-    start = pd.Timestamp(date).tz_localize('America/New_York')
-    end   = pd.Timestamp(date + pd.Timedelta(days=1)).tz_localize('America/New_York')
-    hours = int((end - start).total_seconds() / 3600)
-    if hours == 23: return 'spring_forward'
-    if hours == 25: return 'fall_back'
-    return None
-
-
-def _restore_dst_hours(true_24h, pred_24h, dst):
-    """
-    Undo the 24h normalization for plotting:
-      spring_forward → remove interpolated 2AM → 23 points, x=[0,1,3,...,23]
-      fall_back      → duplicate averaged 1AM  → 25 points, x_labels=[0,1,1,2,...,23]
-    Returns (true_plot, pred_plot, x_positions, x_labels, dst_note).
-    """
-    if dst == 'spring_forward':
-        idx = [i for i in range(24) if i != 2]
-        x_labels = [str(h) for h in ([0, 1] + list(range(3, 24)))]
-        return (true_24h[idx], pred_24h[idx],
-                range(23), x_labels, ' [Spring Fwd]')
-
-    if dst == 'fall_back':
-        true_plot = np.insert(true_24h, 2, true_24h[1])
-        pred_plot = np.insert(pred_24h, 2, pred_24h[1])
-        x_labels  = ['0', '1', '1*'] + [str(h) for h in range(2, 24)]
-        return (true_plot, pred_plot,
-                range(25), x_labels, ' [Fall Back, *=2nd 1AM]')
-
-    return true_24h, pred_24h, range(24), [str(h) for h in range(24)], ''
-
-
-# ---------------------------------------------------------------------------
-# Standalone single-day plot function (public interface)
-# ---------------------------------------------------------------------------
-
-def plot_single_day(model_name, date_str, true_24h, pred_24h, ax=None, pred_color='#C44E52', save_path=None):
-    """
-    Plot true vs predicted load for one day.
-    DST transition days are automatically detected and plotted with the correct
-    number of EPT hours (23 for spring-forward, 25 for fall-back).
-
-    ax=None  → creates its own figure and saves to save_path
-    ax=<Axes> → draws into that axes (for embedding in subplots, save_path ignored)
-    """
-    dst  = _dst_type(pd.Timestamp(date_str).date())
-    true_plot, pred_plot, x_pos, x_labels, dst_note = _restore_dst_hours(
-        np.asarray(true_24h, dtype=float),
-        np.asarray(pred_24h, dtype=float),
-        dst,
-    )
-
-    standalone = ax is None
-    if standalone:
-        _, ax = plt.subplots(figsize=(10, 4))
-
-    ax.plot(x_pos, true_plot, label='True', color='#4C72B0', linewidth=2)
-    ax.plot(x_pos, pred_plot, label='Pred', color=pred_color, linewidth=2, linestyle='--')
-    ax.set_xticks(list(x_pos))
-    ax.set_xticklabels(x_labels, fontsize=7)
-    ax.set_xlabel('Hour (EPT)')
-    ax.set_ylabel('Load (MW)')
-    ax.legend()
-    ax.grid(linestyle='--', alpha=0.6)
-
-    if standalone:
-        if save_path is None:
-            raise ValueError("save_path is required when calling plot_single_day without an ax.")
-        mape = mean_absolute_percentage_error(true_24h, pred_24h) * 100
-        ax.set_title(f'{model_name} | {date_str}{dst_note} | MAPE: {mape:.2f}%', fontsize=12)
-        plt.tight_layout()
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Single-day plot saved to: {save_path}")
-
-
-# ---------------------------------------------------------------------------
-# ModelEvaluator
-# ---------------------------------------------------------------------------
 
 class ModelEvaluator:
     def __init__(self, eval_cfg):
         self.cfg = eval_cfg
         self.X_opt = self.y_opt = None
-        self.X_3d = self.y_3d = self.mask_3d = self.timestamps_3d = self.scaler_ts = None
+        self.X_3d = self.y_3d = self.mask_3d = self.timestamps_3d = self.y_scaler = None
 
     # --- Data loading ---
 
@@ -130,7 +47,6 @@ class ModelEvaluator:
             self.X_3d, self.y_3d, self.mask_3d, self.timestamps_3d = build_timeseries_matrix(
                 CLEANED_PATH, MATRIX_DIR
             )
-            import glob
             y_scaler_files = glob.glob(os.path.join(MATRIX_DIR, 'y_scaler_*.pkl'))
             if not y_scaler_files:
                 raise FileNotFoundError(f"No y_scaler file found in {MATRIX_DIR}")
@@ -159,296 +75,57 @@ class ModelEvaluator:
         )
         return self.X_3d[test_pos], self.y_3d[test_pos], self.timestamps_3d[test_pos]
 
-    # --- Inference ---
-
-    def _predict_tree(self, model_path, X):
-        models = joblib.load(model_path)
-        return np.array([m.predict(X) for m in models]).T  # (N, 24)
-
-    def _predict_sequence(self, model_name, model_path, X_np):
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        num_features = X_np.shape[2]
-        if model_name == 'transformer':
-            model = TimeSeriesTransformer3D(num_features=num_features, params=TRANSFORMER_PARAMS).to(device)
-        else:
-            model = LSTMModel(num_features=num_features, params=LSTM_PARAMS).to(device)
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-        model.eval()
-        with torch.no_grad():
-            preds_scaled = model(torch.FloatTensor(X_np).to(device)).cpu().numpy()
-        return self._inverse_transform(preds_scaled)
-
     def _inverse_transform(self, scaled_2d):
         N, P = scaled_2d.shape
-        flat = scaled_2d.flatten().reshape(-1, 1)
-        return self.y_scaler.inverse_transform(flat).reshape(N, P)
-
-    # --- Metrics & detailed df ---
-
-    def _build_detailed_df(self, model_name, y_true_np, y_pred_np, timestamps):
-        dates = pd.to_datetime(timestamps).repeat(24)
-        hours_arr = np.tile(np.arange(24), len(timestamps))
-        datetimes = dates + pd.to_timedelta(hours_arr, unit='h')
-        df = pd.DataFrame({
-            'datetime': pd.to_datetime(datetimes),
-            'true_load': y_true_np.flatten(),
-            f'{model_name}_pred': y_pred_np.flatten(),
-        })
-        df['signed_error'] = df[f'{model_name}_pred'] - df['true_load']
-        df['abs_error'] = df['signed_error'].abs()
-        df['mape_pct'] = df['abs_error'] / df['true_load'] * 100
-        df['day_of_week'] = df['datetime'].dt.dayofweek
-        df['day_of_month'] = df['datetime'].dt.day
-        df['date'] = df['datetime'].dt.date
-        return df
-
-    # --- Plots ---
-
-    def _plot_error_distributions(self, model_name, hourly_mape, dow_mape, dom_mape, result_dir):
-        plt.figure(figsize=(15, 12))
-
-        plt.subplot(3, 1, 1)
-        plt.bar(range(24), hourly_mape, color='#4C72B0', edgecolor='black', alpha=0.8)
-        plt.title(f'{model_name} - Hourly MAPE (%)', fontsize=14, fontweight='bold')
-        plt.xlabel('Hour of Day (0-23)', fontsize=12)
-        plt.ylabel('MAPE (%)', fontsize=12)
-        plt.xticks(range(24))
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-        plt.subplot(3, 1, 2)
-        days_labels = ['Mon (0)', 'Tue (1)', 'Wed (2)', 'Thu (3)', 'Fri (4)', 'Sat (5)', 'Sun (6)']
-        dow_values = [dow_mape.get(i, 0) for i in range(7)]
-        plt.bar(days_labels, dow_values, color='#55A868', edgecolor='black', alpha=0.8)
-        plt.title(f'{model_name} - Day of Week MAPE (%)', fontsize=14, fontweight='bold')
-        plt.xlabel('Day of Week', fontsize=12)
-        plt.ylabel('MAPE (%)', fontsize=12)
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-        plt.subplot(3, 1, 3)
-        dom_idx = sorted(dom_mape.index)
-        dom_values = [dom_mape[d] for d in dom_idx]
-        plt.bar(dom_idx, dom_values, color='#C44E52', edgecolor='black', alpha=0.8)
-        plt.title(f'{model_name} - Day of Month MAPE (%)', fontsize=14, fontweight='bold')
-        plt.xlabel('Day of Month (1-31)', fontsize=12)
-        plt.ylabel('MAPE (%)', fontsize=12)
-        plt.xticks(range(1, 32))
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-        plt.tight_layout()
-        save_path = os.path.join(result_dir, f'{model_name}_error_dashboard.png')
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Error dashboard saved to: {save_path}")
-
-    def _plot_best_worst_days(self, model_name, detailed_df, daily_mape, result_dir):
-        worst_days = list(daily_mape.head(3).index)
-        best_days  = list(daily_mape.tail(3).index[::-1])
-
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        fig.suptitle(f'{model_name} — Best & Worst 3 Days', fontsize=16, fontweight='bold')
-
-        for col, date in enumerate(worst_days):
-            day_df = detailed_df[detailed_df['date'] == date].sort_values('datetime')
-            plot_single_day(
-                model_name, str(date),
-                day_df['true_load'].values,
-                day_df[f'{model_name}_pred'].values,
-                ax=axes[0, col], pred_color='#C44E52',
-            )
-            axes[0, col].set_title(f'Worst #{col+1}: {date}\nMAPE: {daily_mape.loc[date]:.2f}%', fontsize=11)
-
-        for col, date in enumerate(best_days):
-            day_df = detailed_df[detailed_df['date'] == date].sort_values('datetime')
-            plot_single_day(
-                model_name, str(date),
-                day_df['true_load'].values,
-                day_df[f'{model_name}_pred'].values,
-                ax=axes[1, col], pred_color='#55A868',
-            )
-            axes[1, col].set_title(f'Best #{col+1}: {date}\nMAPE: {daily_mape.loc[date]:.2f}%', fontsize=11)
-
-        plt.tight_layout()
-        save_path = os.path.join(result_dir, f'{model_name}_best_worst_days.png')
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Best/worst day plots saved to: {save_path}")
-
-    def _plot_error_histogram(self, model_name, detailed_df, result_dir):
-        signed_err = detailed_df['signed_error'].values
-        signed_pct = (detailed_df['signed_error'] / detailed_df['true_load'] * 100).values
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        fig.suptitle(f'{model_name} — Error Distribution  (+) = over-predict', fontsize=14, fontweight='bold')
-
-        for ax, vals, label, color in [
-            (axes[0], signed_err, 'Signed Error (MW)', '#4C72B0'),
-            (axes[1], signed_pct, 'Signed Percentage Error (%)', '#C44E52'),
-        ]:
-            ax.hist(vals, bins=50, color=color, edgecolor='black', alpha=0.8)
-            ax.axvline(0, color='black', linewidth=1.2, linestyle='--')
-            ax.set_xlabel(label)
-            ax.set_ylabel('Count')
-            ax.set_title(label, fontsize=12)
-            ax.grid(axis='y', linestyle='--', alpha=0.7)
-
-        plt.tight_layout()
-        save_path = os.path.join(result_dir, f'{model_name}_error_histogram.png')
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Error histogram saved to: {save_path}")
-
-    def _plot_error_cdf(self, model_name, detailed_df, result_dir):
-        signed_err = detailed_df['signed_error'].values
-        signed_pct = (detailed_df['signed_error'] / detailed_df['true_load'] * 100).values
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        fig.suptitle(f'{model_name} — Error CDF  (+) = over-predict', fontsize=14, fontweight='bold')
-
-        for ax, vals, label, color in [
-            (axes[0], signed_err, 'Signed Error (MW)', '#4C72B0'),
-            (axes[1], signed_pct, 'Signed Percentage Error (%)', '#C44E52'),
-        ]:
-            sorted_vals = np.sort(vals)
-            cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals) * 100
-            ax.plot(sorted_vals, cdf, color=color, linewidth=2)
-            ax.axvline(0, color='black', linewidth=1.2, linestyle='--', label='Zero bias')
-            ax.set_xlabel(label)
-            ax.set_ylabel('Cumulative % of Hours')
-            ax.set_title(f'CDF of {label}', fontsize=12)
-            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0f}%'))
-            ax.grid(linestyle='--', alpha=0.7)
-
-            for pct in [10, 50, 90]:
-                threshold = np.percentile(sorted_vals, pct)
-                ax.axvline(threshold, linestyle=':', linewidth=1, alpha=0.7,
-                           label=f'P{pct}: {threshold:+.2f}')
-            ax.legend(fontsize=9)
-
-        plt.tight_layout()
-        save_path = os.path.join(result_dir, f'{model_name}_error_cdf.png')
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Error CDF saved to: {save_path}")
-
-    def _plot_signed_error_vs_load(self, model_name, detailed_df, result_dir):
-        """Scatter plot of signed error (pred - true) vs true load, coloured by hour of day."""
-        fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-        fig.suptitle(f'{model_name} — Signed Error vs Load', fontsize=14, fontweight='bold')
-
-        true_load = detailed_df['true_load'].values
-        signed_err = detailed_df['signed_error'].values
-        hours = detailed_df['datetime'].dt.hour.values
-
-        # Left: scatter coloured by hour of day
-        sc = axes[0].scatter(true_load, signed_err, c=hours, cmap='twilight_shifted',
-                             s=4, alpha=0.4, rasterized=True)
-        axes[0].axhline(0, color='black', linewidth=1.0, linestyle='--')
-        cbar = fig.colorbar(sc, ax=axes[0])
-        cbar.set_label('Hour of Day (EPT)')
-        axes[0].set_xlabel('True Load (MW)')
-        axes[0].set_ylabel('Signed Error (MW)\n(+) = over-predict')
-        axes[0].set_title('Scatter by Hour of Day')
-        axes[0].grid(linestyle='--', alpha=0.5)
-
-        # Right: hourly mean signed error bar chart (bias profile)
-        hourly_me = detailed_df.groupby(detailed_df['datetime'].dt.hour)['signed_error'].mean()
-        colors = ['#C44E52' if v > 0 else '#4C72B0' for v in hourly_me.values]
-        axes[1].bar(hourly_me.index, hourly_me.values, color=colors, edgecolor='black', alpha=0.8)
-        axes[1].axhline(0, color='black', linewidth=1.0)
-        axes[1].set_xlabel('Hour of Day (EPT)')
-        axes[1].set_ylabel('Mean Signed Error (MW)')
-        axes[1].set_title('Mean Bias by Hour')
-        axes[1].set_xticks(range(24))
-        axes[1].grid(axis='y', linestyle='--', alpha=0.6)
-
-        plt.tight_layout()
-        save_path = os.path.join(result_dir, f'{model_name}_signed_error_vs_load.png')
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Signed error scatter saved to: {save_path}")
-
-    # --- Core single-model evaluation ---
-
-    def _evaluate_one(self, model_name, y_true_np, y_pred_np, timestamps, result_dir):
-        os.makedirs(result_dir, exist_ok=True)
-        print(f"\n====== {model_name} Error Analysis ======")
-
-        flat_true = y_true_np.flatten()
-        flat_pred = y_pred_np.flatten()
-        mape = mean_absolute_percentage_error(flat_true, flat_pred) * 100
-        mae  = mean_absolute_error(flat_true, flat_pred)
-        rmse = np.sqrt(mean_squared_error(flat_true, flat_pred))
-        me   = float(np.mean(flat_pred - flat_true))
-        bias_dir = 'over' if me > 0 else 'under'
-        print(f"Global -> MAPE: {mape:.2f}% | MAE: {mae:.2f} | RMSE: {rmse:.2f} | ME: {me:+.2f} MW ({bias_dir})")
-
-        hourly_mape = [
-            mean_absolute_percentage_error(y_true_np[:, h], y_pred_np[:, h]) * 100
-            for h in range(24)
-        ]
-        detailed_df = self._build_detailed_df(model_name, y_true_np, y_pred_np, timestamps)
-        dow_mape   = detailed_df.groupby('day_of_week')['mape_pct'].mean()
-        dom_mape   = detailed_df.groupby('day_of_month')['mape_pct'].mean()
-        daily_mape = detailed_df.groupby('date')['mape_pct'].mean().sort_values(ascending=False)
-
-        csv_path = os.path.join(result_dir, f'{model_name}_detailed_errors.csv')
-        detailed_df.drop(columns=['date']).to_csv(csv_path, index=False)
-        print(f"Detailed errors saved to: {csv_path}")
-
-        self._plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, result_dir)
-        self._plot_error_histogram(model_name, detailed_df, result_dir)
-        self._plot_error_cdf(model_name, detailed_df, result_dir)
-        self._plot_signed_error_vs_load(model_name, detailed_df, result_dir)
-        self._plot_best_worst_days(model_name, detailed_df, daily_mape, result_dir)
+        return (
+            self.y_scaler
+            .inverse_transform(scaled_2d.flatten().reshape(-1, 1))
+            .reshape(N, P)
+        )
 
     # --- Public API ---
 
     def evaluate_all(self):
-        result_base = self.cfg.get('result_dir', 'results/evaluation')
-        strategy    = self.cfg['split_strategy']
+        result_base  = self.cfg.get('result_dir', 'results/evaluation')
+        strategy     = self.cfg['split_strategy']
+        val_strategy = self.cfg.get('val_strategy', '')
+        val_frac     = self.cfg.get('val_frac', '')
 
         tree_enabled = [m for m in ['xgboost', 'lightgbm'] if self.cfg['models'][m]['enabled']]
         if tree_enabled:
             X_test, y_test = self._tree_test_split()
+            y_true_np  = y_test.values
             timestamps = pd.to_datetime(y_test.index)
-            y_true_np  = y_test.values  # already in MW, no scaling
+            run_tag    = f"{strategy}_test{self.cfg['test_frac']}"
 
             for model_name in tree_enabled:
                 print(f"\n====== Loading {model_name.upper()} ======")
-                y_pred_np = self._predict_tree(
-                    self.cfg['models'][model_name]['model_path'], X_test
-                )
-                run_tag = f"{strategy}_test{self.cfg['test_frac']}"
+                model_path = self.cfg['models'][model_name]['model_path']
                 result_dir = os.path.join(result_base, model_name, run_tag)
-                self._evaluate_one(model_name.upper(), y_true_np, y_pred_np, timestamps, result_dir)
+                mod = xgboost_mod if model_name == 'xgboost' else lightgbm_mod
+                mod.evaluate(model_path, X_test, y_true_np, timestamps, result_dir)
 
         seq_enabled = [m for m in ['transformer', 'lstm'] if self.cfg['models'][m]['enabled']]
         if seq_enabled:
             X_te, y_te_scaled, test_timestamps = self._seq_test_split()
             y_true_mw = self._inverse_transform(y_te_scaled)
 
-            val_strategy = self.cfg.get('val_strategy', '')
-            val_frac     = self.cfg.get('val_frac', '')
+            if val_strategy:
+                run_tag = f"{strategy}_test{self.cfg['test_frac']}_{val_strategy}_val{val_frac}"
+            else:
+                run_tag = strategy
 
             for model_name in seq_enabled:
                 print(f"\n====== Loading {model_name.upper()} ======")
-                y_pred_mw = self._predict_sequence(
-                    model_name,
-                    self.cfg['models'][model_name]['model_path'],
-                    X_te,
-                )
-                if val_strategy:
-                    run_tag = f"{strategy}_test{self.cfg['test_frac']}_{val_strategy}_val{val_frac}"
-                else:
-                    run_tag = strategy
+                model_path = self.cfg['models'][model_name]['model_path']
                 result_dir = os.path.join(result_base, model_name, run_tag)
-                self._evaluate_one(model_name.upper(), y_true_mw, y_pred_mw, test_timestamps, result_dir)
+                mod    = transformer_mod if model_name == 'transformer' else lstm_mod
+                params = TRANSFORMER_PARAMS if model_name == 'transformer' else LSTM_PARAMS
+                mod.evaluate(model_path, X_te, y_true_mw, self.y_scaler,
+                             test_timestamps, result_dir, params)
 
     def show_single_day(self, model_name, model_path, date_str):
-        """
-        Load a saved model, find `date_str` in the full matrix, run inference,
-        and display an interactive 24-hour plot. Nothing is saved to disk.
-        """
+        from pathlib import Path
 
         if model_name in ['xgboost', 'lightgbm']:
             target = pd.to_datetime(date_str)
@@ -456,19 +133,21 @@ class ModelEvaluator:
                 raise ValueError(f"{date_str} not found in 2D matrix index.")
             x_row    = self.X_opt.loc[[target]].drop(columns=['is_target_valid'])
             true_24h = self.y_opt.loc[target].values
-            pred_24h = self._predict_tree(model_path, x_row).flatten()
+            mod      = xgboost_mod if model_name == 'xgboost' else lightgbm_mod
+            pred_24h = mod.predict(model_path, x_row).flatten()
 
         else:  # transformer / lstm
             target = pd.to_datetime(date_str)
             idx = np.where(pd.to_datetime(self.timestamps_3d) == target)[0]
             if len(idx) == 0:
                 raise ValueError(f"{date_str} not found in 3D matrix timestamps.")
-            pred_24h = self._predict_sequence(model_name, model_path, self.X_3d[idx]).flatten()
+            mod    = transformer_mod if model_name == 'transformer' else lstm_mod
+            params = TRANSFORMER_PARAMS if model_name == 'transformer' else LSTM_PARAMS
+            pred_24h = self._inverse_transform(
+                mod.predict(model_path, self.X_3d[idx], params)
+            ).flatten()
             true_24h = self._inverse_transform(self.y_3d[idx]).flatten()
 
-        # model_path e.g. models/dom/lstm/tail_test0.1_random_val0.1/lstm_best.pth
-        # → save to results/dom/singleday/lstm/tail_test0.1_random_val0.1/2023-08-15.png
-        from pathlib import Path
-        model_subdir = os.path.join(*Path(model_path).parts[2:-1])  # skip 'models/<dataset>'
+        model_subdir = os.path.join(*Path(model_path).parts[2:-1])
         save_path = os.path.join('results', DATASET, 'singleday', model_subdir, f'{date_str}.png')
         plot_single_day(model_name.upper(), date_str, true_24h, pred_24h, save_path=save_path)

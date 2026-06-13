@@ -3,19 +3,19 @@
 Joint model evaluator: handles multi-zone predictions.
 
 Each zone's 24-hour slice is inverse-transformed with its own y_scaler,
-then evaluated independently using the existing _evaluate_one / plot logic.
+then evaluated independently using EvalUtils.
 """
 
-import glob
 import os
 
-import joblib
 import numpy as np
-import torch
+import pandas as pd
 
-from .feature_engine import _split_indices
-from .model_evaluator import ModelEvaluator, plot_single_day
-from .model_trainer import TimeSeriesTransformer3D, LSTMModel
+from src.feature_engine import _split_indices
+from src.models import transformer as transformer_mod
+from src.models import lstm as lstm_mod
+from src.models._eval_utils import EvalUtils, plot_single_day
+from src.model_evaluator import ModelEvaluator
 
 
 class JointModelEvaluator:
@@ -26,7 +26,7 @@ class JointModelEvaluator:
         """
         self.cfg    = eval_cfg
         self.zones  = zones
-        self._base  = ModelEvaluator(eval_cfg)   # reuse plot / metric logic
+        self._base  = ModelEvaluator(eval_cfg)   # reuse data-loading helpers
 
         self.X_3d = self.y_3d = self.mask_3d = self.timestamps = None
         self.y_scalers: dict = {}
@@ -40,9 +40,8 @@ class JointModelEvaluator:
             JOINT_ZONES, JOINT_CLEANED_PATH, JOINT_MATRIX_DIR,
             JOINT_FEATURE_CONFIG, _WEATHER_COLS,
         )
-        from .joint_feature_engine import build_joint_cleaned, build_joint_timeseries_matrix
+        from src.joint_feature_engine import build_joint_cleaned, build_joint_timeseries_matrix
 
-        # Build joint cleaned CSV if missing
         if not os.path.exists(JOINT_CLEANED_PATH):
             build_joint_cleaned(JOINT_ZONES)
 
@@ -80,16 +79,10 @@ class JointModelEvaluator:
 
     def _predict(self, model_type: str, model_path: str, X_np: np.ndarray) -> np.ndarray:
         from src.config import JOINT_TRANSFORMER_PARAMS, JOINT_LSTM_PARAMS
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        num_features = X_np.shape[2]
         if model_type == 'transformer':
-            model = TimeSeriesTransformer3D(num_features, JOINT_TRANSFORMER_PARAMS).to(device)
+            return transformer_mod.predict(model_path, X_np, JOINT_TRANSFORMER_PARAMS)
         else:
-            model = LSTMModel(num_features, JOINT_LSTM_PARAMS).to(device)
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-        model.eval()
-        with torch.no_grad():
-            return model(torch.FloatTensor(X_np).to(device)).cpu().numpy()
+            return lstm_mod.predict(model_path, X_np, JOINT_LSTM_PARAMS)
 
     # ------------------------------------------------------------------ #
     # Evaluate all enabled models                                          #
@@ -125,13 +118,13 @@ class JointModelEvaluator:
             run_tag = f"{cfg['split_strategy']}_test{cfg['test_frac']}{val_tag}"
 
             for i, zone in enumerate(self.zones):
-                start, end  = i * 24, (i + 1) * 24
-                true_mw     = self._inv(y_te[:, start:end], zone)
-                pred_mw     = self._inv(y_pred_scaled[:, start:end], zone)
-                result_dir  = os.path.join(result_base, model_type, run_tag, zone)
-                label       = f'joint_{model_type}_{zone.upper()}'
+                start, end = i * 24, (i + 1) * 24
+                true_mw    = self._inv(y_te[:, start:end], zone)
+                pred_mw    = self._inv(y_pred_scaled[:, start:end], zone)
+                result_dir = os.path.join(result_base, model_type, run_tag, zone)
+                label      = f'joint_{model_type}_{zone.upper()}'
                 print(f'\n====== {label} Error Analysis ======')
-                self._base._evaluate_one(label, true_mw, pred_mw, ts_te, result_dir)
+                EvalUtils.evaluate_one(label, true_mw, pred_mw, ts_te, result_dir)
 
     # ------------------------------------------------------------------ #
     # Single-day plot                                                      #
@@ -139,9 +132,8 @@ class JointModelEvaluator:
 
     def show_single_day(self, model_type: str, model_path: str, date_str: str):
         from src.config import JOINT_DATASET
-        import pandas as pd
 
-        target = pd.Timestamp(date_str).date()
+        target   = pd.Timestamp(date_str).date()
         ts_dates = [pd.Timestamp(t).date() if not hasattr(t, 'year') else t
                     for t in self.timestamps]
         idx = np.where([d == target for d in ts_dates])[0]
@@ -152,10 +144,10 @@ class JointModelEvaluator:
         y_true_scaled = self.y_3d[idx]
 
         for i, zone in enumerate(self.zones):
-            start, end  = i * 24, (i + 1) * 24
-            true_mw     = self._inv(y_true_scaled[:, start:end], zone).flatten()
-            pred_mw     = self._inv(y_pred_scaled[:, start:end], zone).flatten()
-            save_path   = os.path.join(
+            start, end = i * 24, (i + 1) * 24
+            true_mw    = self._inv(y_true_scaled[:, start:end], zone).flatten()
+            pred_mw    = self._inv(y_pred_scaled[:, start:end], zone).flatten()
+            save_path  = os.path.join(
                 'results', JOINT_DATASET, 'singleday', model_type, f'{date_str}_{zone}.png'
             )
             plot_single_day(

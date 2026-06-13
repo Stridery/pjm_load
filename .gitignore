@@ -9,8 +9,8 @@ __pycache__/
 data/
 
 # 模型权重和结果
-models/
-results/
+/models/
+/results/
 
 # 日志文件
 logs/

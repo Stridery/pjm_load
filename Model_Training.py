@@ -1,7 +1,10 @@
 import src.config as cfg
 from src.feature_engine import build_or_load_matrix, get_train_test_split, build_timeseries_matrix
-from src.model_trainer import PowerForecaster
 from src.model_evaluator import ModelEvaluator
+from src.models import xgboost as xgb_mod
+from src.models import lightgbm as lgb_mod
+from src.models import transformer as transformer_mod
+from src.models import lstm as lstm_mod
 
 TEST_STRATEGIES = ['tail', 'random']
 VAL_STRATEGIES  = ['tail', 'random']
@@ -38,17 +41,16 @@ if cfg.TRAIN_CONFIG['xgboost'] or cfg.TRAIN_CONFIG['lightgbm']:
 
         cfg.TREE_FEATURE_CONFIG['split_strategy'] = test_strategy
         X_train, y_train, X_test, y_test = get_train_test_split(X_opt, y_opt)
-        forecaster = PowerForecaster(X_train, y_train, X_test, y_test)
 
         if cfg.TRAIN_CONFIG['xgboost']:
-            forecaster.train_xgboost(cfg.XGB_PARAMS)
+            xgb_mod.train(X_train, y_train, cfg.XGB_PARAMS, cfg.TREE_FEATURE_CONFIG)
             tf = cfg.TREE_FEATURE_CONFIG
             _run_eval('xgboost',
                       f'models/{cfg.DATASET}/xgboost/{test_strategy}_test{tf["test_frac"]}/xgboost_24_models.pkl',
                       test_strategy, tf)
 
         if cfg.TRAIN_CONFIG['lightgbm']:
-            forecaster.train_lightgbm(cfg.LGBM_PARAMS)
+            lgb_mod.train(X_train, y_train, cfg.LGBM_PARAMS, cfg.TREE_FEATURE_CONFIG)
             tf = cfg.TREE_FEATURE_CONFIG
             _run_eval('lightgbm',
                       f'models/{cfg.DATASET}/lightgbm/{test_strategy}_test{tf["test_frac"]}/lightgbm_24_models.pkl',
@@ -67,9 +69,7 @@ if cfg.TRAIN_CONFIG['transformer']:
             cfg.TRANSFORMER_FEATURE_CONFIG['split_strategy'] = test_strategy
             cfg.TRANSFORMER_FEATURE_CONFIG['val_strategy']   = val_strategy
 
-            PowerForecaster(None, None, None, None).train_transformer_3d(
-                X_3d=X_3d, y_3d=y_3d, mask_3d=mask_3d, params=cfg.TRANSFORMER_PARAMS
-            )
+            transformer_mod.train(X_3d, y_3d, mask_3d, cfg.TRANSFORMER_PARAMS, cfg.TRANSFORMER_FEATURE_CONFIG)
             tf = cfg.TRANSFORMER_FEATURE_CONFIG
             _run_eval('transformer',
                       f'models/{cfg.DATASET}/transformer/{test_strategy}_test{tf["test_frac"]}_{val_strategy}_val{tf["val_frac"]}/transformer_best.pth',
@@ -88,9 +88,7 @@ if cfg.TRAIN_CONFIG['lstm']:
             cfg.LSTM_FEATURE_CONFIG['split_strategy'] = test_strategy
             cfg.LSTM_FEATURE_CONFIG['val_strategy']   = val_strategy
 
-            PowerForecaster(None, None, None, None).train_lstm_3d(
-                X_3d=X_3d, y_3d=y_3d, mask_3d=mask_3d, params=cfg.LSTM_PARAMS
-            )
+            lstm_mod.train(X_3d, y_3d, mask_3d, cfg.LSTM_PARAMS, cfg.LSTM_FEATURE_CONFIG)
             lf = cfg.LSTM_FEATURE_CONFIG
             _run_eval('lstm',
                       f'models/{cfg.DATASET}/lstm/{test_strategy}_test{lf["test_frac"]}_{val_strategy}_val{lf["val_frac"]}/lstm_best.pth',

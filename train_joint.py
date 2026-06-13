@@ -13,8 +13,9 @@ import os
 
 import src.config as cfg
 from src.joint_feature_engine import build_joint_cleaned, build_joint_timeseries_matrix
-from src.model_trainer import PowerForecaster
 from src.joint_model_evaluator import JointModelEvaluator
+from src.models import transformer as transformer_mod
+from src.models import lstm as lstm_mod
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,11 +23,11 @@ logging.basicConfig(
     datefmt='%H:%M:%S',
 )
 
-ZONES      = cfg.JOINT_ZONES
-DATASET    = cfg.JOINT_DATASET
-FEAT_CFG   = cfg.JOINT_FEATURE_CONFIG
-T_PARAMS   = cfg.JOINT_TRANSFORMER_PARAMS
-L_PARAMS   = cfg.JOINT_LSTM_PARAMS
+ZONES    = cfg.JOINT_ZONES
+DATASET  = cfg.JOINT_DATASET
+FEAT_CFG = cfg.JOINT_FEATURE_CONFIG
+T_PARAMS = cfg.JOINT_TRANSFORMER_PARAMS
+L_PARAMS = cfg.JOINT_LSTM_PARAMS
 
 TEST_STRATEGIES = ['tail', 'random']
 VAL_STRATEGIES  = ['tail', 'random']
@@ -58,8 +59,6 @@ print(f'X shape: {X_3d.shape} | y shape: {y_3d.shape} | valid: {mask_3d.sum()}/{
 # ---------------------------------------------------------------------------
 # Step 3: Train and evaluate
 # ---------------------------------------------------------------------------
-forecaster = PowerForecaster(None, None, None, None)
-
 for test_strategy in TEST_STRATEGIES:
     for val_strategy in VAL_STRATEGIES:
         FEAT_CFG['split_strategy'] = test_strategy
@@ -74,14 +73,8 @@ for test_strategy in TEST_STRATEGIES:
             'random_state':   FEAT_CFG['random_state'],
             'result_dir':     f'results/{DATASET}/evaluation',
             'models': {
-                'transformer': {
-                    'enabled': 0,
-                    'model_path': f'models/{DATASET}/transformer/{run_tag}/transformer_best.pth',
-                },
-                'lstm': {
-                    'enabled': 0,
-                    'model_path': f'models/{DATASET}/lstm/{run_tag}/lstm_best.pth',
-                },
+                'transformer': {'enabled': 0, 'model_path': f'models/{DATASET}/transformer/{run_tag}/transformer_best.pth'},
+                'lstm':        {'enabled': 0, 'model_path': f'models/{DATASET}/lstm/{run_tag}/lstm_best.pth'},
             },
         }
 
@@ -89,10 +82,7 @@ for test_strategy in TEST_STRATEGIES:
         print(f"\n{'='*60}")
         print(f'Joint Transformer | test: {test_strategy} | val: {val_strategy}')
         print('='*60)
-        forecaster.train_transformer_3d(
-            X_3d, y_3d, mask_3d, T_PARAMS,
-            feature_cfg=FEAT_CFG, dataset=DATASET,
-        )
+        transformer_mod.train(X_3d, y_3d, mask_3d, T_PARAMS, FEAT_CFG, DATASET)
         t_path = f'models/{DATASET}/transformer/{run_tag}/transformer_best.pth'
         eval_cfg['models']['transformer'] = {'enabled': 1, 'model_path': t_path}
         evaluator = JointModelEvaluator(eval_cfg, ZONES)
@@ -108,10 +98,7 @@ for test_strategy in TEST_STRATEGIES:
         print(f"\n{'='*60}")
         print(f'Joint LSTM | test: {test_strategy} | val: {val_strategy}')
         print('='*60)
-        forecaster.train_lstm_3d(
-            X_3d, y_3d, mask_3d, L_PARAMS,
-            feature_cfg=FEAT_CFG, dataset=DATASET,
-        )
+        lstm_mod.train(X_3d, y_3d, mask_3d, L_PARAMS, FEAT_CFG, DATASET)
         l_path = f'models/{DATASET}/lstm/{run_tag}/lstm_best.pth'
         eval_cfg['models']['lstm'] = {'enabled': 1, 'model_path': l_path}
         evaluator = JointModelEvaluator(eval_cfg, ZONES)
