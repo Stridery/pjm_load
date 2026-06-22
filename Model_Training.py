@@ -6,8 +6,8 @@ from src.models import lightgbm as lgb_mod
 from src.models import transformer as transformer_mod
 from src.models import lstm as lstm_mod
 
-TEST_STRATEGIES = ['tail', 'random']
-VAL_STRATEGIES  = ['tail', 'random']
+TEST_STRATEGIES = ['tail']
+VAL_STRATEGIES  = ['tail']
 
 
 def _run_eval(model_name, model_path, split_strategy, feature_cfg):
@@ -46,14 +46,14 @@ if cfg.TRAIN_CONFIG['xgboost'] or cfg.TRAIN_CONFIG['lightgbm']:
             xgb_mod.train(X_train, y_train, cfg.XGB_PARAMS, cfg.TREE_FEATURE_CONFIG)
             tf = cfg.TREE_FEATURE_CONFIG
             _run_eval('xgboost',
-                      f'models/{cfg.DATASET}/xgboost/{test_strategy}_test{tf["test_frac"]}/xgboost_24_models.pkl',
+                      f'models/{cfg.DATASET}/xgboost/{test_strategy}_test{tf["test_frac"]}{cfg._xgb_lds}/xgboost_24_models.pkl',
                       test_strategy, tf)
 
         if cfg.TRAIN_CONFIG['lightgbm']:
             lgb_mod.train(X_train, y_train, cfg.LGBM_PARAMS, cfg.TREE_FEATURE_CONFIG)
             tf = cfg.TREE_FEATURE_CONFIG
             _run_eval('lightgbm',
-                      f'models/{cfg.DATASET}/lightgbm/{test_strategy}_test{tf["test_frac"]}/lightgbm_24_models.pkl',
+                      f'models/{cfg.DATASET}/lightgbm/{test_strategy}_test{tf["test_frac"]}{cfg._lgbm_lds}/lightgbm_24_models.pkl',
                       test_strategy, tf)
 
 # --- Transformer ---
@@ -72,7 +72,7 @@ if cfg.TRAIN_CONFIG['transformer']:
             transformer_mod.train(X_3d, y_3d, mask_3d, cfg.TRANSFORMER_PARAMS, cfg.TRANSFORMER_FEATURE_CONFIG)
             tf = cfg.TRANSFORMER_FEATURE_CONFIG
             _run_eval('transformer',
-                      f'models/{cfg.DATASET}/transformer/{test_strategy}_test{tf["test_frac"]}_{val_strategy}_val{tf["val_frac"]}/transformer_best.pth',
+                      f'models/{cfg.DATASET}/transformer/{test_strategy}_test{tf["test_frac"]}_{val_strategy}_val{tf["val_frac"]}{cfg._tr_lds}{cfg._tr_fds}/transformer_best.pth',
                       test_strategy, tf)
 
 # --- LSTM ---
@@ -91,5 +91,5 @@ if cfg.TRAIN_CONFIG['lstm']:
             lstm_mod.train(X_3d, y_3d, mask_3d, cfg.LSTM_PARAMS, cfg.LSTM_FEATURE_CONFIG)
             lf = cfg.LSTM_FEATURE_CONFIG
             _run_eval('lstm',
-                      f'models/{cfg.DATASET}/lstm/{test_strategy}_test{lf["test_frac"]}_{val_strategy}_val{lf["val_frac"]}/lstm_best.pth',
+                      f'models/{cfg.DATASET}/lstm/{test_strategy}_test{lf["test_frac"]}_{val_strategy}_val{lf["val_frac"]}{cfg._lstm_lds}{cfg._lstm_fds}/lstm_best.pth',
                       test_strategy, lf)

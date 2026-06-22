@@ -30,10 +30,15 @@ class LSTMModel(nn.Module):
             nn.Linear(fc_hidden, params['out_dim']),
         )
 
-    def forward(self, x):
+    def encode(self, x):
         out, _ = self.lstm(x)
-        out = out[:, -1, :]
-        return self.fc_out(out)
+        return out[:, -1, :]          # (batch, hidden_size)
+
+    def decode(self, features):
+        return self.fc_out(features)
+
+    def forward(self, x):
+        return self.decode(self.encode(x))
 
 
 # ---------------------------------------------------------------------------
@@ -70,14 +75,18 @@ def predict(model_path, X_np, params):
 # ---------------------------------------------------------------------------
 
 def evaluate(model_path, X_test, y_true_mw, y_scaler, timestamps, result_dir,
-             params=None):
-    """Predict, inverse-transform, then run the full evaluation suite."""
+             params=None, X_train=None, y_true_train_mw=None, timestamps_train=None):
+    """Predict, inverse-transform, then run the full evaluation suite. Pass X_train to include train subplot."""
     params = params or LSTM_PARAMS
     y_pred_scaled = predict(model_path, X_test, params)
     N, P = y_pred_scaled.shape
-    y_pred_mw = (
-        y_scaler
-        .inverse_transform(y_pred_scaled.flatten().reshape(-1, 1))
-        .reshape(N, P)
-    )
-    EvalUtils.evaluate_one('LSTM', y_true_mw, y_pred_mw, timestamps, result_dir)
+    y_pred_mw = y_scaler.inverse_transform(y_pred_scaled.flatten().reshape(-1, 1)).reshape(N, P)
+
+    train_df = None
+    if X_train is not None and y_true_train_mw is not None:
+        y_ptr = predict(model_path, X_train, params)
+        N2, P2 = y_ptr.shape
+        y_pred_train_mw = y_scaler.inverse_transform(y_ptr.flatten().reshape(-1, 1)).reshape(N2, P2)
+        train_df = EvalUtils.build_detailed_df('LSTM', y_true_train_mw, y_pred_train_mw, timestamps_train)
+
+    EvalUtils.evaluate_one('LSTM', y_true_mw, y_pred_mw, timestamps, result_dir, train_df)

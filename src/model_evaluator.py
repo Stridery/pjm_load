@@ -52,7 +52,7 @@ class ModelEvaluator:
                 raise FileNotFoundError(f"No y_scaler file found in {MATRIX_DIR}")
             self.y_scaler = joblib.load(y_scaler_files[0])
 
-    # --- Test split helpers ---
+    # --- Split helpers ---
 
     def _tree_test_split(self):
         _, test_pos = _split_indices(
@@ -66,6 +66,18 @@ class ModelEvaluator:
         y_test = self.y_opt.loc[test_idx]
         return X_test, y_test
 
+    def _tree_train_split(self):
+        train_pos, _ = _split_indices(
+            len(self.X_opt),
+            self.cfg['split_strategy'],
+            self.cfg['test_frac'],
+            self.cfg['random_state'],
+        )
+        train_idx = self.X_opt.index[train_pos]
+        X_train = self.X_opt.loc[train_idx].drop(columns=['is_target_valid'])
+        y_train = self.y_opt.loc[train_idx]
+        return X_train, y_train
+
     def _seq_test_split(self):
         _, test_pos = _split_indices(
             len(self.X_3d),
@@ -74,6 +86,15 @@ class ModelEvaluator:
             self.cfg['random_state'],
         )
         return self.X_3d[test_pos], self.y_3d[test_pos], self.timestamps_3d[test_pos]
+
+    def _seq_train_split(self):
+        train_pos, _ = _split_indices(
+            len(self.X_3d),
+            self.cfg['split_strategy'],
+            self.cfg['test_frac'],
+            self.cfg['random_state'],
+        )
+        return self.X_3d[train_pos], self.y_3d[train_pos], self.timestamps_3d[train_pos]
 
     def _inverse_transform(self, scaled_2d):
         N, P = scaled_2d.shape
@@ -86,43 +107,47 @@ class ModelEvaluator:
     # --- Public API ---
 
     def evaluate_all(self):
-        result_base  = self.cfg.get('result_dir', 'results/evaluation')
-        strategy     = self.cfg['split_strategy']
-        val_strategy = self.cfg.get('val_strategy', '')
-        val_frac     = self.cfg.get('val_frac', '')
+        result_base = self.cfg.get('result_dir', 'results/evaluation')
 
         tree_enabled = [m for m in ['xgboost', 'lightgbm'] if self.cfg['models'][m]['enabled']]
         if tree_enabled:
-            X_test, y_test = self._tree_test_split()
-            y_true_np  = y_test.values
-            timestamps = pd.to_datetime(y_test.index)
-            run_tag    = f"{strategy}_test{self.cfg['test_frac']}"
+            X_test, y_test   = self._tree_test_split()
+            X_train, y_train = self._tree_train_split()
+            y_true_np        = y_test.values
+            y_true_train_np  = y_train.values
+            timestamps       = pd.to_datetime(y_test.index)
+            timestamps_train = pd.to_datetime(y_train.index)
 
             for model_name in tree_enabled:
                 print(f"\n====== Loading {model_name.upper()} ======")
                 model_path = self.cfg['models'][model_name]['model_path']
+                # Mirror the model's directory name (includes _lds suffix when applicable)
+                run_tag    = os.path.basename(os.path.dirname(model_path))
                 result_dir = os.path.join(result_base, model_name, run_tag)
                 mod = xgboost_mod if model_name == 'xgboost' else lightgbm_mod
-                mod.evaluate(model_path, X_test, y_true_np, timestamps, result_dir)
+                mod.evaluate(model_path, X_test, y_true_np, timestamps, result_dir,
+                             X_train=X_train, y_true_train=y_true_train_np,
+                             timestamps_train=timestamps_train)
 
         seq_enabled = [m for m in ['transformer', 'lstm'] if self.cfg['models'][m]['enabled']]
         if seq_enabled:
-            X_te, y_te_scaled, test_timestamps = self._seq_test_split()
-            y_true_mw = self._inverse_transform(y_te_scaled)
-
-            if val_strategy:
-                run_tag = f"{strategy}_test{self.cfg['test_frac']}_{val_strategy}_val{val_frac}"
-            else:
-                run_tag = strategy
+            X_te, y_te_scaled, test_timestamps     = self._seq_test_split()
+            X_tr, y_tr_scaled, train_timestamps    = self._seq_train_split()
+            y_true_mw       = self._inverse_transform(y_te_scaled)
+            y_true_train_mw = self._inverse_transform(y_tr_scaled)
 
             for model_name in seq_enabled:
                 print(f"\n====== Loading {model_name.upper()} ======")
                 model_path = self.cfg['models'][model_name]['model_path']
+                # Mirror the model's directory name (includes _lds suffix when applicable)
+                run_tag    = os.path.basename(os.path.dirname(model_path))
                 result_dir = os.path.join(result_base, model_name, run_tag)
                 mod    = transformer_mod if model_name == 'transformer' else lstm_mod
                 params = TRANSFORMER_PARAMS if model_name == 'transformer' else LSTM_PARAMS
                 mod.evaluate(model_path, X_te, y_true_mw, self.y_scaler,
-                             test_timestamps, result_dir, params)
+                             test_timestamps, result_dir, params,
+                             X_train=X_tr, y_true_train_mw=y_true_train_mw,
+                             timestamps_train=train_timestamps)
 
     def show_single_day(self, model_name, model_path, date_str):
         from pathlib import Path

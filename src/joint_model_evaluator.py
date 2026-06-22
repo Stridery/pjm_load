@@ -112,10 +112,8 @@ class JointModelEvaluator:
             print(f'\n====== Loading JOINT {model_type.upper()} ======')
             y_pred_scaled = self._predict(model_type, model_path, X_te)
 
-            val_tag = ''
-            if 'val_strategy' in cfg:
-                val_tag = f"_{cfg['val_strategy']}_val{cfg['val_frac']}"
-            run_tag = f"{cfg['split_strategy']}_test{cfg['test_frac']}{val_tag}"
+            # Mirror the model's directory name (includes _lds suffix when applicable)
+            run_tag = os.path.basename(os.path.dirname(model_path))
 
             for i, zone in enumerate(self.zones):
                 start, end = i * 24, (i + 1) * 24

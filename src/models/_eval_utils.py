@@ -242,33 +242,38 @@ class EvalUtils:
         print(f"Error CDF saved to: {save_path}")
 
     @staticmethod
-    def plot_signed_error_vs_load(model_name, detailed_df, result_dir):
-        fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-        fig.suptitle(f'{model_name} — Signed Error vs Load', fontsize=14, fontweight='bold')
+    def plot_signed_error_vs_load(model_name, detailed_df, result_dir, train_df=None):
+        rows = [('Test', detailed_df)] + ([('Train', train_df)] if train_df is not None else [])
+        n_rows = len(rows)
+        fig, axes_grid = plt.subplots(n_rows, 2, figsize=(16, 5 * n_rows), squeeze=False)
+        fig.suptitle(f'{model_name} — Signed Error vs Load  (+) = over-predict',
+                     fontsize=14, fontweight='bold')
 
-        true_load  = detailed_df['true_load'].values
-        signed_err = detailed_df['signed_error'].values
-        hours      = detailed_df['datetime'].dt.hour.values
+        for row_idx, (split_label, df) in enumerate(rows):
+            ax_sc, ax_bar = axes_grid[row_idx]
 
-        sc = axes[0].scatter(true_load, signed_err, c=hours, cmap='twilight_shifted',
-                             s=4, alpha=0.4, rasterized=True)
-        axes[0].axhline(0, color='black', linewidth=1.0, linestyle='--')
-        cbar = fig.colorbar(sc, ax=axes[0])
-        cbar.set_label('Hour of Day (EPT)')
-        axes[0].set_xlabel('True Load (MW)')
-        axes[0].set_ylabel('Signed Error (MW)\n(+) = over-predict')
-        axes[0].set_title('Scatter by Hour of Day')
-        axes[0].grid(linestyle='--', alpha=0.5)
+            true_load  = df['true_load'].values
+            signed_err = df['signed_error'].values
+            hours      = df['datetime'].dt.hour.values
 
-        hourly_me = detailed_df.groupby(detailed_df['datetime'].dt.hour)['signed_error'].mean()
-        colors = ['#C44E52' if v > 0 else '#4C72B0' for v in hourly_me.values]
-        axes[1].bar(hourly_me.index, hourly_me.values, color=colors, edgecolor='black', alpha=0.8)
-        axes[1].axhline(0, color='black', linewidth=1.0)
-        axes[1].set_xlabel('Hour of Day (EPT)')
-        axes[1].set_ylabel('Mean Signed Error (MW)')
-        axes[1].set_title('Mean Bias by Hour')
-        axes[1].set_xticks(range(24))
-        axes[1].grid(axis='y', linestyle='--', alpha=0.6)
+            sc = ax_sc.scatter(true_load, signed_err, c=hours, cmap='twilight_shifted',
+                               s=4, alpha=0.4, rasterized=True)
+            ax_sc.axhline(0, color='black', linewidth=1.0, linestyle='--')
+            fig.colorbar(sc, ax=ax_sc).set_label('Hour of Day (EPT)')
+            ax_sc.set_xlabel('True Load (MW)')
+            ax_sc.set_ylabel('Signed Error (MW)\n(+) = over-predict')
+            ax_sc.set_title(f'{split_label} — Scatter by Hour of Day')
+            ax_sc.grid(linestyle='--', alpha=0.5)
+
+            hourly_me = df.groupby(df['datetime'].dt.hour)['signed_error'].mean()
+            colors = ['#C44E52' if v > 0 else '#4C72B0' for v in hourly_me.values]
+            ax_bar.bar(hourly_me.index, hourly_me.values, color=colors, edgecolor='black', alpha=0.8)
+            ax_bar.axhline(0, color='black', linewidth=1.0)
+            ax_bar.set_xlabel('Hour of Day (EPT)')
+            ax_bar.set_ylabel('Mean Signed Error (MW)')
+            ax_bar.set_title(f'{split_label} — Mean Bias by Hour')
+            ax_bar.set_xticks(range(24))
+            ax_bar.grid(axis='y', linestyle='--', alpha=0.6)
 
         plt.tight_layout()
         save_path = os.path.join(result_dir, f'{model_name}_signed_error_vs_load.png')
@@ -277,7 +282,51 @@ class EvalUtils:
         print(f"Signed error scatter saved to: {save_path}")
 
     @staticmethod
-    def evaluate_one(model_name, y_true_np, y_pred_np, timestamps, result_dir):
+    def plot_residuals_vs_predicted(model_name, detailed_df, result_dir, train_df=None):
+        pred_col = f'{model_name}_pred'
+        rows = [('Test', detailed_df)] + ([('Train', train_df)] if train_df is not None else [])
+        n_rows = len(rows)
+        fig, axes_grid = plt.subplots(n_rows, 2, figsize=(16, 5 * n_rows), squeeze=False)
+        fig.suptitle(f'{model_name} — Residuals vs Predicted  (+) = over-predict',
+                     fontsize=14, fontweight='bold')
+
+        for row_idx, (split_label, df) in enumerate(rows):
+            ax_sc, ax_bar = axes_grid[row_idx]
+
+            pred_vals = df[pred_col].values
+            residuals = df['signed_error'].values
+            hours     = df['datetime'].dt.hour.values
+
+            sc = ax_sc.scatter(pred_vals, residuals, c=hours, cmap='twilight_shifted',
+                               s=4, alpha=0.4, rasterized=True)
+            ax_sc.axhline(0, color='black', linewidth=1.0, linestyle='--')
+            fig.colorbar(sc, ax=ax_sc).set_label('Hour of Day (EPT)')
+            ax_sc.set_xlabel('Predicted Load (MW)')
+            ax_sc.set_ylabel('Residual (MW)\n(+) = over-predict')
+            ax_sc.set_title(f'{split_label} — Scatter by Hour of Day')
+            ax_sc.grid(linestyle='--', alpha=0.5)
+
+            pred_decile = pd.qcut(df[pred_col], q=10, labels=False, duplicates='drop')
+            bin_centers = df.groupby(pred_decile)[pred_col].mean()
+            bin_resid   = df.groupby(pred_decile)['signed_error'].mean()
+            colors = ['#C44E52' if v > 0 else '#4C72B0' for v in bin_resid.values]
+            ax_bar.bar(range(len(bin_resid)), bin_resid.values, color=colors, edgecolor='black', alpha=0.8)
+            ax_bar.axhline(0, color='black', linewidth=1.0)
+            ax_bar.set_xticks(range(len(bin_centers)))
+            ax_bar.set_xticklabels([f'{v/1000:.1f}k' for v in bin_centers.values], fontsize=8)
+            ax_bar.set_xlabel('Predicted Load Decile (MW)')
+            ax_bar.set_ylabel('Mean Residual (MW)')
+            ax_bar.set_title(f'{split_label} — Mean Bias by Predicted-Value Decile')
+            ax_bar.grid(axis='y', linestyle='--', alpha=0.6)
+
+        plt.tight_layout()
+        save_path = os.path.join(result_dir, f'{model_name}_residuals_vs_predicted.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Residuals vs predicted saved to: {save_path}")
+
+    @staticmethod
+    def evaluate_one(model_name, y_true_np, y_pred_np, timestamps, result_dir, train_df=None):
         os.makedirs(result_dir, exist_ok=True)
         print(f"\n====== {model_name} Error Analysis ======")
 
@@ -306,5 +355,6 @@ class EvalUtils:
         EvalUtils.plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, result_dir)
         EvalUtils.plot_error_histogram(model_name, detailed_df, result_dir)
         EvalUtils.plot_error_cdf(model_name, detailed_df, result_dir)
-        EvalUtils.plot_signed_error_vs_load(model_name, detailed_df, result_dir)
+        EvalUtils.plot_signed_error_vs_load(model_name, detailed_df, result_dir, train_df)
+        EvalUtils.plot_residuals_vs_predicted(model_name, detailed_df, result_dir, train_df)
         EvalUtils.plot_best_worst_days(model_name, detailed_df, daily_mape, result_dir)
