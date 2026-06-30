@@ -5,8 +5,10 @@ import os
 DATASET = os.environ.get('PJM_DATASET', 'bge')   # override: PJM_DATASET=dom python ...
 
 # --- Weather Features (per dataset) ---
-# dom columns match the output of data_crawler (Open-Meteo native variables).
-# bge columns match the legacy manually-prepared weather file.
+# Used only by the joint pipeline (train_joint.py / joint_model_evaluator.py),
+# which windows full weather per zone. The single-zone bge/dom pipeline
+# (src/feature_engine.py) no longer uses weather beyond apparent temperature,
+# which it splits into HDD/CDD itself, so there is no derived WEATHER_COLS here.
 _WEATHER_COLS = {
     'dom': [
         'Temp_F', 'ApparentTemp_F', 'Dewpoint_F', 'RelativeHumidity_pct',
@@ -19,7 +21,6 @@ _WEATHER_COLS = {
         'WindGusts_mph', 'Precip_in', 'CloudCover_pct', 'SoilTemp0_7cm_F',
     ],
 }
-WEATHER_COLS = _WEATHER_COLS.get(DATASET, [])  # empty for 'joint'; joint uses _WEATHER_COLS per zone
 
 # --- File Paths ---
 RAW_LOAD_PATH    = f'data/{DATASET}/raw/dom_load.csv'
@@ -85,7 +86,7 @@ XGB_PARAMS = {
     'reg_alpha': 0.5117878514902956,
     'random_state': 42,
     'n_jobs': -1,
-    'use_lds': True,
+    'use_lds': False,
     'lds_bin_width': 200.0,
     'lds_ks': 5,
     'lds_sigma': 2.0,
@@ -108,7 +109,7 @@ LGBM_PARAMS = {
     'lambda_l2': 1.4022452913170822,
     'min_child_samples': 40,
     'n_jobs': -1,
-    'use_lds': True,
+    'use_lds': False,
     'lds_bin_width': 200.0,
     'lds_ks': 5,
     'lds_sigma': 2.0,
@@ -129,9 +130,9 @@ TRANSFORMER_FEATURE_CONFIG = {
 }
 
 TRANSFORMER_PARAMS = {
-    'd_model': 64,
-    'nhead': 4,
-    'num_layers': 2,
+    'd_model': 32,
+    'nhead': 2,
+    'num_layers': 1,
     'dropout': 0.3,
     'out_dim': 24,
     'epochs': 200,
@@ -143,7 +144,7 @@ TRANSFORMER_PARAMS = {
     'lds_ks': 5,
     'lds_sigma': 1.0,
     'lds_min_freq_ratio': 0.05,
-    'use_fds': True,
+    'use_fds': False,
     'fds_start_epoch': 30,
     'fds_bin_width': 200.0,
     'fds_ks': 5,
@@ -151,7 +152,7 @@ TRANSFORMER_PARAMS = {
     'fds_momentum': 0.1,   # EMA weight on current epoch's stats (lower = more stable history)
     'early_stop_patience': 50,
     'stage2_epochs': 10,        # Stage 2 calibration epochs (0 = disabled)
-    'stage2_mode': 'pinball',       # 'mse' | 'bft' | 'pinball'
+    'stage2_mode': 'bft',       # 'mse' | 'bft' | 'pinball'
     'stage2_lr': 3e-4,
     'stage2_bft_n_bins': 10,    # bft: equal-width load bins for resampling
     'stage2_q_max': 0.6,        # pinball: max quantile target for peak-load hours
@@ -171,8 +172,8 @@ LSTM_FEATURE_CONFIG = {
 }
 
 LSTM_PARAMS = {
-    'hidden_size': 128,
-    'num_layers': 2,
+    'hidden_size': 64,
+    'num_layers': 1,
     'dropout': 0.3,
     'out_dim': 24,
     'epochs': 200,
@@ -184,15 +185,15 @@ LSTM_PARAMS = {
     'lds_ks': 5,
     'lds_sigma': 1,
     'lds_min_freq_ratio': 0.05,
-    'use_fds': True,
+    'use_fds': False,
     'fds_start_epoch': 30,
     'fds_bin_width': 200.0,
     'fds_ks': 5,
     'fds_sigma': 0.5,
     'fds_momentum': 0.1,
     'early_stop_patience': 50,
-    'stage2_epochs': 10,
-    'stage2_mode': 'pinball',       # 'mse' | 'bft' | 'pinball'
+    'stage2_epochs': 0,
+    'stage2_mode': 'bft',       # 'mse' | 'bft' | 'pinball'
     'stage2_lr': 1e-4,
     'stage2_bft_n_bins': 10,    # bft: equal-width load bins for resampling
     'stage2_q_max': 0.6,
@@ -254,11 +255,11 @@ EVAL_CONFIG = {
     # Which models to evaluate and where their saved files are
     'models': {
         'xgboost': {
-            'enabled': 0,
+            'enabled': 1,
             'model_path': f'models/{DATASET}/xgboost/tail_test0.1{_xgb_lds}/xgboost_24_models.pkl',
         },
         'lightgbm': {
-            'enabled': 0,
+            'enabled': 1,
             'model_path': f'models/{DATASET}/lightgbm/tail_test0.1{_lgbm_lds}/lightgbm_24_models.pkl',
         },
         'transformer': {

@@ -45,6 +45,18 @@ def _base_feature_groups(X):
     return {b: cols for b, cols in groups.items() if len(cols) == LOOKBACK}
 
 
+def _feature_values(X):
+    """One representative series per numeric variable: 168h mean for windowed
+    features, raw value for non-constant scalar calendar columns."""
+    variables = {}
+    for base, cols in _base_feature_groups(X).items():
+        variables[base] = X[cols].mean(axis=1)
+    for c in X.columns:
+        if c.startswith(("today_", "tmrw_")) and c != "is_target_valid" and X[c].std() > 0:
+            variables[c] = X[c]
+    return variables
+
+
 # ---------------------------------------------------------------------------
 # Task 1: one combined figure relating every feature to daily-mean load.
 #   - windowed features (168h mean)  -> scatter + linear fit
@@ -66,10 +78,9 @@ def _plot_feature_overview(X, y_target, target_label, out_path):
     y_mean = y_target.rename("load")  # target load series (one value per day)
     groups = _base_feature_groups(X)
 
-    # --- panel layout: scatters first, then calendar panels ---
-    n_scatter = len(groups)
-    n_extra = 6  # dayofweek, month, weekend, holiday boxplots + month-circle + hour-note
-    total = n_scatter + n_extra
+    # --- panel layout: one scatter per windowed feature, + month sin/cos circle ---
+    has_month_circle = {"today_month_cos", "today_month_sin"}.issubset(X.columns)
+    total = len(groups) + (1 if has_month_circle else 0)
     ncols = 4
     nrows = math.ceil(total / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 3.3 * nrows))
@@ -92,27 +103,9 @@ def _plot_feature_overview(X, y_target, target_label, out_path):
         ax.set_ylabel(target_label, fontsize=8)
         ax.tick_params(labelsize=7)
 
-    # --- discrete calendar features: boxplots ---
-    def _box_by(ax, key, title, labels=None):
-        g = pd.concat([X[key].rename("k"), y_mean.rename("load")], axis=1).dropna()
-        cats = sorted(g["k"].unique())
-        data = [g.loc[g["k"] == c, "load"].values for c in cats]
-        ax.boxplot(data, showfliers=False,
-                   tick_labels=[labels[int(c)] if labels else f"{c:g}" for c in cats])
-        ax.set_title(title, fontsize=9)
-        ax.set_ylabel(target_label, fontsize=8)
-        ax.tick_params(labelsize=7)
-        ax.grid(axis="y", alpha=0.3)
-
-    dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    _box_by(axes[ai], "today_dayofweek", "by day-of-week", labels=dow); ai += 1
-    _box_by(axes[ai], "today_month", "by month"); ai += 1
-    _box_by(axes[ai], "tmrw_is_weekend", "by tmrw_is_weekend", labels=["No", "Yes"]); ai += 1
-    _box_by(axes[ai], "tmrw_is_holiday", "by tmrw_is_holiday", labels=["No", "Yes"]); ai += 1
-
     # --- month sin/cos: cyclic scatter on the unit circle, colored by load ---
-    ax = axes[ai]; ai += 1
-    if {"today_month_cos", "today_month_sin"}.issubset(X.columns):
+    if has_month_circle:
+        ax = axes[ai]; ai += 1
         g = pd.concat([X["today_month_cos"], X["today_month_sin"], y_mean.rename("load")],
                       axis=1).dropna()
         sc = ax.scatter(g["today_month_cos"], g["today_month_sin"], c=g["load"],
@@ -123,21 +116,6 @@ def _plot_feature_overview(X, y_target, target_label, out_path):
         ax.set_ylabel("month_sin", fontsize=8)
         ax.set_aspect("equal")
         ax.tick_params(labelsize=7)
-
-    # --- hour sin/cos: dead-feature note ---
-    ax = axes[ai]; ai += 1
-    ax.axis("off")
-    hs, hc = X.get("today_hour_sin"), X.get("today_hour_cos")
-    if hs is not None and hc is not None:
-        ax.text(0.05, 0.95,
-                "hour_sin / hour_cos\n\n"
-                f"sin: const={hs.iloc[0]:.3f} std={hs.std():.4f}\n"
-                f"cos: const={hc.iloc[0]:.3f} std={hc.std():.4f}\n\n"
-                "DEAD FEATURES — every sample is a\n"
-                "day stamped at hour 0, so these\n"
-                "carry zero variance / no signal.",
-                va="top", ha="left", fontsize=9, family="monospace",
-                bbox=dict(boxstyle="round", facecolor="mistyrose", edgecolor="crimson"))
 
     for ax in axes[ai:]:
         ax.set_visible(False)
@@ -180,10 +158,170 @@ def task2_feature_overview_by_hour(X, y, hours=(0, 3, 9, 12, 15, 20)):
                                f"feature_vs_load_h{h:02d}.png")
 
 
+# ---------------------------------------------------------------------------
+# Task 3: which hours dominate the worst over- and under-predictions.
+#   Reads a model's *_detailed_errors.csv and reports the hour distribution of
+#   the top-10% most positive and most negative signed errors. Terminal only.
+#   signed_error = pred - true  (positive = over-prediction, negative = under).
+# ---------------------------------------------------------------------------
+ERR_CSV = (f"results/{DATASET}/evaluation/transformer/"
+           f"tail_test0.1_tail_val0.1_fds/TRANSFORMER_detailed_errors.csv")
+
+
+def task3_error_hours(csv_path=ERR_CSV, frac=0.10):
+    print("=" * 70)
+    print(f"Task 3: hour distribution of worst {frac:.0%} over/under-predictions")
+    print(f"  file: {csv_path}")
+    print("=" * 70)
+
+    if not os.path.exists(csv_path):
+        print(f"  NOT FOUND: {csv_path}\n")
+        return
+
+    df = pd.read_csv(csv_path, parse_dates=["datetime"])
+    df["hour"] = df["datetime"].dt.hour
+    n = len(df)
+    k = max(1, int(round(n * frac)))
+    base = df["hour"].value_counts(normalize=True)  # baseline hour share in test set
+
+    pos = df.nlargest(k, "signed_error")   # most over-predicted (pred >> true)
+    neg = df.nsmallest(k, "signed_error")  # most under-predicted (pred << true)
+
+    def _report(name, sub):
+        cnt = sub["hour"].value_counts().sort_values(ascending=False)
+        share = cnt / len(sub)
+        print(f"\n  {name}: n={len(sub)} of {n}  "
+              f"(signed_error range [{sub['signed_error'].min():+.0f}, "
+              f"{sub['signed_error'].max():+.0f}], mean {sub['signed_error'].mean():+.0f} MW)")
+        print(f"    {'hour':>4} {'count':>6} {'grp%':>7} {'base%':>7} {'lift':>6}")
+        for h in cnt.index:
+            b = base.get(h, 0.0)
+            lift = (share[h] / b) if b > 0 else float("nan")
+            print(f"    {h:>4d} {cnt[h]:>6d} {share[h]:>6.1%} {b:>6.1%} {lift:>5.1f}x")
+
+    _report("MOST OVER-PREDICTED  (signed_error > 0)", pos)
+    _report("MOST UNDER-PREDICTED (signed_error < 0)", neg)
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Task 4: scatter of each variable SQUARED vs daily-mean load (combined figure).
+#   Checks for quadratic relationships. For windowed features the variable is the
+#   168h mean; scalar numeric calendar columns are used as-is. Each is squared.
+# ---------------------------------------------------------------------------
+def _plot_squared_scatter(X, y_target, target_label, out_path):
+    """Combined figure: scatter of each variable^2 vs a given target load series."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    y_t = y_target.rename("load")
+    variables = _feature_values(X)
+    n = len(variables)
+    ncols = 4
+    nrows = math.ceil(n / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 3.3 * nrows))
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, (name, ser) in zip(axes, variables.items()):
+        df = pd.concat([ser.rename("v"), y_t], axis=1).dropna()
+        xv = (df["v"].values) ** 2
+        yv = df["load"].values
+        r = np.corrcoef(xv, yv)[0, 1]
+        ax.scatter(xv, yv, s=6, alpha=0.35, edgecolors="none")
+        m, b = np.polyfit(xv, yv, 1)
+        xs = np.array([xv.min(), xv.max()])
+        ax.plot(xs, m * xs + b, color="crimson", lw=1.2)
+        ax.set_title(f"{name}^2  (r={r:+.3f})", fontsize=9)
+        ax.set_xlabel("variable^2", fontsize=8)
+        ax.set_ylabel(target_label, fontsize=8)
+        ax.tick_params(labelsize=7)
+
+    for ax in axes[n:]:
+        ax.set_visible(False)
+
+    fig.suptitle(f"Variable^2 vs {target_label}  (dataset={DATASET}, n={len(y_t.dropna())})",
+                 fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"  saved -> {os.path.abspath(out_path)}\n")
+
+
+def task4_squared_feature_scatter(X, y, out_path="feature_squared_vs_load.png"):
+    print("=" * 70)
+    print("Task 4: scatter(variable^2  vs  daily-mean load)")
+    print("=" * 70)
+    _plot_squared_scatter(X, y.mean(axis=1), "daily-mean load", out_path)
+
+
+# ---------------------------------------------------------------------------
+# Task 5: same variable^2 scatter, but per target hour (not averaged).
+# ---------------------------------------------------------------------------
+def task5_squared_by_hour(X, y, hours=(0, 3, 9, 12, 15, 20)):
+    print("=" * 70)
+    print(f"Task 5: variable^2 scatter per target hour {list(hours)}")
+    print("=" * 70)
+    for h in hours:
+        col = f"h{h}"
+        if col not in y.columns:
+            print(f"  skip {col}: not in y columns")
+            continue
+        _plot_squared_scatter(X, y[col], f"load @ {h:02d}:00",
+                              f"feature_squared_vs_load_h{h:02d}.png")
+
+
+# ---------------------------------------------------------------------------
+# Task 6: correlation heatmap of the feature variables (+ daily-mean load).
+#   Variable = 168h mean for windowed features, raw value for scalar columns.
+#   Correlation (not covariance) so color depth is comparable across scales.
+# ---------------------------------------------------------------------------
+def task6_feature_corr_heatmap(X, y, out_path="feature_correlation_heatmap.png"):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    print("=" * 70)
+    print("Task 6: correlation heatmap of feature variables (+ daily-mean load)")
+    print("=" * 70)
+
+    df = pd.DataFrame(_feature_values(X))
+    df["load"] = y.mean(axis=1)
+    corr = df.corr()
+    labels = list(corr.columns)
+    m = len(labels)
+
+    fig, ax = plt.subplots(figsize=(0.9 * m + 2, 0.9 * m + 1))
+    im = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Pearson r")
+
+    ax.set_xticks(range(m)); ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(m)); ax.set_yticklabels(labels, fontsize=8)
+
+    for i in range(m):
+        for j in range(m):
+            v = corr.values[i, j]
+            ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=7,
+                    color="white" if abs(v) > 0.55 else "black")
+
+    ax.set_title(f"Feature correlation  (dataset={DATASET}, n={len(df)})", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"  saved -> {os.path.abspath(out_path)}\n")
+    return corr
+
+
 def run_diagnostics():
     X, y = _load_opt()
     task1_feature_overview(X, y)
     task2_feature_overview_by_hour(X, y)
+    task3_error_hours()
+    task4_squared_feature_scatter(X, y)
+    task5_squared_by_hour(X, y)
+    task6_feature_corr_heatmap(X, y)
 
 
 if __name__ == "__main__":

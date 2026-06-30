@@ -242,15 +242,31 @@ class EvalUtils:
         print(f"Error CDF saved to: {save_path}")
 
     @staticmethod
+    def _plot_monthly_bias(ax, df, split_label):
+        """Bar chart of mean signed error per calendar month (chronological)."""
+        ym = df['datetime'].dt.to_period('M')
+        monthly_me = df.groupby(ym)['signed_error'].mean().sort_index()
+        labels = [str(p) for p in monthly_me.index]
+        colors = ['#C44E52' if v > 0 else '#4C72B0' for v in monthly_me.values]
+        ax.bar(range(len(monthly_me)), monthly_me.values, color=colors, edgecolor='black', alpha=0.8)
+        ax.axhline(0, color='black', linewidth=1.0)
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+        ax.set_xlabel('Month')
+        ax.set_ylabel('Mean Signed Error (MW)')
+        ax.set_title(f'{split_label} — Mean Bias by Month')
+        ax.grid(axis='y', linestyle='--', alpha=0.6)
+
+    @staticmethod
     def plot_signed_error_vs_load(model_name, detailed_df, result_dir, train_df=None):
         rows = [('Test', detailed_df)] + ([('Train', train_df)] if train_df is not None else [])
         n_rows = len(rows)
-        fig, axes_grid = plt.subplots(n_rows, 2, figsize=(16, 5 * n_rows), squeeze=False)
+        fig, axes_grid = plt.subplots(n_rows, 3, figsize=(22, 5 * n_rows), squeeze=False)
         fig.suptitle(f'{model_name} — Signed Error vs Load  (+) = over-predict',
                      fontsize=14, fontweight='bold')
 
         for row_idx, (split_label, df) in enumerate(rows):
-            ax_sc, ax_bar = axes_grid[row_idx]
+            ax_sc, ax_bar, ax_month = axes_grid[row_idx]
 
             true_load  = df['true_load'].values
             signed_err = df['signed_error'].values
@@ -275,6 +291,8 @@ class EvalUtils:
             ax_bar.set_xticks(range(24))
             ax_bar.grid(axis='y', linestyle='--', alpha=0.6)
 
+            EvalUtils._plot_monthly_bias(ax_month, df, split_label)
+
         plt.tight_layout()
         save_path = os.path.join(result_dir, f'{model_name}_signed_error_vs_load.png')
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -286,12 +304,12 @@ class EvalUtils:
         pred_col = f'{model_name}_pred'
         rows = [('Test', detailed_df)] + ([('Train', train_df)] if train_df is not None else [])
         n_rows = len(rows)
-        fig, axes_grid = plt.subplots(n_rows, 2, figsize=(16, 5 * n_rows), squeeze=False)
+        fig, axes_grid = plt.subplots(n_rows, 3, figsize=(22, 5 * n_rows), squeeze=False)
         fig.suptitle(f'{model_name} — Residuals vs Predicted  (+) = over-predict',
                      fontsize=14, fontweight='bold')
 
         for row_idx, (split_label, df) in enumerate(rows):
-            ax_sc, ax_bar = axes_grid[row_idx]
+            ax_sc, ax_bar, ax_month = axes_grid[row_idx]
 
             pred_vals = df[pred_col].values
             residuals = df['signed_error'].values
@@ -318,6 +336,8 @@ class EvalUtils:
             ax_bar.set_ylabel('Mean Residual (MW)')
             ax_bar.set_title(f'{split_label} — Mean Bias by Predicted-Value Decile')
             ax_bar.grid(axis='y', linestyle='--', alpha=0.6)
+
+            EvalUtils._plot_monthly_bias(ax_month, df, split_label)
 
         plt.tight_layout()
         save_path = os.path.join(result_dir, f'{model_name}_residuals_vs_predicted.png')

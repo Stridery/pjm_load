@@ -5,7 +5,30 @@ import os
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 import joblib
-from src.config import TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG, WEATHER_COLS
+from src.config import TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG
+
+# Plain windowed features, used as-is (monotonic w.r.t. load -> no split needed).
+WINDOWED_FEATURES = ['Load_Estimated']
+
+# Piecewise "degree-day" style splits. Each source column is split at a balance
+# point into a below-threshold and an above-threshold non-negative feature, so a
+# U-shaped relation to load becomes two monotonic features. `square=True` then
+# squares both, capturing the super-linear cooling/heating response to load.
+# (source_column, balance_point, below_name, above_name, square)
+FEATURE_SPLITS = [
+    ('ApparentTemp_F',     65.0,  'HDD',      'CDD',      True),  # heating / cooling degree, squared
+    ('SolarRadiation_Wm2', 170.0, 'SOLAR_LO', 'SOLAR_HI', True),
+]
+
+
+def _split_below_above(values, balance, square=False):
+    """Split values at `balance` into (below, above), both non-negative.
+    If `square`, square both sides."""
+    below = np.maximum(0.0, balance - values)
+    above = np.maximum(0.0, values - balance)
+    if square:
+        below, above = below ** 2, above ** 2
+    return below, above
 
 
 def _normalize_to_24h(load_vals, ept_hour_vals):
@@ -63,9 +86,14 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     ept_dates = ept_dt.dt.date.values
     ept_hours = ept_dt.dt.hour.values
 
-    weather_cols = WEATHER_COLS
-    feature_cols = ['Load_Estimated'] + weather_cols
-    data_array   = df_final[feature_cols].values
+    # Surgery: windowed features = plain features + piecewise weather splits.
+    feature_cols = list(WINDOWED_FEATURES)
+    arrays       = [df_final[c].values for c in WINDOWED_FEATURES]
+    for src, bal, lo_name, hi_name, square in FEATURE_SPLITS:
+        below, above = _split_below_above(df_final[src].values, bal, square)
+        feature_cols += [lo_name, hi_name]
+        arrays       += [below, above]
+    data_array = np.column_stack(arrays)
     load_raw     = df_final['Load'].values
     valid_raw    = df_final['is_valid'].values
 
@@ -101,16 +129,13 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
                 f[f'{col.lower()}_h{k}'] = past_window[k, j]
 
         today_meta = df_final[ept_dates == today].iloc[0]
-        tmrw_meta  = df_final.iloc[tmrw_pos[0]]
+        # Surgery: keep only the cyclical month encoding. hour_sin/cos are dropped
+        # (constant — every 2D sample is stamped at hour 0, so they carry no signal).
+        # is_target_valid is not a model feature — it is a control column used by
+        # get_train_test_split for masking and dropped before fitting.
         f.update({
-            'today_month':      today_meta['month'],
-            'today_hour_sin':   today_meta['hour_sin'],
-            'today_hour_cos':   today_meta['hour_cos'],
             'today_month_sin':  today_meta['month_sin'],
             'today_month_cos':  today_meta['month_cos'],
-            'today_dayofweek':  today_meta['dayofweek'],
-            'tmrw_is_weekend':  tmrw_meta['is_weekend'],
-            'tmrw_is_holiday':  tmrw_meta['is_holiday'],
             'is_target_valid':  tmrw_valid,
         })
 
@@ -150,10 +175,15 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     df = pd.read_csv(cleaned_path, index_col=0, parse_dates=True)
     df = df.sort_index()
 
-    feature_cols = (
-        ['Load_Estimated'] + WEATHER_COLS +
-        ['hour_sin', 'hour_cos', 'month_sin', 'month_cos', 'dayofweek', 'is_weekend']
-    )
+    # Surgery: plain features + piecewise weather splits + cyclical month.
+    # hour_sin/cos are dropped: the window always ends at the fixed cutoff hour, so
+    # each timestep maps to the same hour-of-day across samples -> purely positional
+    # (cross-sample std ~0.03), redundant with the sequence model's own ordering.
+    split_cols = []
+    for src, bal, lo_name, hi_name, square in FEATURE_SPLITS:
+        df[lo_name], df[hi_name] = _split_below_above(df[src], bal, square)
+        split_cols += [lo_name, hi_name]
+    feature_cols = list(WINDOWED_FEATURES) + split_cols + ['month_sin', 'month_cos']
     split_idx = int(len(df) * (1 - TRANSFORMER_FEATURE_CONFIG['test_frac']))
 
     scaler = StandardScaler()
@@ -200,18 +230,8 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
             continue
 
         is_seq_valid = bool(is_valid_array[tmrw_pos].all())
+        # Surgery: no tomorrow-calendar broadcast — only the kept feature_cols.
         X_window     = data_array[cutoff_pos - lookback_hours : cutoff_pos]
-
-        tmrw_row = df.iloc[tmrw_pos[0]]
-        tmrw_dow = tmrw_row['dayofweek']
-        tmrw_meta = np.array([
-            np.sin(2 * np.pi * tmrw_dow / 7),
-            np.cos(2 * np.pi * tmrw_dow / 7),
-            float(tmrw_row['is_weekend']),
-            float(tmrw_row['is_holiday']),
-        ], dtype='float32')
-        tmrw_broadcast = np.tile(tmrw_meta, (lookback_hours, 1))
-        X_window = np.concatenate([X_window, tmrw_broadcast], axis=1)
 
         X_list.append(X_window)
         y_list.append(y_window)

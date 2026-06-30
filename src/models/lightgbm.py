@@ -30,7 +30,8 @@ def train(X_train, y_train, params=None, feature_cfg=None):
 
     print("LightGBM device: cpu")
     print(f"LightGBM LDS:    {'enabled' if use_lds else 'disabled'}")
-    cat_features = ['today_dayofweek', 'tmrw_is_weekend']
+    # Surgery: all remaining features are continuous (windowed numerics + cyclical
+    # sin/cos encodings) — no categorical columns left to declare.
 
     models = []
     for h in tqdm(range(24), desc="LightGBM"):
@@ -39,7 +40,7 @@ def train(X_train, y_train, params=None, feature_cfg=None):
             y_h, bin_width=lds_bin_width, ks=lds_ks, sigma=lds_sigma, min_freq_ratio=lds_min_freq
         ) if use_lds else None
         model = lgb.LGBMRegressor(**_params, n_estimators=1000)
-        model.fit(X_train, y_h, categorical_feature=cat_features, sample_weight=weights)
+        model.fit(X_train, y_h, sample_weight=weights)
         models.append(model)
 
     save_path = os.path.join(model_dir, 'lightgbm_24_models.pkl')
