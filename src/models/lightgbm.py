@@ -20,7 +20,11 @@ def train(X_train, y_train, params=None, feature_cfg=None):
 
     # Copy so we can pop internal flags without mutating the caller's dict
     _params = {**(params or LGBM_PARAMS)}
-    use_lds = _params.pop('use_lds', False)
+    use_lds       = _params.pop('use_lds', False)
+    lds_bin_width = _params.pop('lds_bin_width', 200.0)
+    lds_ks        = _params.pop('lds_ks', 5)
+    lds_sigma     = _params.pop('lds_sigma', 2.0)
+    lds_min_freq  = _params.pop('lds_min_freq_ratio', 0.05)
 
     model_dir = _make_run_dir('models', 'lightgbm', feature_cfg, use_lds=use_lds)
 
@@ -31,7 +35,9 @@ def train(X_train, y_train, params=None, feature_cfg=None):
     models = []
     for h in tqdm(range(24), desc="LightGBM"):
         y_h = y_train[f'h{h}'].values
-        weights = compute_lds_weights(y_h) if use_lds else None
+        weights = compute_lds_weights(
+            y_h, bin_width=lds_bin_width, ks=lds_ks, sigma=lds_sigma, min_freq_ratio=lds_min_freq
+        ) if use_lds else None
         model = lgb.LGBMRegressor(**_params, n_estimators=1000)
         model.fit(X_train, y_h, categorical_feature=cat_features, sample_weight=weights)
         models.append(model)

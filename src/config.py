@@ -2,7 +2,7 @@
 import os
 
 # --- Dataset Selection (controls all data / model / result paths) ---
-DATASET = os.environ.get('PJM_DATASET', 'dom')   # override: PJM_DATASET=dom python ...
+DATASET = os.environ.get('PJM_DATASET', 'bge')   # override: PJM_DATASET=dom python ...
 
 # --- Weather Features (per dataset) ---
 # dom columns match the output of data_crawler (Open-Meteo native variables).
@@ -85,7 +85,11 @@ XGB_PARAMS = {
     'reg_alpha': 0.5117878514902956,
     'random_state': 42,
     'n_jobs': -1,
-    'use_lds': True,    # Label Distribution Smoothing: upweight rare peak-load samples
+    'use_lds': True,
+    'lds_bin_width': 200.0,
+    'lds_ks': 5,
+    'lds_sigma': 2.0,
+    'lds_min_freq_ratio': 0.05,
 }
 
 LGBM_PARAMS = {
@@ -104,7 +108,11 @@ LGBM_PARAMS = {
     'lambda_l2': 1.4022452913170822,
     'min_child_samples': 40,
     'n_jobs': -1,
-    'use_lds': True,    # Label Distribution Smoothing: upweight rare peak-load samples
+    'use_lds': True,
+    'lds_bin_width': 200.0,
+    'lds_ks': 5,
+    'lds_sigma': 2.0,
+    'lds_min_freq_ratio': 0.05,
 }
 
 # --- Transformer Feature Generation ---
@@ -124,18 +132,31 @@ TRANSFORMER_PARAMS = {
     'd_model': 64,
     'nhead': 4,
     'num_layers': 2,
-    'dropout': 0.4,
+    'dropout': 0.3,
     'out_dim': 24,
     'epochs': 200,
     'batch_size': 32,
     'learning_rate': 3e-4,
-    'weight_decay': 0.05,
-    'use_lds': True,    # Label Distribution Smoothing: upweight rare peak-load days
-    'use_fds': True,    # Feature Distribution Smoothing: calibrate encoder features
-    'fds_start_epoch': 5,   # warmup epochs before FDS calibration activates
-    'fds_n_bins': 50,
+    'weight_decay': 1e-4,
+    'use_lds': False,
+    'lds_bin_width': 200.0,
+    'lds_ks': 5,
+    'lds_sigma': 1.0,
+    'lds_min_freq_ratio': 0.05,
+    'use_fds': True,
+    'fds_start_epoch': 30,
+    'fds_bin_width': 200.0,
     'fds_ks': 5,
-    'fds_sigma': 2.0,
+    'fds_sigma': 0.5,
+    'fds_momentum': 0.1,   # EMA weight on current epoch's stats (lower = more stable history)
+    'early_stop_patience': 50,
+    'stage2_epochs': 10,        # Stage 2 calibration epochs (0 = disabled)
+    'stage2_mode': 'pinball',       # 'mse' | 'bft' | 'pinball'
+    'stage2_lr': 3e-4,
+    'stage2_bft_n_bins': 10,    # bft: equal-width load bins for resampling
+    'stage2_q_max': 0.6,        # pinball: max quantile target for peak-load hours
+    'stage2_p': 4.0,            # pinball: curvature of q(load_pct) schedule
+    'stage2_routing': 'pred',   # pinball: 'pred' (deployable) | 'true' (diagnostic upper bound)
 }
 
 # --- LSTM Feature Generation (shares the same 3D matrix as Transformer) ---
@@ -157,13 +178,26 @@ LSTM_PARAMS = {
     'epochs': 200,
     'batch_size': 32,
     'learning_rate': 1e-3,
-    'weight_decay': 1e-3,
-    'use_lds': True,    # Label Distribution Smoothing: upweight rare peak-load days
-    'use_fds': True,    # Feature Distribution Smoothing: calibrate encoder features
-    'fds_start_epoch': 5,
-    'fds_n_bins': 50,
+    'weight_decay': 1e-4,
+    'use_lds': False,
+    'lds_bin_width': 200.0,
+    'lds_ks': 5,
+    'lds_sigma': 1,
+    'lds_min_freq_ratio': 0.05,
+    'use_fds': True,
+    'fds_start_epoch': 30,
+    'fds_bin_width': 200.0,
     'fds_ks': 5,
-    'fds_sigma': 2.0,
+    'fds_sigma': 0.5,
+    'fds_momentum': 0.1,
+    'early_stop_patience': 50,
+    'stage2_epochs': 10,
+    'stage2_mode': 'pinball',       # 'mse' | 'bft' | 'pinball'
+    'stage2_lr': 1e-4,
+    'stage2_bft_n_bins': 10,    # bft: equal-width load bins for resampling
+    'stage2_q_max': 0.6,
+    'stage2_p': 4.0,
+    'stage2_routing': 'pred',
 }
 
 # --- Joint Model Configuration ---
@@ -228,18 +262,18 @@ EVAL_CONFIG = {
             'model_path': f'models/{DATASET}/lightgbm/tail_test0.1{_lgbm_lds}/lightgbm_24_models.pkl',
         },
         'transformer': {
-            'enabled': 0,
+            'enabled': 1,
             'model_path': f'models/{DATASET}/transformer/tail_test0.1_tail_val0.1{_tr_lds}{_tr_fds}/transformer_best.pth',
         },
         'lstm': {
-            'enabled': 0,
+            'enabled': 1,
             'model_path': f'models/{DATASET}/lstm/tail_test0.1_tail_val0.1{_lstm_lds}{_lstm_fds}/lstm_best.pth',
         },
     },
 
     # Single-day plot mode: load model, find date in matrix, show plot interactively
     'single_day': {
-        'enabled': 1,
+        'enabled': 0,
         'model': 'transformer',
         'model_path': f'models/{DATASET}/transformer/tail_test0.1_tail_val0.1{_tr_lds}{_tr_fds}/transformer_best.pth',
         'date': '2026-01-24',

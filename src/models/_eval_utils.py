@@ -339,6 +339,17 @@ class EvalUtils:
         bias_dir = 'over' if me > 0 else 'under'
         print(f"Global -> MAPE: {mape:.2f}% | MAE: {mae:.2f} | RMSE: {rmse:.2f} | ME: {me:+.2f} MW ({bias_dir})")
 
+        # Binned Residual Slope: OLS on (bin mean true load, bin mean residual)
+        # Positive → over-predict at high load; Negative → under-predict at high load
+        residuals  = flat_pred - flat_true
+        bin_labels = pd.qcut(flat_true, q=10, labels=False, duplicates='drop')
+        bin_s      = pd.Series(flat_true)
+        bin_centers = bin_s.groupby(bin_labels).mean().values
+        bin_resid   = pd.Series(residuals).groupby(bin_labels).mean().values
+        brs = np.polyfit(bin_centers, bin_resid, 1)[0]   # MW per MW
+        brs_dir = 'over↑ at peak' if brs > 0 else 'under↓ at peak'
+        print(f"         BRS:  {brs:+.4f} MW/MW ({brs_dir}, near 0 = unbiased across load range)")
+
         hourly_mape = [
             mean_absolute_percentage_error(y_true_np[:, h], y_pred_np[:, h]) * 100
             for h in range(24)

@@ -29,8 +29,8 @@ FEAT_CFG = cfg.JOINT_FEATURE_CONFIG
 T_PARAMS = cfg.JOINT_TRANSFORMER_PARAMS
 L_PARAMS = cfg.JOINT_LSTM_PARAMS
 
-TEST_STRATEGIES = ['tail', 'random']
-VAL_STRATEGIES  = ['tail', 'random']
+TEST_STRATEGIES = ['tail']
+VAL_STRATEGIES  = ['tail']
 
 # ---------------------------------------------------------------------------
 # Step 1: Build joint cleaned CSV (skip if already exists)

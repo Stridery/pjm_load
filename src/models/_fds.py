@@ -30,41 +30,65 @@ def _gaussian_kernel(ks: int, sigma: float) -> np.ndarray:
     return k / k.sum()
 
 
+def _fill_sparse_bins(arr: np.ndarray, counts: np.ndarray, min_n: int) -> np.ndarray:
+    """Replace rows in arr where counts < min_n with nearest-neighbour row.
+
+    Operates on a copy; does not mutate arr.
+    """
+    out = arr.copy()
+    sparse = np.where(counts < min_n)[0]
+    dense  = np.where(counts >= min_n)[0]
+    if len(dense) == 0 or len(sparse) == 0:
+        return out
+    for b in sparse:
+        nearest = dense[np.argmin(np.abs(dense - b))]
+        out[b] = arr[nearest]
+    return out
+
+
 class FDSModule:
     """Stateful FDS manager — one instance per training run.
 
     Args:
         feature_dim:  Dimensionality of encoder output (hidden_size or d_model).
-        n_bins:       Number of equal-width label bins.
+        bin_width:    Physical width of each label bin (same units as labels, e.g. MW).
+                      Bins are anchored to multiples of bin_width and fixed after
+                      the first epoch so EMA statistics are consistent across epochs.
         ks:           Gaussian kernel size (number of points, should be odd).
         sigma:        Gaussian kernel std-dev in bin units.
-        eps:          Numerical stability for std computation.
+        momentum:     EMA coefficient for per-bin statistics (weight on current epoch).
+                      0 = never update; 1 = replace history each epoch.
+        eps:          Floor added to raw std before division (prevents amplification
+                      in single-sample bins). Set to ~1 % of expected feature std.
     """
 
     def __init__(
         self,
         feature_dim: int,
-        n_bins: int = 50,
+        bin_width: float = 200.0,
         ks: int = 5,
         sigma: float = 2.0,
-        eps: float = 1e-6,
+        momentum: float = 0.1,
+        eps: float = 1e-4,
     ):
         self.feature_dim = feature_dim
-        self.n_bins = n_bins
-        self.eps = eps
-        self.kernel = _gaussian_kernel(ks, sigma)
+        self.bin_width   = bin_width
+        self.momentum    = momentum
+        self.eps         = eps
+        self.kernel      = _gaussian_kernel(ks, sigma)
 
-        # Per-bin raw statistics — updated every epoch
-        self._mean = np.zeros((n_bins, feature_dim), dtype=np.float64)
-        self._var  = np.zeros((n_bins, feature_dim), dtype=np.float64)
+        # Bin edges — fixed from first epoch's physical grid, reused every subsequent epoch
+        self._edges: np.ndarray | None = None
+        self.n_bins: int = 0
+
+        # Per-bin raw statistics (allocated after first epoch when n_bins is known)
+        self._mean: np.ndarray | None = None
+        self._var:  np.ndarray | None = None
+        self._counts: np.ndarray | None = None   # how many samples seen per bin (for fill)
 
         # Smoothed statistics — used for calibration
-        self.mean_smooth = np.zeros((n_bins, feature_dim), dtype=np.float64)
-        self.var_smooth  = np.zeros((n_bins, feature_dim), dtype=np.float64)
-
-        # Label range (set from first epoch's labels, fixed thereafter)
-        self._lo: float | None = None
-        self._hi: float | None = None
+        self.mean_smooth: np.ndarray | None = None
+        self.var_smooth:  np.ndarray | None = None
 
         # Calibration is skipped until at least one smooth() call has run
         self._ready = False
@@ -82,7 +106,7 @@ class FDSModule:
 
         Call once per batch, after optimizer.step().
         features: (batch, feature_dim)
-        labels:   (batch,) — representative scalar per sample (e.g. mean load)
+        labels:   (batch,) — representative scalar per sample (e.g. peak load)
         """
         self._acc_features.append(features.detach().cpu().float().numpy())
         self._acc_labels.append(labels.detach().cpu().float().numpy())
@@ -102,34 +126,56 @@ class FDSModule:
         features = np.concatenate(self._acc_features, axis=0)  # (N, feat_dim)
         labels   = np.concatenate(self._acc_labels,   axis=0)  # (N,)
 
-        # Clear for next epoch
         self._acc_features = []
         self._acc_labels   = []
 
-        # Fix label range from first epoch
-        if self._lo is None:
-            self._lo = float(labels.min())
-            self._hi = float(labels.max())
+        # First epoch: build fixed physical-width edges and allocate stat arrays
+        if self._edges is None:
+            lo = np.floor(labels.min() / self.bin_width) * self.bin_width
+            hi = np.ceil(labels.max()  / self.bin_width) * self.bin_width
+            self._edges  = np.arange(lo, hi + self.bin_width, self.bin_width)
+            self.n_bins  = len(self._edges) - 1
+            self._mean   = np.zeros((self.n_bins, self.feature_dim), dtype=np.float64)
+            self._var    = np.zeros((self.n_bins, self.feature_dim), dtype=np.float64)
+            self._counts = np.zeros(self.n_bins, dtype=np.int64)
+            self.mean_smooth = np.zeros((self.n_bins, self.feature_dim), dtype=np.float64)
+            self.var_smooth  = np.zeros((self.n_bins, self.feature_dim), dtype=np.float64)
 
-        edges   = np.linspace(self._lo, self._hi, self.n_bins + 1)
-        bin_idx = np.clip(np.digitize(labels, edges[1:-1]), 0, self.n_bins - 1)
+        bin_idx = np.clip(np.digitize(labels, self._edges[1:-1]), 0, self.n_bins - 1)
 
+        m = self.momentum
+        epoch_counts = np.zeros(self.n_bins, dtype=np.int64)
         for b in range(self.n_bins):
             mask = bin_idx == b
-            n = int(mask.sum())
+            n    = int(mask.sum())
+            epoch_counts[b] = n
             if n >= 1:
-                self._mean[b] = features[mask].mean(axis=0)
+                cur_mean = features[mask].mean(axis=0)
+                if self._ready:
+                    self._mean[b] = (1 - m) * self._mean[b] + m * cur_mean
+                else:
+                    self._mean[b] = cur_mean
             if n >= 2:
-                self._var[b] = features[mask].var(axis=0)
-            # n == 0: leave previous stats (or zeros on first epoch)
+                cur_var = features[mask].var(axis=0)
+                if self._ready:
+                    self._var[b] = (1 - m) * self._var[b] + m * cur_var
+                else:
+                    self._var[b] = cur_var
+            # n == 0: leave previous EMA stats untouched
 
-        # Smooth each feature dimension independently across bins
+        self._counts = epoch_counts
+
+        # Fill sparse bins (n < 2) with nearest-neighbour before smoothing
+        # to prevent zero-var bins from pulling down neighbours via convolution
+        mean_filled = _fill_sparse_bins(self._mean, epoch_counts, min_n=1)
+        var_filled  = _fill_sparse_bins(self._var,  epoch_counts, min_n=2)
+
         for d in range(self.feature_dim):
             self.mean_smooth[:, d] = convolve1d(
-                self._mean[:, d], self.kernel, mode='reflect'
+                mean_filled[:, d], self.kernel, mode='reflect'
             )
             self.var_smooth[:, d] = convolve1d(
-                np.maximum(self._var[:, d], 0.0), self.kernel, mode='reflect'
+                np.maximum(var_filled[:, d], 0.0), self.kernel, mode='reflect'
             )
 
         self._ready = True
@@ -157,8 +203,7 @@ class FDSModule:
         device    = features.device
         labels_np = labels.detach().cpu().float().numpy()
 
-        edges   = np.linspace(self._lo, self._hi, self.n_bins + 1)
-        bin_idx = np.clip(np.digitize(labels_np, edges[1:-1]), 0, self.n_bins - 1)
+        bin_idx = np.clip(np.digitize(labels_np, self._edges[1:-1]), 0, self.n_bins - 1)
 
         def to_t(arr: np.ndarray) -> torch.Tensor:
             return torch.tensor(arr[bin_idx], dtype=torch.float32, device=device)

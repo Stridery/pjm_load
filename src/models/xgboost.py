@@ -21,7 +21,11 @@ def train(X_train, y_train, params=None, feature_cfg=None):
 
     # Copy so we can pop internal flags without mutating the caller's dict
     xgb_params = {**(params or XGB_PARAMS)}
-    use_lds = xgb_params.pop('use_lds', False)
+    use_lds       = xgb_params.pop('use_lds', False)
+    lds_bin_width = xgb_params.pop('lds_bin_width', 200.0)
+    lds_ks        = xgb_params.pop('lds_ks', 5)
+    lds_sigma     = xgb_params.pop('lds_sigma', 2.0)
+    lds_min_freq  = xgb_params.pop('lds_min_freq_ratio', 0.05)
 
     model_dir = _make_run_dir('models', 'xgboost', feature_cfg, use_lds=use_lds)
 
@@ -34,7 +38,9 @@ def train(X_train, y_train, params=None, feature_cfg=None):
     models = []
     for h in tqdm(range(24), desc="XGBoost"):
         y_h = y_train[f'h{h}'].values
-        weights = compute_lds_weights(y_h) if use_lds else None
+        weights = compute_lds_weights(
+            y_h, bin_width=lds_bin_width, ks=lds_ks, sigma=lds_sigma, min_freq_ratio=lds_min_freq
+        ) if use_lds else None
         model = xgb.XGBRegressor(**xgb_params)
         model.fit(X_train, y_h, sample_weight=weights)
         models.append(model)
