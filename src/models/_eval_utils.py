@@ -94,14 +94,17 @@ def plot_single_day(model_name, date_str, true_24h, pred_24h, ax=None, pred_colo
 class EvalUtils:
 
     @staticmethod
-    def build_detailed_df(model_name, y_true_np, y_pred_np, timestamps):
-        dates = pd.to_datetime(timestamps).repeat(24)
-        hours_arr = np.tile(np.arange(24), len(timestamps))
+    def build_detailed_df(model_name, y_true_np, y_pred_np, timestamps, hours=None):
+        # hours=None -> all output columns; otherwise restrict to the given hour indices
+        # (used to evaluate a single MoE expert on the hours it owns).
+        hours = list(range(y_true_np.shape[1])) if hours is None else list(hours)
+        dates = pd.to_datetime(timestamps).repeat(len(hours))
+        hours_arr = np.tile(np.array(hours), len(timestamps))
         datetimes = dates + pd.to_timedelta(hours_arr, unit='h')
         df = pd.DataFrame({
             'datetime': pd.to_datetime(datetimes),
-            'true_load': y_true_np.flatten(),
-            f'{model_name}_pred': y_pred_np.flatten(),
+            'true_load': y_true_np[:, hours].flatten(),
+            f'{model_name}_pred': y_pred_np[:, hours].flatten(),
         })
         df['signed_error'] = df[f'{model_name}_pred'] - df['true_load']
         df['abs_error'] = df['signed_error'].abs()
@@ -112,15 +115,17 @@ class EvalUtils:
         return df
 
     @staticmethod
-    def plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, result_dir):
+    def plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, result_dir, hours=None):
+        hours = list(range(len(hourly_mape))) if hours is None else list(hours)
         plt.figure(figsize=(15, 12))
 
         plt.subplot(3, 1, 1)
-        plt.bar(range(24), hourly_mape, color='#4C72B0', edgecolor='black', alpha=0.8)
+        xpos = range(len(hours))
+        plt.bar(xpos, hourly_mape, color='#4C72B0', edgecolor='black', alpha=0.8)
         plt.title(f'{model_name} - Hourly MAPE (%)', fontsize=14, fontweight='bold')
-        plt.xlabel('Hour of Day (0-23)', fontsize=12)
+        plt.xlabel('Hour of Day (EPT)', fontsize=12)
         plt.ylabel('MAPE (%)', fontsize=12)
-        plt.xticks(range(24))
+        plt.xticks(xpos, [str(h) for h in hours])
         plt.grid(axis='y', linestyle='--', alpha=0.7)
 
         plt.subplot(3, 1, 2)
@@ -346,12 +351,20 @@ class EvalUtils:
         print(f"Residuals vs predicted saved to: {save_path}")
 
     @staticmethod
-    def evaluate_one(model_name, y_true_np, y_pred_np, timestamps, result_dir, train_df=None):
+    def evaluate_one(model_name, y_true_np, y_pred_np, timestamps, result_dir, train_df=None, hours=None):
+        # hours=None -> full 24h day (default, all models). Pass a subset of hour
+        # indices to evaluate a single MoE expert on the hours it owns; the whole
+        # suite then runs on that slice (the full-day best/worst curve is skipped,
+        # since a partial-day curve is not meaningful).
         os.makedirs(result_dir, exist_ok=True)
+        full  = hours is None
+        hcols = list(range(y_true_np.shape[1])) if full else list(hours)
         print(f"\n====== {model_name} Error Analysis ======")
+        if not full:
+            print(f"Hours evaluated: {hcols}")
 
-        flat_true = y_true_np.flatten()
-        flat_pred = y_pred_np.flatten()
+        flat_true = y_true_np[:, hcols].flatten()
+        flat_pred = y_pred_np[:, hcols].flatten()
         mape = mean_absolute_percentage_error(flat_true, flat_pred) * 100
         mae  = mean_absolute_error(flat_true, flat_pred)
         rmse = np.sqrt(mean_squared_error(flat_true, flat_pred))
@@ -372,9 +385,9 @@ class EvalUtils:
 
         hourly_mape = [
             mean_absolute_percentage_error(y_true_np[:, h], y_pred_np[:, h]) * 100
-            for h in range(24)
+            for h in hcols
         ]
-        detailed_df = EvalUtils.build_detailed_df(model_name, y_true_np, y_pred_np, timestamps)
+        detailed_df = EvalUtils.build_detailed_df(model_name, y_true_np, y_pred_np, timestamps, hours=hcols)
         dow_mape   = detailed_df.groupby('day_of_week')['mape_pct'].mean()
         dom_mape   = detailed_df.groupby('day_of_month')['mape_pct'].mean()
         daily_mape = detailed_df.groupby('date')['mape_pct'].mean().sort_values(ascending=False)
@@ -383,9 +396,10 @@ class EvalUtils:
         detailed_df.drop(columns=['date']).to_csv(csv_path, index=False)
         print(f"Detailed errors saved to: {csv_path}")
 
-        EvalUtils.plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, result_dir)
+        EvalUtils.plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, result_dir, hours=hcols)
         EvalUtils.plot_error_histogram(model_name, detailed_df, result_dir)
         EvalUtils.plot_error_cdf(model_name, detailed_df, result_dir)
         EvalUtils.plot_signed_error_vs_load(model_name, detailed_df, result_dir, train_df)
         EvalUtils.plot_residuals_vs_predicted(model_name, detailed_df, result_dir, train_df)
-        EvalUtils.plot_best_worst_days(model_name, detailed_df, daily_mape, result_dir)
+        if full:
+            EvalUtils.plot_best_worst_days(model_name, detailed_df, daily_mape, result_dir)

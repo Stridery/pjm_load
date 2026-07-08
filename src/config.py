@@ -2,13 +2,11 @@
 import os
 
 # --- Dataset Selection (controls all data / model / result paths) ---
-DATASET = os.environ.get('PJM_DATASET', 'bge')   # override: PJM_DATASET=dom python ...
+DATASET = os.environ.get('PJM_DATASET', 'dom')   # override: PJM_DATASET=dom python ...
 
 # --- Weather Features (per dataset) ---
-# Used only by the joint pipeline (train_joint.py / joint_model_evaluator.py),
-# which windows full weather per zone. The single-zone bge/dom pipeline
-# (src/feature_engine.py) no longer uses weather beyond apparent temperature,
-# which it splits into HDD/CDD itself, so there is no derived WEATHER_COLS here.
+# dom columns match the output of data_crawler (Open-Meteo native variables).
+# bge columns match the legacy manually-prepared weather file.
 _WEATHER_COLS = {
     'dom': [
         'Temp_F', 'ApparentTemp_F', 'Dewpoint_F', 'RelativeHumidity_pct',
@@ -21,6 +19,7 @@ _WEATHER_COLS = {
         'WindGusts_mph', 'Precip_in', 'CloudCover_pct', 'SoilTemp0_7cm_F',
     ],
 }
+WEATHER_COLS = _WEATHER_COLS.get(DATASET, [])  # empty for 'joint'; joint uses _WEATHER_COLS per zone
 
 # --- File Paths ---
 RAW_LOAD_PATH    = f'data/{DATASET}/raw/dom_load.csv'
@@ -58,11 +57,64 @@ CRAWLER_CONFIG = {
 
 # --- Models to Train (1 = train, 0 = skip) ---
 TRAIN_CONFIG = {
-    'xgboost':     0,
-    'lightgbm':    0,
-    'transformer': 1,
-    'lstm':        1,
+    'xgboost':         0,
+    'lightgbm':        0,
+    'transformer':     1,
+    'lstm':            0,
+    'moe_transformer': 1,
 }
+
+# ---------------------------------------------------------------------------
+# Regime / Mixture-of-Experts definition (used by MoE Transformer)
+# ---------------------------------------------------------------------------
+# Two-axis hard routing:
+#   season  -> chosen per sample (day) from its month  (sample-level route)
+#   hour    -> fixed ownership of each output hour 0-23 (output-index route)
+# Each expert = (season group, a fixed set of hour indices). Season groups may
+# hold a different number of experts, and the hour partition is season-specific.
+# To retune a boundary, edit REGIME_MAP only — the model reads it directly.
+SEASON_ORDER  = ['summer', 'upper_shoulder', 'shoulder', 'winter']   # fixed index order
+SEASON_MONTHS = {
+    'summer':         [7, 8],
+    'upper_shoulder': [6, 9],
+    'shoulder':       [3, 4, 5, 10, 11],
+    'winter':         [12, 1, 2],
+}
+MONTH_TO_SEASON = {m: s for s, months in SEASON_MONTHS.items() for m in months}
+
+# season -> {expert_name: [owned hour indices]}.  Hour lists within a season
+# must be disjoint and together tile 0..23 (validated at model build time).
+# Hour ranges are left-closed/right-open and wrap past midnight (e.g. [21,1) = 21,22,23,0).
+REGIME_MAP = {
+    'summer': {           # ☀️ 7/8 月
+        'low':  [1, 2, 3, 4, 5, 6],                                    # 6h  [1,7)   深夜基负荷
+        'peak': [12, 13, 14, 15, 16, 17, 18, 19, 20],                 # 9h  [12,21) 制冷尖峰
+        'high': [0, 7, 8, 9, 10, 11, 21, 22, 23],                     # 9h  [7,12)∪[21,1)
+    },
+    'upper_shoulder': {   # 🌤️ 6/9 月
+        'low':  [1, 2, 3, 4, 5, 6],                                    # 6h  [1,7)
+        'peak': [14, 15, 16, 17, 18, 19],                             # 6h  [14,20)
+        'high': [0, 7, 8, 9, 10, 11, 12, 13, 20, 21, 22, 23],         # 12h [7,14)∪[20,1)
+    },
+    'shoulder': {         # 🍂 3/4/5/10/11 月
+        'low':  [0, 1, 2, 3, 4],                                       # 5h  [0,5)
+        'peak': [6, 7, 8, 9, 17, 18, 19, 20],                         # 8h  [6,10)∪[17,21)
+        'high': [5, 10, 11, 12, 13, 14, 15, 16, 21, 22, 23],          # 11h {5}∪[10,17)∪[21,0)
+    },
+    'winter': {           # ❄️ 12/1/2 月
+        'low':  [0, 1, 2, 3, 4],                                       # 5h  [0,5)
+        'peak': [6, 7, 8, 9, 17, 18, 19, 20, 21],                     # 9h  [6,10)∪[17,22)
+        'high': [5, 10, 11, 12, 13, 14, 15, 16, 22, 23],              # 10h {5}∪[10,17)∪[22,0)
+    },
+}
+
+# --- Split embargo (for the 3-week macro features) ---
+# Drop this many samples (days) on the training side of each split boundary
+# (train|val and val|test) so a sample's 3-week feature window never straddles a
+# boundary. 14 = 2 weeks (the macro window reaches 2 weeks past the 168h lookback).
+# The test set is left intact. Applied on top of the front-end history trim
+# (samples lacking 504h of history are skipped at matrix build time).
+EMBARGO_DAYS = 14
 
 # --- Tree Model Feature Generation ---
 TREE_FEATURE_CONFIG = {
@@ -123,16 +175,16 @@ TRANSFORMER_FEATURE_CONFIG = {
                                 #   <= 9 → today at that hour (e.g. 0 = midnight, 9 = 9am)
                                 #   > 9  → previous day at that hour (e.g. 18 = yesterday 6pm)
     'split_strategy': 'tail',   # 'random' | 'head' | 'tail'
-    'test_frac': 0.1,
+    'test_frac': 0.16,
     'val_strategy': 'tail',     # 'random' | 'head' | 'tail' — how to split val from train pool
-    'val_frac': 0.1,            # fraction of train pool used as validation
+    'val_frac': 0.19,            # fraction of train pool used as validation
     'random_state': 42,         # only used when split_strategy or val_strategy='random'
 }
 
 TRANSFORMER_PARAMS = {
-    'd_model': 32,
-    'nhead': 2,
-    'num_layers': 1,
+    'd_model': 64,
+    'nhead': 4,
+    'num_layers': 2,
     'dropout': 0.3,
     'out_dim': 24,
     'epochs': 200,
@@ -151,13 +203,56 @@ TRANSFORMER_PARAMS = {
     'fds_sigma': 0.5,
     'fds_momentum': 0.1,   # EMA weight on current epoch's stats (lower = more stable history)
     'early_stop_patience': 50,
-    'stage2_epochs': 10,        # Stage 2 calibration epochs (0 = disabled)
-    'stage2_mode': 'bft',       # 'mse' | 'bft' | 'pinball'
+    'stage2_epochs': 0,        # Stage 2 calibration epochs (0 = disabled)
+    'stage2_mode': 'pinball',       # 'mse' | 'bft' | 'pinball'
     'stage2_lr': 3e-4,
     'stage2_bft_n_bins': 10,    # bft: equal-width load bins for resampling
     'stage2_q_max': 0.6,        # pinball: max quantile target for peak-load hours
     'stage2_p': 4.0,            # pinball: curvature of q(load_pct) schedule
     'stage2_routing': 'pred',   # pinball: 'pred' (deployable) | 'true' (diagnostic upper bound)
+}
+
+# --- MoE Transformer (shares the same 3D matrix + feature config as Transformer) ---
+# Shared encoder + 8 regime expert heads (see REGIME_MAP). Reuses the transformer
+# feature config for splitting; only the head/routing differs.
+MOE_TRANSFORMER_FEATURE_CONFIG = {
+    **TRANSFORMER_FEATURE_CONFIG,
+    'test_frac': 0.16,   # last ~1 year  = out-of-time test  (all seasons, dom: 2025-05→2026-05)
+    'val_frac':  0.19,   # prior ~1 year = validation        (all seasons, dom: 2024-04→2025-05)
+}                        # train = the earlier ~4 years (dom: 2020-01→2024-04)
+
+MOE_TRANSFORMER_PARAMS = {
+    'd_model': 64,
+    'nhead': 4,
+    'num_layers': 2,
+    'dropout': 0.3,
+    'out_dim': 24,             # total hours; must equal sum of REGIME_MAP hour lists per season
+    'expert_fc_hidden': 64,    # hidden width of each expert head MLP
+    'epochs': 200,
+    'batch_size': 32,
+    'learning_rate': 3e-4,
+    'weight_decay': 1e-4,
+    'early_stop_patience': 50,
+    'use_lds': False,          # per-day LDS sample weighting (same scheme as transformer)
+    'lds_bin_width': 200.0,
+    'lds_ks': 5,
+    'lds_sigma': 1.0,
+    'lds_min_freq_ratio': 0.05,
+    # --- FDS: feature (encoder-representation) distribution smoothing ---
+    'use_fds': True,
+    'fds_start_epoch': 30,
+    'fds_bin_width': 200.0,
+    'fds_ks': 5,
+    'fds_sigma': 0.5,
+    'fds_momentum': 0.1,       # EMA weight on current epoch's stats (lower = more stable)
+    # --- Stage 2: pluggable calibration of the expert heads (freezes encoder) ---
+    'stage2_epochs': 10,        # 0 = disabled
+    'stage2_mode': 'pinball',  # 'mse' | 'bft' | 'pinball'
+    'stage2_lr': 3e-4,
+    'stage2_bft_n_bins': 10,   # bft: equal-frequency load bins for resampling
+    'stage2_q_max': 0.6,       # pinball: max quantile target for peak-load hours
+    'stage2_p': 4.0,           # pinball: curvature of q(load_pct) schedule
+    'stage2_routing': 'pred',  # pinball: 'pred' (deployable) | 'true' (diagnostic upper bound)
 }
 
 # --- LSTM Feature Generation (shares the same 3D matrix as Transformer) ---
@@ -172,8 +267,8 @@ LSTM_FEATURE_CONFIG = {
 }
 
 LSTM_PARAMS = {
-    'hidden_size': 64,
-    'num_layers': 1,
+    'hidden_size': 128,
+    'num_layers': 2,
     'dropout': 0.3,
     'out_dim': 24,
     'epochs': 200,
@@ -193,7 +288,7 @@ LSTM_PARAMS = {
     'fds_momentum': 0.1,
     'early_stop_patience': 50,
     'stage2_epochs': 0,
-    'stage2_mode': 'bft',       # 'mse' | 'bft' | 'pinball'
+    'stage2_mode': 'pinball',       # 'mse' | 'bft' | 'pinball'
     'stage2_lr': 1e-4,
     'stage2_bft_n_bins': 10,    # bft: equal-width load bins for resampling
     'stage2_q_max': 0.6,
@@ -241,6 +336,7 @@ _tr_lds   = '_lds' if TRANSFORMER_PARAMS.get('use_lds') else ''
 _lstm_lds = '_lds' if LSTM_PARAMS.get('use_lds')        else ''
 _tr_fds   = '_fds' if TRANSFORMER_PARAMS.get('use_fds') else ''
 _lstm_fds = '_fds' if LSTM_PARAMS.get('use_fds')        else ''
+_moe_lds  = '_lds' if MOE_TRANSFORMER_PARAMS.get('use_lds') else ''
 
 # --- Evaluation Config ---
 EVAL_CONFIG = {
@@ -255,11 +351,11 @@ EVAL_CONFIG = {
     # Which models to evaluate and where their saved files are
     'models': {
         'xgboost': {
-            'enabled': 1,
+            'enabled': 0,
             'model_path': f'models/{DATASET}/xgboost/tail_test0.1{_xgb_lds}/xgboost_24_models.pkl',
         },
         'lightgbm': {
-            'enabled': 1,
+            'enabled': 0,
             'model_path': f'models/{DATASET}/lightgbm/tail_test0.1{_lgbm_lds}/lightgbm_24_models.pkl',
         },
         'transformer': {
@@ -269,6 +365,10 @@ EVAL_CONFIG = {
         'lstm': {
             'enabled': 1,
             'model_path': f'models/{DATASET}/lstm/tail_test0.1_tail_val0.1{_lstm_lds}{_lstm_fds}/lstm_best.pth',
+        },
+        'moe_transformer': {
+            'enabled': 1,
+            'model_path': f'models/{DATASET}/moe_transformer/tail_test0.16_tail_val0.19{_moe_lds}/moe_transformer_best.pth',
         },
     },
 

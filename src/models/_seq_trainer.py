@@ -7,14 +7,25 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-from src.feature_engine import _split_indices
+from src.feature_engine import _split_indices, apply_embargo
+from src.config import EMBARGO_DAYS
 from src.models._utils import _make_run_dir
 from src.models._lds import compute_lds_weights
 from src.models._fds import FDSModule
 
 
-def _pinball_calibration(model, X_tr, y_tr, params, device):
-    """Stage 2 — load-dependent pinball loss calibration of fc_out.
+def _fwd(model, x, season):
+    """Forward that optionally threads a per-sample route (MoE season index).
+
+    Vanilla transformer/LSTM: season=None -> model(x).
+    MoE transformer:          season given -> model(x, season).
+    Lets the shared Stage-2 calibrators drive either model unchanged.
+    """
+    return model(x, season) if season is not None else model(x)
+
+
+def _pinball_calibration(model, X_tr, y_tr, params, device, season=None, head_key='fc_out'):
+    """Stage 2 — load-dependent pinball loss calibration of the output head.
 
     q(load_pct) = 0.5 + (q_max - 0.5) * load_pct ** p
     loss = mean( max(q*u, (q-1)*u) ),  u = y_true - y_pred  (u>0 = under-predict)
@@ -31,11 +42,11 @@ def _pinball_calibration(model, X_tr, y_tr, params, device):
     batch_sz = params.get('batch_size', 32)
 
     for name, param in model.named_parameters():
-        param.requires_grad = ('fc_out' in name)
+        param.requires_grad = (head_key in name)
     n_frozen  = sum(1 for _, p in model.named_parameters() if not p.requires_grad)
     n_tunable = sum(1 for _, p in model.named_parameters() if p.requires_grad)
     print(f"\n--- Stage 2 [pinball] ---")
-    print(f"Frozen: {n_frozen} | Tunable (fc_out): {n_tunable} | "
+    print(f"Frozen: {n_frozen} | Tunable ({head_key}): {n_tunable} | "
           f"routing={routing} | q_max={q_max} | p={p_exp} | lr={lr}")
 
     # Collect Stage-1 predictions for quantile routing (no grad, frozen backbone)
@@ -43,7 +54,8 @@ def _pinball_calibration(model, X_tr, y_tr, params, device):
     chunks = []
     with torch.no_grad():
         for i in range(0, len(X_tr), batch_sz):
-            chunks.append(model(X_tr[i:i + batch_sz].to(device)).cpu())
+            bs = None if season is None else season[i:i + batch_sz].to(device)
+            chunks.append(_fwd(model, X_tr[i:i + batch_sz].to(device), bs).cpu())
     stage1_pred = torch.cat(chunks, dim=0)          # (N, 24), scaled
 
     route_vals = y_tr.numpy() if routing == 'true' else stage1_pred.numpy()
@@ -54,21 +66,20 @@ def _pinball_calibration(model, X_tr, y_tr, params, device):
     print(f"load_pct [{pct_np.min():.3f}, {pct_np.max():.3f}] → "
           f"q [{0.5:.3f}, {0.5 + (q_max - 0.5):.3f}]")
 
-    s2_loader = DataLoader(
-        TensorDataset(X_tr, y_tr, torch.FloatTensor(pct_np)),
-        batch_size=batch_sz, shuffle=True,
-    )
+    tensors = [X_tr, y_tr, torch.FloatTensor(pct_np)] + ([season] if season is not None else [])
+    s2_loader = DataLoader(TensorDataset(*tensors), batch_size=batch_sz, shuffle=True)
     optimizer = optim.Adam(
-        [p for n, p in model.named_parameters() if 'fc_out' in n], lr=lr,
+        [p for n, p in model.named_parameters() if head_key in n], lr=lr,
     )
     model.train()
 
     for epoch in range(epochs):
         epoch_loss = 0.0
-        for bx, by, bpct in s2_loader:
-            bx, by, bpct = bx.to(device), by.to(device), bpct.to(device)
+        for batch in s2_loader:
+            bx, by, bpct = batch[0].to(device), batch[1].to(device), batch[2].to(device)
+            bs = batch[3].to(device) if season is not None else None
             optimizer.zero_grad()
-            pred = model(bx)
+            pred = _fwd(model, bx, bs)
             u    = by - pred
             q    = 0.5 + (q_max - 0.5) * bpct ** p_exp
             loss = torch.max(q * u, (q - 1) * u).mean()
@@ -83,8 +94,8 @@ def _pinball_calibration(model, X_tr, y_tr, params, device):
     print("Stage 2 complete.")
 
 
-def _bft_calibration(model, X_tr, y_tr, params, device):
-    """Stage 2 — Balanced Fine-Tuning (BFT) via bin resampling of fc_out.
+def _bft_calibration(model, X_tr, y_tr, params, device, season=None, head_key='fc_out'):
+    """Stage 2 — Balanced Fine-Tuning (BFT) via bin resampling of the output head.
 
     Constructs a temporary balanced dataset by:
       - Using daily peak load (max over 24h) as the representative label
@@ -102,11 +113,11 @@ def _bft_calibration(model, X_tr, y_tr, params, device):
     batch_sz = params.get('batch_size', 32)
 
     for name, param in model.named_parameters():
-        param.requires_grad = ('fc_out' in name)
+        param.requires_grad = (head_key in name)
     n_frozen  = sum(1 for _, p in model.named_parameters() if not p.requires_grad)
     n_tunable = sum(1 for _, p in model.named_parameters() if p.requires_grad)
     print(f"\n--- Stage 2 [bft] ---")
-    print(f"Frozen: {n_frozen} | Tunable (fc_out): {n_tunable} | n_bins={n_bins} | lr={lr}")
+    print(f"Frozen: {n_frozen} | Tunable ({head_key}): {n_tunable} | n_bins={n_bins} | lr={lr}")
 
     # Daily peak load as representative label (better captures extreme events)
     y_np    = y_tr.numpy()             # (N, 24)
@@ -145,21 +156,21 @@ def _bft_calibration(model, X_tr, y_tr, params, device):
           f"| under-sampled: {int((bin_counts > target_n).sum())} bins "
           f"| over-sampled: {int(((bin_counts > 0) & (bin_counts < target_n)).sum())} bins")
 
-    bal_loader = DataLoader(
-        TensorDataset(X_bal, y_bal), batch_size=batch_sz, shuffle=True,
-    )
+    tensors = [X_bal, y_bal] + ([season[bal_idx]] if season is not None else [])
+    bal_loader = DataLoader(TensorDataset(*tensors), batch_size=batch_sz, shuffle=True)
     optimizer = optim.Adam(
-        [p for n, p in model.named_parameters() if 'fc_out' in n], lr=lr,
+        [p for n, p in model.named_parameters() if head_key in n], lr=lr,
     )
     criterion = nn.MSELoss()
     model.train()
 
     for epoch in range(epochs):
         epoch_loss = 0.0
-        for bx, by in bal_loader:
-            bx, by = bx.to(device), by.to(device)
+        for batch in bal_loader:
+            bx, by = batch[0].to(device), batch[1].to(device)
+            bs = batch[2].to(device) if season is not None else None
             optimizer.zero_grad()
-            loss = criterion(model(bx), by)
+            loss = criterion(_fwd(model, bx, bs), by)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
@@ -171,49 +182,71 @@ def _bft_calibration(model, X_tr, y_tr, params, device):
     print("Stage 2 complete.")
 
 
-def post_hoc_calibration(model, train_loader, optimizer, epochs=5, device='cuda'):
-    """Stage 2: freeze backbone, fine-tune fc_out head with unweighted MSELoss.
+def _mse_calibration(model, X_tr, y_tr, params, device, season=None, head_key='fc_out'):
+    """Stage 2 — plain post-hoc calibration: freeze backbone, re-fit the output
+    head with unweighted MSELoss on the true distribution (no LDS/FDS reweighting).
 
     Stage 1 (aggressive LDS/FDS) maximises peak-feature extraction but
-    systematically over-predicts ordinary samples (bias shift).  Stage 2
-    corrects this by re-fitting only the final regression head on the true
-    data distribution, with no sample reweighting.
-
-    Args:
-        model:        Trained sequence model (Transformer or LSTM).
-        train_loader: DataLoader yielding (X, y, w) — sample weights w are ignored.
-        optimizer:    Optimizer pre-built for fc_out params only (lr ~ 1e-4).
-        epochs:       Number of fine-tuning epochs (5–10 is usually sufficient).
-        device:       Torch device string.
+    systematically over-predicts ordinary samples; this corrects that bias shift.
     """
-    for name, param in model.named_parameters():
-        param.requires_grad = ('fc_out' in name)
+    epochs   = params.get('stage2_epochs', 5)
+    lr       = params.get('stage2_lr', 1e-3)
+    batch_sz = params.get('batch_size', 32)
 
+    for name, param in model.named_parameters():
+        param.requires_grad = (head_key in name)
     n_frozen  = sum(1 for _, p in model.named_parameters() if not p.requires_grad)
     n_tunable = sum(1 for _, p in model.named_parameters() if p.requires_grad)
-    print(f"\n--- Stage 2: Post-hoc Calibration ---")
-    print(f"Frozen: {n_frozen} param tensors | Tunable (fc_out): {n_tunable} param tensors")
+    print(f"\n--- Stage 2 [mse] ---")
+    print(f"Frozen: {n_frozen} | Tunable ({head_key}): {n_tunable} | lr={lr}")
 
+    tensors = [X_tr, y_tr] + ([season] if season is not None else [])
+    loader = DataLoader(TensorDataset(*tensors), batch_size=batch_sz, shuffle=True)
+    optimizer = optim.Adam([p for n, p in model.named_parameters() if head_key in n], lr=lr)
     criterion = nn.MSELoss()
     model.train()
 
     for epoch in range(epochs):
         epoch_loss = 0.0
-        for bx, by, _ in train_loader:          # ignore LDS sample weights
-            bx, by = bx.to(device), by.to(device)
+        for batch in loader:
+            bx, by = batch[0].to(device), batch[1].to(device)
+            bs = batch[2].to(device) if season is not None else None
             optimizer.zero_grad()
-            pred = model(bx)                     # plain forward — no FDS, no LDS weighting
-            loss = criterion(pred, by)
+            loss = criterion(_fwd(model, bx, bs), by)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-        print(f"  Stage2 Epoch {epoch + 1:02d}/{epochs} | MSE: {epoch_loss / len(train_loader):.4f}")
+        print(f"  Stage2 Epoch {epoch + 1:02d}/{epochs} | MSE: {epoch_loss / len(loader):.4f}")
 
     for param in model.parameters():
         param.requires_grad = True
-
     model.eval()
     print("Stage 2 complete.")
+
+
+def run_stage2(model, X_tr, y_tr, params, device, save_path, season=None, head_key='fc_out'):
+    """Shared Stage-2 dispatcher for all sequence models.
+
+    Reloads the best Stage-1 checkpoint, runs the chosen calibration mode
+    ('mse' | 'bft' | 'pinball') on the output head (`head_key` selects which
+    params are tunable: 'fc_out' for transformer/LSTM, 'experts' for MoE), then
+    re-saves. `season` threads the MoE per-sample route; None for plain models.
+    No-op when stage2_epochs <= 0.
+    """
+    if params.get('stage2_epochs', 0) <= 0:
+        return
+    mode = params.get('stage2_mode', 'pinball')
+    model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
+    if mode == 'pinball':
+        _pinball_calibration(model, X_tr, y_tr, params, device, season, head_key)
+    elif mode == 'bft':
+        _bft_calibration(model, X_tr, y_tr, params, device, season, head_key)
+    elif mode == 'mse':
+        _mse_calibration(model, X_tr, y_tr, params, device, season, head_key)
+    else:
+        raise ValueError(f"Unknown stage2_mode {mode!r}. Use 'mse', 'bft', or 'pinball'.")
+    torch.save(model.state_dict(), save_path)
+    print(f"Stage 2 [{mode}] model saved to: {save_path}")
 
 
 def train_sequence(model_cls, model_type_name, save_name,
@@ -236,6 +269,7 @@ def train_sequence(model_cls, model_type_name, save_name,
     rel_train_idx, rel_val_idx = _split_indices(len(train_pool_idx), val_strategy, val_frac, random_state)
     train_idx = train_pool_idx[rel_train_idx]
     val_idx   = train_pool_idx[rel_val_idx]
+    train_idx, val_idx = apply_embargo(train_idx, val_idx, EMBARGO_DAYS)   # 2-week gap at split boundaries
 
     train_mask = mask_3d[train_idx]
     X_tr_np = X_3d[train_idx][train_mask]
@@ -362,23 +396,6 @@ def train_sequence(model_cls, model_type_name, save_name,
     print(f"Best Stage 1 model saved to: {save_path}")
 
     # ------------------------------------------------------------------ #
-    # Stage 2 — pluggable calibration (stage2_mode: 'mse' | 'pinball')  #
+    # Stage 2 — pluggable calibration (stage2_mode: 'mse' | 'bft' | 'pinball') #
     # ------------------------------------------------------------------ #
-    stage2_epochs = params.get('stage2_epochs', 0)
-    if stage2_epochs > 0:
-        mode = params.get('stage2_mode', 'pinball')
-        model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
-        if mode == 'pinball':
-            _pinball_calibration(model, X_tr, y_tr, params=params, device=device)
-        elif mode == 'bft':
-            _bft_calibration(model, X_tr, y_tr, params=params, device=device)
-        elif mode == 'mse':
-            stage2_opt = optim.AdamW(
-                [p for n, p in model.named_parameters() if 'fc_out' in n],
-                lr=params.get('stage2_lr', 1e-3),
-            )
-            post_hoc_calibration(model, loader, stage2_opt, epochs=stage2_epochs, device=device)
-        else:
-            raise ValueError(f"Unknown stage2_mode {mode!r}. Use 'mse', 'bft', or 'pinball'.")
-        torch.save(model.state_dict(), save_path)
-        print(f"Stage 2 [{mode}] model saved to: {save_path}")
+    run_stage2(model, X_tr, y_tr, params, device, save_path)
