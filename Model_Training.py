@@ -6,6 +6,7 @@ from src.models import lightgbm as lgb_mod
 from src.models import transformer as transformer_mod
 from src.models import lstm as lstm_mod
 from src.models import moe_transformer as moe_mod
+from src.models import mstnn as mstnn_mod
 
 TEST_STRATEGIES = ['tail']
 VAL_STRATEGIES  = ['tail']
@@ -13,7 +14,7 @@ VAL_STRATEGIES  = ['tail']
 
 def _run_eval(model_name, model_path, split_strategy, feature_cfg):
     """训练完成后立即评估，动态构建 eval config 传入 ModelEvaluator。"""
-    models = {m: {'enabled': 0, 'model_path': ''} for m in ['xgboost', 'lightgbm', 'transformer', 'lstm', 'moe_transformer']}
+    models = {m: {'enabled': 0, 'model_path': ''} for m in ['xgboost', 'lightgbm', 'transformer', 'lstm', 'moe_transformer', 'mstnn']}
     models[model_name] = {'enabled': 1, 'model_path': model_path}
     eval_cfg = {
         'split_strategy': split_strategy,
@@ -94,6 +95,25 @@ if cfg.TRAIN_CONFIG['moe_transformer']:
             mf = cfg.MOE_TRANSFORMER_FEATURE_CONFIG
             _run_eval('moe_transformer',
                       f'models/{cfg.DATASET}/moe_transformer/{test_strategy}_test{mf["test_frac"]}_{val_strategy}_val{mf["val_frac"]}{cfg._moe_lds}/moe_transformer_best.pth',
+                      test_strategy, mf)
+
+# --- MSTNN ---
+if cfg.TRAIN_CONFIG['mstnn']:
+    X_3d, y_3d, mask_3d, timestamps_3d = build_timeseries_matrix(cfg.CLEANED_PATH, cfg.MATRIX_DIR)
+
+    for test_strategy in TEST_STRATEGIES:
+        for val_strategy in VAL_STRATEGIES:
+            print(f"\n{'='*60}")
+            print(f"MSTNN | test split: {test_strategy} | val split: {val_strategy}")
+            print(f"{'='*60}")
+
+            cfg.MSTNN_FEATURE_CONFIG['split_strategy'] = test_strategy
+            cfg.MSTNN_FEATURE_CONFIG['val_strategy']   = val_strategy
+
+            mstnn_mod.train(X_3d, y_3d, mask_3d, cfg.MSTNN_PARAMS, cfg.MSTNN_FEATURE_CONFIG)
+            mf = cfg.MSTNN_FEATURE_CONFIG
+            _run_eval('mstnn',
+                      f'models/{cfg.DATASET}/mstnn/{test_strategy}_test{mf["test_frac"]}_{val_strategy}_val{mf["val_frac"]}{cfg._mstnn_lds}/mstnn_best.pth',
                       test_strategy, mf)
 
 # --- LSTM ---

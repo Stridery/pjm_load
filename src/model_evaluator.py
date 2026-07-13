@@ -9,11 +9,12 @@ import pandas as pd
 from src.feature_engine import build_or_load_matrix, build_timeseries_matrix, _split_indices
 from src.config import (
     CLEANED_PATH, MATRIX_DIR, DATASET,
-    TRANSFORMER_PARAMS, LSTM_PARAMS, MOE_TRANSFORMER_PARAMS,
+    TRANSFORMER_PARAMS, LSTM_PARAMS, MOE_TRANSFORMER_PARAMS, MSTNN_PARAMS,
 )
 from src.models import transformer as transformer_mod
 from src.models import lstm as lstm_mod
 from src.models import moe_transformer as moe_mod
+from src.models import mstnn as mstnn_mod
 from src.models import xgboost as xgboost_mod
 from src.models import lightgbm as lightgbm_mod
 from src.models._eval_utils import plot_single_day
@@ -35,7 +36,7 @@ class ModelEvaluator:
         return sd.get('enabled', 0) and sd.get('model') in tree
 
     def _needs_sequence(self):
-        seq = ['transformer', 'lstm', 'moe_transformer']
+        seq = ['transformer', 'lstm', 'moe_transformer', 'mstnn']
         if any(self.cfg['models'][m]['enabled'] for m in seq):
             return True
         sd = self.cfg.get('single_day', {})
@@ -130,7 +131,7 @@ class ModelEvaluator:
                              X_train=X_train, y_true_train=y_true_train_np,
                              timestamps_train=timestamps_train)
 
-        seq_models = ['transformer', 'lstm', 'moe_transformer']
+        seq_models = ['transformer', 'lstm', 'moe_transformer', 'mstnn']
         seq_enabled = [m for m in seq_models if self.cfg['models'].get(m, {}).get('enabled')]
         if seq_enabled:
             X_te, y_te_scaled, test_timestamps     = self._seq_test_split()
@@ -145,9 +146,9 @@ class ModelEvaluator:
                 run_tag    = os.path.basename(os.path.dirname(model_path))
                 result_dir = os.path.join(result_base, model_name, run_tag)
                 mod    = {'transformer': transformer_mod, 'lstm': lstm_mod,
-                          'moe_transformer': moe_mod}[model_name]
+                          'moe_transformer': moe_mod, 'mstnn': mstnn_mod}[model_name]
                 params = {'transformer': TRANSFORMER_PARAMS, 'lstm': LSTM_PARAMS,
-                          'moe_transformer': MOE_TRANSFORMER_PARAMS}[model_name]
+                          'moe_transformer': MOE_TRANSFORMER_PARAMS, 'mstnn': MSTNN_PARAMS}[model_name]
                 mod.evaluate(model_path, X_te, y_true_mw, self.y_scaler,
                              test_timestamps, result_dir, params,
                              X_train=X_tr, y_true_train_mw=y_true_train_mw,
@@ -174,8 +175,8 @@ class ModelEvaluator:
                 pred_scaled = moe_mod.predict(
                     model_path, self.X_3d[idx], self.timestamps_3d[idx], MOE_TRANSFORMER_PARAMS)
             else:
-                mod    = transformer_mod if model_name == 'transformer' else lstm_mod
-                params = TRANSFORMER_PARAMS if model_name == 'transformer' else LSTM_PARAMS
+                mod    = {'transformer': transformer_mod, 'lstm': lstm_mod, 'mstnn': mstnn_mod}[model_name]
+                params = {'transformer': TRANSFORMER_PARAMS, 'lstm': LSTM_PARAMS, 'mstnn': MSTNN_PARAMS}[model_name]
                 pred_scaled = mod.predict(model_path, self.X_3d[idx], params)
             pred_24h = self._inverse_transform(pred_scaled).flatten()
             true_24h = self._inverse_transform(self.y_3d[idx]).flatten()

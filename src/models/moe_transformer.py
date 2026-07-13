@@ -11,7 +11,7 @@ Design (hard routing + shared encoder + regime expert heads):
     (summer x3, winter x3, shoulder x2) each specialise in one physical regime.
   - One forward pass trains all experts: for a day of known season, its experts
     each predict their owned hours; results scatter into the 24-vector; the usual
-    L1 loss on 24 hours routes each hour's gradient to its expert + the shared
+    loss on 24 hours routes each hour's gradient to its expert + the shared
     encoder.
 
 The vanilla transformer / LSTM are untouched; this lives in its own file with a
@@ -35,7 +35,7 @@ from src.models._utils import _make_run_dir
 from src.models._eval_utils import EvalUtils
 from src.models._lds import compute_lds_weights
 from src.models._fds import FDSModule
-from src.models._seq_trainer import run_stage2
+from src.models._seq_trainer import run_stage2, _fds_apply, make_criterion, _loss_tag
 from src.config import (
     REGIME_MAP, SEASON_ORDER, MONTH_TO_SEASON,
     MOE_TRANSFORMER_PARAMS, MOE_TRANSFORMER_FEATURE_CONFIG,
@@ -103,8 +103,17 @@ class MoETransformer(nn.Module):
         self.out_dim = out_dim
         _validate_regime_map(out_dim)
 
+        # Static skip: per-timestep features (Load + weather) go through the shared
+        # encoder; the broadcast constants (forecast-day calendar + 3-week macro)
+        # bypass the sequence and are concatenated to the day representation z, so the
+        # encoder never re-processes them at all 168 steps. Every expert head sees them.
+        self.n_seq = params.get('n_seq_features') or num_features
+        self.n_static = num_features - self.n_seq
+        self.enc_dim = d_model                       # learned representation (FDS calibrates this)
+        self.feat_dim = d_model + self.n_static      # what the expert heads consume
+
         # --- shared encoder (same as vanilla transformer) ---
-        self.input_projection = nn.Linear(num_features, d_model)
+        self.input_projection = nn.Linear(self.n_seq, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=params['nhead'],
@@ -121,17 +130,20 @@ class MoETransformer(nn.Module):
             concat_hours = []
             for name in names:
                 hrs = REGIME_MAP[season][name]
-                self.experts[f'{season}__{name}'] = _expert_head(d_model, fc_hidden, len(hrs), dropout)
+                self.experts[f'{season}__{name}'] = _expert_head(self.feat_dim, fc_hidden, len(hrs), dropout)
                 concat_hours.extend(hrs)
             # inv_perm[h] = column of the season's concatenated expert output holding hour h
             inv_perm = [concat_hours.index(h) for h in range(out_dim)]
             self.register_buffer(f'inv_perm_{season}', torch.tensor(inv_perm, dtype=torch.long))
 
     def encode(self, x):
-        x = self.input_projection(x)
-        x = self.pos_encoder(x)
-        x = self.transformer_encoder(x)
-        return x[:, -1, :]                       # (batch, d_model)
+        h = self.input_projection(x[:, :, :self.n_seq])
+        h = self.pos_encoder(h)
+        h = self.transformer_encoder(h)
+        z = h[:, -1, :]                          # (batch, d_model)
+        if self.n_static > 0:
+            z = torch.cat([z, x[:, 0, self.n_seq:]], dim=1)   # (batch, feat_dim)
+        return z
 
     def _season_forward(self, z, season):
         """Full 24-vector prediction as if the whole batch were this season."""
@@ -220,20 +232,22 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
     use_fds   = params.get('use_fds', False)
     fds       = None
     fds_start = 0
+    enc_dim = model.enc_dim          # calibrate only the learned repr, not the static-skip tail
     if use_fds:
         fds_start = params.get('fds_start_epoch', 5)
         fds = FDSModule(
-            feature_dim=params['d_model'],
+            feature_dim=enc_dim,
             bin_width=params.get('fds_bin_width', 200.0),
             ks=params.get('fds_ks', 5),
             sigma=params.get('fds_sigma', 2.0),
             momentum=params.get('fds_momentum', 0.1),
         )
-        print(f"FDS: enabled | feat_dim={params['d_model']} | bin_width={fds.bin_width} "
+        print(f"FDS: enabled | feat_dim={enc_dim} | bin_width={fds.bin_width} "
               f"| start_epoch={fds_start} | momentum={fds.momentum}")
 
-    train_criterion = nn.L1Loss(reduction='none')
-    val_criterion   = nn.L1Loss()
+    train_criterion = make_criterion(params, reduction='none')
+    val_criterion   = make_criterion(params)
+    print(f"Loss: {_loss_tag(params)}")
     optimizer = optim.AdamW(model.parameters(), lr=params['learning_rate'],
                             weight_decay=params['weight_decay'])
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
@@ -254,10 +268,10 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
 
             if use_fds:
                 # encode / (calibrate) / decode so FDS can intervene on z, then route by season
-                features_raw = model.encode(bx)             # (batch, d_model)
+                features_raw = model.encode(bx)             # (batch, [enc | static])
                 by_rep       = by.mean(dim=1)
                 if epoch >= fds_start and fds._ready:
-                    features = fds.calibrate(features_raw, by_rep)
+                    features = _fds_apply(fds, features_raw, by_rep, enc_dim)
                 else:
                     features = features_raw
                 pred = model.decode(features, bs)
@@ -271,7 +285,7 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
             train_loss += loss.item()
 
             if use_fds:
-                fds.collect(features_raw, by_rep)
+                fds.collect(features_raw[:, :enc_dim], by_rep)   # encoder slice only
 
         if use_fds:
             fds.update_and_smooth()

@@ -7,6 +7,10 @@ from sklearn.preprocessing import StandardScaler
 import joblib
 from src.config import TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG, WEATHER_COLS, EMBARGO_DAYS
 from src.macro_features import compute_macro_features, MACRO_FEATURE_NAMES, MACRO_WINDOW_HOURS
+from src.thermal_features import (
+    add_thermal_sequence_cols, build_thermal_references, compute_thermal_static,
+    THERMAL_SEQ_COLS, THERMAL_STATIC_NAMES,
+)
 
 
 def _normalize_to_24h(load_vals, ept_hour_vals):
@@ -59,20 +63,26 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     print("=== Constructing 2D Matrix from Cleaned Data ===")
     df_final = pd.read_csv(cleaned_path, index_col=0, parse_dates=True)
     df_final = df_final.sort_index()
+    add_thermal_sequence_cols(df_final)
 
     ept_dt    = pd.to_datetime(df_final['Datetime_EPT'])
     ept_dates = ept_dt.dt.date.values
     ept_hours = ept_dt.dt.hour.values
 
     weather_cols = WEATHER_COLS
-    feature_cols = ['Load_Estimated'] + weather_cols
+    feature_cols = ['Load_Estimated'] + weather_cols + THERMAL_SEQ_COLS
     data_array   = df_final[feature_cols].values
-    load_raw     = df_final['Load'].values
-    est_raw      = df_final['Load_Estimated'].values   # for macro features
+    load_raw     = df_final['Load'].values             # metered load — TARGET only
+    est_raw      = df_final['Load_Estimated'].values   # preliminary load — macro features
+    temp_raw     = df_final['Temp_F'].values
+    cdd_raw      = df_final['CDD_h'].values
     valid_raw    = df_final['is_valid'].values
 
     min_history = max(lookback_hours, MACRO_WINDOW_HOURS)   # lookback + 3-week macro
     unique_days = np.unique(ept_dates)
+    split_idx   = int(len(df_final) * (1 - TREE_FEATURE_CONFIG['test_frac']))
+    _thr, heat_streak, climatology, day_index, doy = build_thermal_references(
+        df_final, ept_dates, unique_days, split_idx)
     X_list, y_list = [], []
 
     for i in tqdm(range(len(unique_days) - 1), desc="Building 2D Samples"):
@@ -116,9 +126,14 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
             'tmrw_is_holiday': tmrw_meta['is_holiday'],
         })
 
-        # 3-week macro features (raw MW, unscaled — trees are scale-invariant).
-        macro_raw = compute_macro_features(load_raw, est_raw, ept_hours, cutoff_pos)
+        # Static numeric features (raw, unscaled — trees are scale-invariant).
+        macro_raw = compute_macro_features(est_raw, ept_hours, cutoff_pos)
         for nm, val in zip(MACRO_FEATURE_NAMES, macro_raw):
+            f[nm] = float(val)
+        thermal_raw = compute_thermal_static(
+            temp_raw, cdd_raw, doy, cutoff_pos,
+            day_index[ept_dates[cutoff_pos - 1]], heat_streak, climatology)
+        for nm, val in zip(THERMAL_STATIC_NAMES, thermal_raw):
             f[nm] = float(val)
         f['is_target_valid'] = tmrw_valid
 
@@ -158,12 +173,13 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     print(f"=== Constructing 3D Matrix (lb={lookback_hours}, h={latest_info_hour}) ===")
     df = pd.read_csv(cleaned_path, index_col=0, parse_dates=True)
     df = df.sort_index()
+    add_thermal_sequence_cols(df)          # per-hour CDD/HDD, rolling CDD/temp, heat index, wet bulb
 
-    # Lookback (per-timestep) features: only continuous physical signals.
-    # Calendar/cyclic features are NOT put in the window — hour-of-day is implicit
-    # in the 24-dim output (and the expert routing), and month/day-of-week belong
-    # to the FORECAST day, so they are appended below as broadcast constants.
-    feature_cols = ['Load_Estimated'] + WEATHER_COLS
+    # Lookback (per-timestep) features: only continuous physical signals that change
+    # every hour. Calendar/cyclic features are NOT put in the window — hour-of-day is
+    # implicit in the 24-dim output (and the expert routing), and month/day-of-week
+    # belong to the FORECAST day, so they are appended below as broadcast constants.
+    feature_cols = ['Load_Estimated'] + WEATHER_COLS + THERMAL_SEQ_COLS
     split_idx = int(len(df) * (1 - TRANSFORMER_FEATURE_CONFIG['test_frac']))
 
     scaler = StandardScaler()
@@ -182,9 +198,10 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     ept_hours = ept_dt.dt.hour.values
 
     data_array    = df_scaled[feature_cols].values
-    load_array    = load_scaled
-    actual_raw    = df['Load'].values              # raw MW, for macro features
-    est_raw       = df['Load_Estimated'].values    # raw MW, for macro features
+    load_array    = load_scaled                    # metered load — TARGET only
+    # Macro features use the PRELIMINARY (estimated) load: the metered series lags ~2
+    # weeks and is not available for these windows at forecast time.
+    est_raw       = df['Load_Estimated'].values
     is_valid_array = df['is_valid'].values
     timestamps    = df.index
     unique_days   = np.unique(ept_dates)
@@ -192,7 +209,13 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     # Enough history for both the lookback window and the 3-week macro features.
     min_history = max(lookback_hours, MACRO_WINDOW_HOURS)
 
-    X_list, macro_list, y_list, valid_mask_list, timestamps_list = [], [], [], [], []
+    # Train-fitted thermal references (heat-wave threshold, streaks, climatology)
+    cdd_raw = df['CDD_h'].values
+    temp_raw = df['Temp_F'].values
+    _thr, heat_streak, climatology, day_index, doy = build_thermal_references(
+        df, ept_dates, unique_days, split_idx)
+
+    X_list, static_list, y_list, valid_mask_list, timestamps_list = [], [], [], [], []
 
     for i in tqdm(range(len(unique_days) - 1), desc="Building 3D Samples"):
         today, tomorrow = unique_days[i], unique_days[i + 1]
@@ -216,7 +239,14 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
 
         is_seq_valid = bool(is_valid_array[tmrw_pos].all())
         X_window     = data_array[cutoff_pos - lookback_hours : cutoff_pos]
-        macro_raw    = compute_macro_features(actual_raw, est_raw, ept_hours, cutoff_pos)
+
+        # Per-sample static (broadcast) numeric features: 3-week macro + thermal state
+        macro_raw   = compute_macro_features(est_raw, ept_hours, cutoff_pos)
+        thermal_raw = compute_thermal_static(
+            temp_raw, cdd_raw, doy, cutoff_pos,
+            day_index[ept_dates[cutoff_pos - 1]],      # last full day before cutoff
+            heat_streak, climatology)
+        static_raw = np.concatenate([macro_raw, thermal_raw])
 
         # Forecast-day (tomorrow) calendar features, broadcast across the window.
         # These condition the prediction on the day being forecast, not the lookback.
@@ -234,7 +264,7 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
         X_window = np.concatenate([X_window, tmrw_broadcast], axis=1)
 
         X_list.append(X_window)
-        macro_list.append(macro_raw)
+        static_list.append(static_raw)
         y_list.append(y_window)
         valid_mask_list.append(is_seq_valid)
         timestamps_list.append(tomorrow)  # EPT date, consistent with tree-model index
@@ -244,15 +274,16 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     mask_3d = np.array(valid_mask_list, dtype=bool)
     timestamps_3d = np.array(timestamps_list)
 
-    # Macro features: standardize (fit on the first 1-test_frac samples, like the
-    # sequence scaler), then broadcast across the window and append after calendar.
-    macro_arr = np.array(macro_list, dtype='float32')          # (N, 7), raw
-    m_split = int(len(macro_arr) * (1 - TRANSFORMER_FEATURE_CONFIG['test_frac']))
-    macro_scaler = StandardScaler().fit(macro_arr[:m_split])
-    macro_scaled = macro_scaler.transform(macro_arr).astype('float32')
-    joblib.dump(macro_scaler, macro_scaler_path)
-    macro_bc = np.repeat(macro_scaled[:, None, :], lookback_hours, axis=1)   # (N, 168, 7)
-    X_3d = np.concatenate([X_3d, macro_bc], axis=2)
+    # Numeric static features (macro + thermal): standardize (fit on the first
+    # 1-test_frac samples, like the sequence scaler), then broadcast across the
+    # window and append after the calendar block.
+    static_arr = np.array(static_list, dtype='float32')        # (N, 7 macro + 7 thermal), raw
+    m_split = int(len(static_arr) * (1 - TRANSFORMER_FEATURE_CONFIG['test_frac']))
+    static_scaler = StandardScaler().fit(static_arr[:m_split])
+    static_scaled = static_scaler.transform(static_arr).astype('float32')
+    joblib.dump(static_scaler, macro_scaler_path)
+    static_bc = np.repeat(static_scaled[:, None, :], lookback_hours, axis=1)
+    X_3d = np.concatenate([X_3d, static_bc], axis=2)
 
     np.save(x_path, X_3d)
     np.save(y_path, y_3d)

@@ -48,7 +48,7 @@ from src.models.transformer import TimeSeriesTransformer3D, predict as tr_predic
 from src.models._eval_utils import EvalUtils
 from src.models._lds import compute_lds_weights
 from src.models._fds import FDSModule
-from src.models._seq_trainer import run_stage2
+from src.models._seq_trainer import run_stage2, make_criterion, _loss_tag
 
 
 def _season_filter(idx, season_of_all, season_i):
@@ -97,8 +97,9 @@ def _train(Xtr, ytr, Xva, yva, params, device, save_path):
                         momentum=params.get('fds_momentum', 0.1))
         print(f"FDS: enabled | feat_dim={params['d_model']} | start_epoch={fds_start}")
 
-    train_crit = nn.L1Loss(reduction='none')
-    val_crit = nn.L1Loss()
+    train_crit = make_criterion(params, reduction='none')
+    val_crit = make_criterion(params)
+    print(f"Loss: {_loss_tag(params)}")
     patience = params.get('early_stop_patience', 50)
     best, no_improve = float('inf'), 0
 
@@ -146,7 +147,7 @@ def _train(Xtr, ytr, Xva, yva, params, device, save_path):
         if no_improve >= patience:
             print(f"Early stopping at epoch {ep+1}")
             break
-    print(f"Best Stage-1 val L1: {best:.4f} -> {save_path}")
+    print(f"Best Stage-1 val loss: {best:.4f} -> {save_path}")
 
     # ---------------- Stage 2 — pluggable calibration of fc_out ---------------- #
     run_stage2(model, X_tr, y_tr, params, device, save_path)   # head_key='fc_out', season=None

@@ -14,6 +14,43 @@ from src.models._lds import compute_lds_weights
 from src.models._fds import FDSModule
 
 
+def make_criterion(params, reduction='mean'):
+    """Stage-1 loss for every NN model: 'huber' (default) | 'mse' | 'l1'.
+
+    Targets are STANDARDIZED, so huber_delta is in units of target std: below delta
+    the loss is quadratic (like MSE, sensitive near the fit), above it linear (like
+    L1, robust to outlier days). delta=1.0 => the knee sits at 1 std.
+
+    reduction='none' is required by the LDS per-sample weighting.
+    """
+    name = str(params.get('loss', 'huber')).lower()
+    if name == 'huber':
+        return nn.HuberLoss(reduction=reduction, delta=float(params.get('huber_delta', 1.0)))
+    if name == 'mse':
+        return nn.MSELoss(reduction=reduction)
+    if name == 'l1':
+        return nn.L1Loss(reduction=reduction)
+    raise ValueError(f"Unknown loss {name!r}. Use 'huber', 'mse', or 'l1'.")
+
+
+def _loss_tag(params):
+    name = str(params.get('loss', 'huber')).lower()
+    return f"{name}(delta={params.get('huber_delta', 1.0)})" if name == 'huber' else name
+
+
+def _fds_apply(fds, features_raw, by_rep, enc_dim):
+    """Calibrate ONLY the learned encoder slice; static-skip features pass through.
+
+    encode() returns [encoder_repr | static_features]. FDS must not distort the raw
+    calendar/macro values appended by the static skip, so it operates on the first
+    enc_dim columns and the tail is concatenated back unchanged.
+    """
+    enc = fds.calibrate(features_raw[:, :enc_dim], by_rep)
+    if features_raw.size(1) > enc_dim:
+        return torch.cat([enc, features_raw[:, enc_dim:]], dim=1)
+    return enc
+
+
 def _fwd(model, x, season):
     """Forward that optionally threads a per-sample route (MoE season index).
 
@@ -304,9 +341,10 @@ def train_sequence(model_cls, model_type_name, save_name,
     fds         = None
     fds_start   = 0
     if use_fds:
-        feat_dim = params.get('hidden_size') or params.get('d_model')
+        # Calibrate only the learned representation (excludes the static-skip tail).
+        feat_dim = getattr(model, 'enc_dim', None) or params.get('hidden_size') or params.get('d_model')
         if feat_dim is None:
-            raise ValueError("FDS requires 'hidden_size' (LSTM) or 'd_model' (Transformer) in params.")
+            raise ValueError("FDS requires the model to expose 'enc_dim', or 'hidden_size'/'d_model' in params.")
         fds_start = params.get('fds_start_epoch', 5)
         fds = FDSModule(
             feature_dim=feat_dim,
@@ -319,8 +357,10 @@ def train_sequence(model_cls, model_type_name, save_name,
               f"| start_epoch={fds_start} | momentum={fds.momentum}")
 
     # Per-sample loss for LDS weighting; val uses plain mean for unbiased early-stop
-    train_criterion = nn.L1Loss(reduction='none')
-    val_criterion   = nn.L1Loss()
+    # Per-sample loss for LDS weighting; val uses the plain mean for early stopping.
+    train_criterion = make_criterion(params, reduction='none')
+    val_criterion   = make_criterion(params)
+    print(f"Loss: {_loss_tag(params)}")
     optimizer = optim.AdamW(model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'])
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
@@ -342,11 +382,11 @@ def train_sequence(model_cls, model_type_name, save_name,
 
             if use_fds:
                 # Separate encode / (calibrate) / decode so FDS can intervene
-                features_raw = model.encode(bx)                 # (batch, feat_dim)
+                features_raw = model.encode(bx)                 # (batch, [enc | static])
                 by_rep       = by.mean(dim=1)                   # representative label per day
 
                 if epoch >= fds_start and fds._ready:
-                    features = fds.calibrate(features_raw, by_rep)
+                    features = _fds_apply(fds, features_raw, by_rep, feat_dim)
                 else:
                     features = features_raw
 
@@ -354,16 +394,16 @@ def train_sequence(model_cls, model_type_name, save_name,
             else:
                 pred = model(bx)
 
-            # LDS-weighted L1 loss: (batch, out_dim) × (batch, 1) → scalar
+            # LDS-weighted loss: (batch, out_dim) × (batch, 1) → scalar
             loss = (train_criterion(pred, by) * bw.unsqueeze(1)).mean()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item()
 
-            # Accumulate RAW features (pre-calibration) for FDS stats update
+            # Accumulate RAW features (pre-calibration) for FDS stats update — encoder slice only
             if use_fds:
-                fds.collect(features_raw, by_rep)
+                fds.collect(features_raw[:, :feat_dim], by_rep)
 
         # Update FDS running statistics once per epoch
         if use_fds:

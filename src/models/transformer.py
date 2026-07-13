@@ -30,7 +30,17 @@ class TimeSeriesTransformer3D(nn.Module):
     def __init__(self, num_features, params):
         super().__init__()
         d_model = params['d_model']
-        self.input_projection = nn.Linear(num_features, d_model)
+
+        # Static skip: the first n_seq features vary per timestep (Load + weather) and
+        # go through the encoder; the rest (forecast-day calendar + 3-week macro) are
+        # broadcast constants — they bypass the sequence and are concatenated to the
+        # day representation, so the encoder never re-processes them 168 times.
+        self.n_seq = params.get('n_seq_features') or num_features
+        self.n_static = num_features - self.n_seq
+        self.enc_dim = d_model                       # learned representation (what FDS calibrates)
+        self.feat_dim = d_model + self.n_static      # what the head consumes
+
+        self.input_projection = nn.Linear(self.n_seq, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=params['nhead'],
@@ -39,17 +49,21 @@ class TimeSeriesTransformer3D(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=params['num_layers'])
         fc_hidden = params.get('fc_hidden', 128)
         self.fc_out = nn.Sequential(
-            nn.Linear(d_model, fc_hidden),
+            nn.Linear(self.feat_dim, fc_hidden),
             nn.ReLU(),
             nn.Dropout(params['dropout']),
             nn.Linear(fc_hidden, params['out_dim'])
         )
 
     def encode(self, x):
-        x = self.input_projection(x)
-        x = self.pos_encoder(x)
-        x = self.transformer_encoder(x)
-        return x[:, -1, :]            # (batch, d_model)
+        seq = x[:, :, :self.n_seq]
+        h = self.input_projection(seq)
+        h = self.pos_encoder(h)
+        h = self.transformer_encoder(h)
+        z = h[:, -1, :]                              # (batch, d_model)
+        if self.n_static > 0:
+            z = torch.cat([z, x[:, 0, self.n_seq:]], dim=1)   # (batch, d_model + n_static)
+        return z
 
     def decode(self, features):
         return self.fc_out(features)

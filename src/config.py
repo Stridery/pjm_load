@@ -2,7 +2,7 @@
 import os
 
 # --- Dataset Selection (controls all data / model / result paths) ---
-DATASET = os.environ.get('PJM_DATASET', 'dom')   # override: PJM_DATASET=dom python ...
+DATASET = os.environ.get('PJM_DATASET', 'bge')   # override: PJM_DATASET=dom python ...
 
 # --- Weather Features (per dataset) ---
 # dom columns match the output of data_crawler (Open-Meteo native variables).
@@ -21,6 +21,9 @@ _WEATHER_COLS = {
 }
 WEATHER_COLS = _WEATHER_COLS.get(DATASET, [])  # empty for 'joint'; joint uses _WEATHER_COLS per zone
 
+from src.thermal_features import THERMAL_SEQ_COLS   # per-hour thermal feats (go into the lookback)
+N_SEQ_FEATURES = 1 + len(WEATHER_COLS) + len(THERMAL_SEQ_COLS)   # Load + weather + thermal
+
 # --- File Paths ---
 RAW_LOAD_PATH    = f'data/{DATASET}/raw/dom_load.csv'
 RAW_WEATHER_PATH = f'data/{DATASET}/raw/pjm_dominionhub_hourly_2015_2025_openmeteo.csv'
@@ -33,6 +36,15 @@ MATRIX_DIR       = f'data/{DATASET}/matrix/'
 # ---------------------------------------------------------------------------
 # Controls src/data_crawler.run_pipeline().
 # Set PJM_API_KEY in your environment (or directly here for local runs).
+
+# Weather location PER ZONE — the city Open-Meteo is geocoded against. This MUST
+# follow the dataset: a single hardcoded default would silently fetch the wrong
+# region's weather on a re-crawl (e.g. Baltimore weather for the Virginia zone).
+_ZONE_LOCATION = {
+    'dom': 'Richmond',    # Dominion Energy Virginia
+    'bge': 'Baltimore',   # Baltimore Gas & Electric
+}
+
 CRAWLER_CONFIG = {
     # PJM zone abbreviation used in both metered-load and forecast endpoints.
     # Common values: 'DOM', 'BGE', 'PECO', 'PPL', 'PSEG', 'AEP', 'DAY', 'DUQ'
@@ -42,9 +54,10 @@ CRAWLER_CONFIG = {
     # Obtain a free key at https://dataminer2.pjm.com/
     'pjm_api_key': os.environ.get('PJM_API_KEY', ''),
 
-    # Location name passed to Open-Meteo Geocoding API.
-    # Should be a city / region representative of the load area's geography.
-    'location_name': os.environ.get('OPENMETEO_LOCATION', 'Baltimore'),
+    # Location name passed to Open-Meteo Geocoding API — resolved from the dataset,
+    # so `PJM_DATASET=dom` fetches Richmond, not Baltimore. Override with the
+    # OPENMETEO_LOCATION env var or run_crawler.py's --location flag.
+    'location_name': os.environ.get('OPENMETEO_LOCATION', _ZONE_LOCATION.get(DATASET, 'Baltimore')),
 
     # IANA timezone string for Open-Meteo requests and timezone alignment.
     # All output timestamps are normalised to this local time (naive).
@@ -57,11 +70,12 @@ CRAWLER_CONFIG = {
 
 # --- Models to Train (1 = train, 0 = skip) ---
 TRAIN_CONFIG = {
-    'xgboost':         0,
-    'lightgbm':        0,
+    'xgboost':         1,
+    'lightgbm':        1,
     'transformer':     1,
-    'lstm':            0,
+    'lstm':            1,
     'moe_transformer': 1,
+    'mstnn':           1,
 }
 
 # ---------------------------------------------------------------------------
@@ -123,7 +137,7 @@ TREE_FEATURE_CONFIG = {
                                 #   <= 9 → today at that hour (e.g. 0 = midnight, 9 = 9am)
                                 #   > 9  → previous day at that hour (e.g. 18 = yesterday 6pm)
     'split_strategy': 'tail',   # 'random' | 'head' | 'tail'
-    'test_frac': 0.1,
+    'test_frac': 0.19,
     'random_state': 42,         # only used when split_strategy='random'
 }
 
@@ -182,6 +196,10 @@ TRANSFORMER_FEATURE_CONFIG = {
 }
 
 TRANSFORMER_PARAMS = {
+    'loss': 'huber',                # Stage-1 loss: 'huber' | 'mse' | 'l1'
+    'huber_delta': 1.0,             # knee in units of target std (targets are standardized)
+    'n_seq_features': N_SEQ_FEATURES,   # per-timestep feats (Load+weather+thermal);
+                                # the rest (calendar+macro+thermal-static) bypass the encoder
     'd_model': 64,
     'nhead': 4,
     'num_layers': 2,
@@ -222,6 +240,10 @@ MOE_TRANSFORMER_FEATURE_CONFIG = {
 }                        # train = the earlier ~4 years (dom: 2020-01→2024-04)
 
 MOE_TRANSFORMER_PARAMS = {
+    'loss': 'huber',                # Stage-1 loss: 'huber' | 'mse' | 'l1'
+    'huber_delta': 1.0,             # knee in units of target std (targets are standardized)
+    'n_seq_features': N_SEQ_FEATURES,   # per-timestep feats (Load+weather+thermal);
+                                # the rest (calendar+macro+thermal-static) bypass the encoder
     'd_model': 64,
     'nhead': 4,
     'num_layers': 2,
@@ -239,20 +261,55 @@ MOE_TRANSFORMER_PARAMS = {
     'lds_sigma': 1.0,
     'lds_min_freq_ratio': 0.05,
     # --- FDS: feature (encoder-representation) distribution smoothing ---
-    'use_fds': True,
+    'use_fds': False,
     'fds_start_epoch': 30,
     'fds_bin_width': 200.0,
     'fds_ks': 5,
     'fds_sigma': 0.5,
     'fds_momentum': 0.1,       # EMA weight on current epoch's stats (lower = more stable)
     # --- Stage 2: pluggable calibration of the expert heads (freezes encoder) ---
-    'stage2_epochs': 10,        # 0 = disabled
+    'stage2_epochs': 0,        # 0 = disabled
     'stage2_mode': 'pinball',  # 'mse' | 'bft' | 'pinball'
     'stage2_lr': 3e-4,
     'stage2_bft_n_bins': 10,   # bft: equal-frequency load bins for resampling
     'stage2_q_max': 0.6,       # pinball: max quantile target for peak-load hours
     'stage2_p': 4.0,           # pinball: curvature of q(load_pct) schedule
     'stage2_routing': 'pred',  # pinball: 'pred' (deployable) | 'true' (diagnostic upper bound)
+}
+
+# --- MSTNN (simplified Multi-Scale Temporal NN; shares the 3D matrix + split) ---
+MSTNN_FEATURE_CONFIG = dict(MOE_TRANSFORMER_FEATURE_CONFIG)   # same 0.16/0.19 split + embargo
+
+MSTNN_PARAMS = {
+    'loss': 'huber',                # Stage-1 loss: 'huber' | 'mse' | 'l1'
+    'huber_delta': 1.0,             # knee in units of target std (targets are standardized)
+    'lookback_hours': 168,          # reshaped to (7 days, 24 hours) grid; must be a multiple of 24
+    'n_seq_features': N_SEQ_FEATURES,   # per-timestep feats (Load+weather+thermal) -> conv;
+                                    #   the rest (calendar+macro+thermal-static) bypass the conv
+    'mstnn_channels': 32,           # conv channels per multi-scale branch
+    'mstnn_kernels': [[3, 3], [5, 5]],   # parallel branches with different receptive fields
+    'mstnn_pool': 'avg',            # 'avg' = global avg pool (small head, less overfit) | 'flatten'
+    'fc_hidden': 128,
+    'dropout': 0.3,
+    'out_dim': 24,
+    'epochs': 200,
+    'batch_size': 32,
+    'learning_rate': 3e-4,
+    'weight_decay': 1e-4,
+    'early_stop_patience': 50,
+    'use_lds': False,
+    'lds_bin_width': 200.0,
+    'lds_ks': 5,
+    'lds_sigma': 1.0,
+    'lds_min_freq_ratio': 0.05,
+    'use_fds': False,               # FDS needs a fixed encoder feat_dim; not wired for MSTNN
+    'stage2_epochs': 0,             # 0 = disabled; 'mse' | 'bft' | 'pinball' supported
+    'stage2_mode': 'pinball',
+    'stage2_lr': 3e-4,
+    'stage2_bft_n_bins': 10,
+    'stage2_q_max': 0.6,
+    'stage2_p': 4.0,
+    'stage2_routing': 'pred',
 }
 
 # --- LSTM Feature Generation (shares the same 3D matrix as Transformer) ---
@@ -267,6 +324,10 @@ LSTM_FEATURE_CONFIG = {
 }
 
 LSTM_PARAMS = {
+    'loss': 'huber',                # Stage-1 loss: 'huber' | 'mse' | 'l1'
+    'huber_delta': 1.0,             # knee in units of target std (targets are standardized)
+    'n_seq_features': N_SEQ_FEATURES,   # per-timestep feats (Load+weather+thermal);
+                                # the rest (calendar+macro+thermal-static) bypass the encoder
     'hidden_size': 128,
     'num_layers': 2,
     'dropout': 0.3,
@@ -315,6 +376,7 @@ JOINT_FEATURE_CONFIG = {
 
 JOINT_TRANSFORMER_PARAMS = {
     **TRANSFORMER_PARAMS,
+    'n_seq_features':       None,  # joint feature engine is not static-skip aware; use all features
     'out_dim':              24 * len(JOINT_ZONES),
     'fc_hidden':            256,   # wider output head for 48-dim joint prediction
     'epochs':               400,
@@ -323,6 +385,7 @@ JOINT_TRANSFORMER_PARAMS = {
 
 JOINT_LSTM_PARAMS = {
     **LSTM_PARAMS,
+    'n_seq_features':       None,  # joint feature engine is not static-skip aware; use all features
     'out_dim':              24 * len(JOINT_ZONES),
     'fc_hidden':            256,
     'epochs':               400,
@@ -337,6 +400,7 @@ _lstm_lds = '_lds' if LSTM_PARAMS.get('use_lds')        else ''
 _tr_fds   = '_fds' if TRANSFORMER_PARAMS.get('use_fds') else ''
 _lstm_fds = '_fds' if LSTM_PARAMS.get('use_fds')        else ''
 _moe_lds  = '_lds' if MOE_TRANSFORMER_PARAMS.get('use_lds') else ''
+_mstnn_lds = '_lds' if MSTNN_PARAMS.get('use_lds') else ''
 
 # --- Evaluation Config ---
 EVAL_CONFIG = {
@@ -369,6 +433,10 @@ EVAL_CONFIG = {
         'moe_transformer': {
             'enabled': 1,
             'model_path': f'models/{DATASET}/moe_transformer/tail_test0.16_tail_val0.19{_moe_lds}/moe_transformer_best.pth',
+        },
+        'mstnn': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/mstnn/tail_test0.16_tail_val0.19{_mstnn_lds}/mstnn_best.pth',
         },
     },
 

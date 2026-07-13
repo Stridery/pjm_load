@@ -124,9 +124,11 @@ def month_hour_load_stats(df=None, save=True):
 def _feature_names(num_features):
     """Names for the 3D-matrix feature axis, in build_timeseries_matrix order."""
     from src.macro_features import MACRO_FEATURE_NAMES
-    names = (['Load_Estimated'] + list(cfg.WEATHER_COLS) +
+    from src.thermal_features import THERMAL_SEQ_COLS, THERMAL_STATIC_NAMES
+    names = (['Load_Estimated'] + list(cfg.WEATHER_COLS) + list(THERMAL_SEQ_COLS) +
              ['tmrw_month_sin', 'tmrw_month_cos', 'tmrw_dow_sin', 'tmrw_dow_cos',
-              'tmrw_is_weekend', 'tmrw_is_holiday'] + list(MACRO_FEATURE_NAMES))
+              'tmrw_is_weekend', 'tmrw_is_holiday'] +
+             list(MACRO_FEATURE_NAMES) + list(THERMAL_STATIC_NAMES))
     return names if len(names) == num_features else [f'feat_{i}' for i in range(num_features)]
 
 

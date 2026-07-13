@@ -15,8 +15,17 @@ class LSTMModel(nn.Module):
     def __init__(self, num_features, params):
         super().__init__()
         hidden = params['hidden_size']
+
+        # Static skip: per-timestep features (Load + weather) go through the LSTM; the
+        # broadcast constants (forecast-day calendar + 3-week macro) bypass the sequence
+        # and are concatenated to the final hidden state.
+        self.n_seq = params.get('n_seq_features') or num_features
+        self.n_static = num_features - self.n_seq
+        self.enc_dim = hidden                        # learned representation (FDS calibrates this)
+        self.feat_dim = hidden + self.n_static       # what the head consumes
+
         self.lstm = nn.LSTM(
-            input_size=num_features,
+            input_size=self.n_seq,
             hidden_size=hidden,
             num_layers=params['num_layers'],
             batch_first=True,
@@ -24,15 +33,18 @@ class LSTMModel(nn.Module):
         )
         fc_hidden = params.get('fc_hidden', 128)
         self.fc_out = nn.Sequential(
-            nn.Linear(hidden, fc_hidden),
+            nn.Linear(self.feat_dim, fc_hidden),
             nn.ReLU(),
             nn.Dropout(params['dropout']),
             nn.Linear(fc_hidden, params['out_dim']),
         )
 
     def encode(self, x):
-        out, _ = self.lstm(x)
-        return out[:, -1, :]          # (batch, hidden_size)
+        out, _ = self.lstm(x[:, :, :self.n_seq])
+        z = out[:, -1, :]                            # (batch, hidden_size)
+        if self.n_static > 0:
+            z = torch.cat([z, x[:, 0, self.n_seq:]], dim=1)
+        return z
 
     def decode(self, features):
         return self.fc_out(features)
