@@ -47,24 +47,39 @@ def merge_and_align(
     ----------------------
     Datetime_EPT | Load_Metered | Load_Estimated | <weather cols>
     """
-    logger.info("Aligning to metered load UTC index  (%d rows)...", len(metered))
+    met = metered.copy()
+    if met.index.tz is None:
+        met.index = met.index.tz_localize("UTC")
 
-    df = metered.copy()
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-
-    # Left-join preliminary load
+    # Time — not metered — is the canonical index. Metered (verified) lags ~7 days
+    # behind preliminary, so an outer join keeps the recent hours that have
+    # Load_Estimated but no Load_Metered yet. Those rows are exactly what the model
+    # forecasts on: every model input comes from Load_Estimated + weather, and only
+    # the training label needs metered. The old metered-as-base left-join dropped
+    # them outright, which is what made the dataset unusable for live prediction.
     if not preliminary.empty:
         pre = preliminary.copy()
         if pre.index.tz is None:
             pre.index = pre.index.tz_localize("UTC")
-        df = df.join(pre, how="left")
+        df = met.join(pre, how="outer")
+        n_unlabeled = int(df["Load_Metered"].isna().sum())
         logger.info(
-            "  Joined Load_Estimated: %d / %d non-null",
-            df["Load_Estimated"].notna().sum(), len(df),
+            "Aligning on the union of metered+preliminary hours: %d rows "
+            "(%d metered, %d with Load_Estimated but no metered yet)",
+            len(df), len(met), n_unlabeled,
         )
     else:
         logger.warning("Preliminary load is empty — Load_Estimated column will be absent.")
+        df = met
+
+    # Datetime_EPT comes from the metered export, so the preliminary-only rows have
+    # none. Derive it from the UTC index for exactly those rows; existing values are
+    # left untouched so nothing about the labelled history changes.
+    missing_ept = df["Datetime_EPT"].isna()
+    if missing_ept.any():
+        derived = df.index[missing_ept].tz_convert(timezone).tz_localize(None)
+        df.loc[missing_ept, "Datetime_EPT"] = derived
+        logger.info("  Derived Datetime_EPT for %d preliminary-only rows", int(missing_ept.sum()))
 
     # Left-join weather (convert to UTC first)
     weather_utc = _weather_to_utc(weather, timezone)

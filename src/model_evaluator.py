@@ -10,6 +10,7 @@ from src.feature_engine import build_or_load_matrix, build_timeseries_matrix, _s
 from src.config import (
     CLEANED_PATH, MATRIX_DIR, DATASET,
     TRANSFORMER_PARAMS, LSTM_PARAMS, MOE_TRANSFORMER_PARAMS, MSTNN_PARAMS,
+    TRANSFORMER_RESIDUAL_PARAMS,
 )
 from src.models import transformer as transformer_mod
 from src.models import lstm as lstm_mod
@@ -17,7 +18,20 @@ from src.models import moe_transformer as moe_mod
 from src.models import mstnn as mstnn_mod
 from src.models import xgboost as xgboost_mod
 from src.models import lightgbm as lightgbm_mod
+from src.models import xgboost_residual as xgb_res_mod
+from src.models import transformer_residual as tr_res_mod
 from src.models._eval_utils import plot_single_day
+
+# Residual models are drop-ins: same matrices, same predict()/evaluate() signatures. They
+# only differ in what they regress on, and that lives entirely inside their modules.
+TREE_MODELS = ['xgboost', 'lightgbm', 'xgboost_residual']
+SEQ_MODELS  = ['transformer', 'lstm', 'moe_transformer', 'mstnn', 'transformer_residual']
+
+TREE_MOD = {'xgboost': xgboost_mod, 'lightgbm': lightgbm_mod,
+            'xgboost_residual': xgb_res_mod}
+SEQ_MOD  = {'transformer': transformer_mod, 'lstm': lstm_mod,
+            'moe_transformer': moe_mod, 'mstnn': mstnn_mod,
+            'transformer_residual': tr_res_mod}
 
 
 class ModelEvaluator:
@@ -28,19 +42,22 @@ class ModelEvaluator:
 
     # --- Data loading ---
 
+    def _enabled(self, names):
+        # .get() rather than [] — Model_Training builds a config holding only the model it
+        # just trained, so a missing key means "not this run", not a bug.
+        return [m for m in names if self.cfg['models'].get(m, {}).get('enabled')]
+
     def _needs_tree(self):
-        tree = ['xgboost', 'lightgbm']
-        if any(self.cfg['models'][m]['enabled'] for m in tree):
+        if self._enabled(TREE_MODELS):
             return True
         sd = self.cfg.get('single_day', {})
-        return sd.get('enabled', 0) and sd.get('model') in tree
+        return sd.get('enabled', 0) and sd.get('model') in TREE_MODELS
 
     def _needs_sequence(self):
-        seq = ['transformer', 'lstm', 'moe_transformer', 'mstnn']
-        if any(self.cfg['models'][m]['enabled'] for m in seq):
+        if self._enabled(SEQ_MODELS):
             return True
         sd = self.cfg.get('single_day', {})
-        return sd.get('enabled', 0) and sd.get('model') in seq
+        return sd.get('enabled', 0) and sd.get('model') in SEQ_MODELS
 
     def load_data(self):
         if self._needs_tree():
@@ -111,7 +128,7 @@ class ModelEvaluator:
     def evaluate_all(self):
         result_base = self.cfg.get('result_dir', 'results/evaluation')
 
-        tree_enabled = [m for m in ['xgboost', 'lightgbm'] if self.cfg['models'][m]['enabled']]
+        tree_enabled = self._enabled(TREE_MODELS)
         if tree_enabled:
             X_test, y_test   = self._tree_test_split()
             X_train, y_train = self._tree_train_split()
@@ -126,13 +143,12 @@ class ModelEvaluator:
                 # Mirror the model's directory name (includes _lds suffix when applicable)
                 run_tag    = os.path.basename(os.path.dirname(model_path))
                 result_dir = os.path.join(result_base, model_name, run_tag)
-                mod = xgboost_mod if model_name == 'xgboost' else lightgbm_mod
+                mod = TREE_MOD[model_name]
                 mod.evaluate(model_path, X_test, y_true_np, timestamps, result_dir,
                              X_train=X_train, y_true_train=y_true_train_np,
                              timestamps_train=timestamps_train)
 
-        seq_models = ['transformer', 'lstm', 'moe_transformer', 'mstnn']
-        seq_enabled = [m for m in seq_models if self.cfg['models'].get(m, {}).get('enabled')]
+        seq_enabled = self._enabled(SEQ_MODELS)
         if seq_enabled:
             X_te, y_te_scaled, test_timestamps     = self._seq_test_split()
             X_tr, y_tr_scaled, train_timestamps    = self._seq_train_split()
@@ -145,10 +161,10 @@ class ModelEvaluator:
                 # Mirror the model's directory name (includes _lds suffix when applicable)
                 run_tag    = os.path.basename(os.path.dirname(model_path))
                 result_dir = os.path.join(result_base, model_name, run_tag)
-                mod    = {'transformer': transformer_mod, 'lstm': lstm_mod,
-                          'moe_transformer': moe_mod, 'mstnn': mstnn_mod}[model_name]
+                mod    = SEQ_MOD[model_name]
                 params = {'transformer': TRANSFORMER_PARAMS, 'lstm': LSTM_PARAMS,
-                          'moe_transformer': MOE_TRANSFORMER_PARAMS, 'mstnn': MSTNN_PARAMS}[model_name]
+                          'moe_transformer': MOE_TRANSFORMER_PARAMS, 'mstnn': MSTNN_PARAMS,
+                          'transformer_residual': TRANSFORMER_RESIDUAL_PARAMS}[model_name]
                 mod.evaluate(model_path, X_te, y_true_mw, self.y_scaler,
                              test_timestamps, result_dir, params,
                              X_train=X_tr, y_true_train_mw=y_true_train_mw,

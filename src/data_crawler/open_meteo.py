@@ -102,15 +102,23 @@ def fetch_weather_year(
     """
     Fetch all hourly weather variables for a full calendar year.
 
-    For the current year, end_date is capped at today-5 days to stay within
-    the Open-Meteo archive lag window.
+    For the current year, end_date is capped at yesterday — matching how far the
+    preliminary load series reaches, so the two line up and the recent hours can
+    be used for prediction.
+
+    Note on the source: the archive endpoint serves ERA5 only up to ~today-5, then
+    silently falls back to ECMWF IFS for the remaining days (same column names,
+    ~1F different values). Fetching past today-5 therefore mixes sources at the
+    tail. Accepted deliberately: stopping 5 days short would leave NaN weather
+    inside the lookback window and make recent-day prediction impossible.
+
     Timestamps in the returned DataFrame are naive local time in `timezone`.
     """
     from datetime import date, timedelta
 
     start_date = f"{year}-01-01"
     latest = date(year, 12, 31)
-    cutoff = date.today() - timedelta(days=5)
+    cutoff = date.today() - timedelta(days=1)
     end_date = str(min(latest, cutoff))
 
     logger.info(

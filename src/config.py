@@ -28,7 +28,8 @@ N_SEQ_FEATURES = 1 + len(WEATHER_COLS) + len(THERMAL_SEQ_COLS)   # Load + weathe
 RAW_LOAD_PATH    = f'data/{DATASET}/raw/dom_load.csv'
 RAW_WEATHER_PATH = f'data/{DATASET}/raw/pjm_dominionhub_hourly_2015_2025_openmeteo.csv'
 MERGED_PATH      = f'data/{DATASET}/joined/merged_pjm_load_weather.csv'
-CLEANED_PATH     = f'data/{DATASET}/cleaned/cleaned_pjm_load_weather.csv'
+CLEANED_PATH     = f'data/{DATASET}/cleaned/cleaned_pjm_load_weather.csv'   # labelled rows -> training
+PREDICT_PATH     = f'data/{DATASET}/cleaned/predict.csv'                    # all rows, no Load -> forecasting
 MATRIX_DIR       = f'data/{DATASET}/matrix/'
 
 # ---------------------------------------------------------------------------
@@ -65,17 +66,19 @@ CRAWLER_CONFIG = {
 
     # Inclusive year range for batch crawling.
     'start_year': int(os.environ.get('CRAWLER_START_YEAR', 2020)),
-    'end_year':   int(os.environ.get('CRAWLER_END_YEAR',   2024)),
+    'end_year':   int(os.environ.get('CRAWLER_END_YEAR',   2026)),
 }
 
 # --- Models to Train (1 = train, 0 = skip) ---
 TRAIN_CONFIG = {
-    'xgboost':         1,
-    'lightgbm':        1,
-    'transformer':     1,
-    'lstm':            1,
-    'moe_transformer': 1,
-    'mstnn':           1,
+    'xgboost':              0,
+    'lightgbm':             0,
+    'transformer':          0,
+    'lstm':                 0,
+    'moe_transformer':      1,
+    'mstnn':                1,
+    'xgboost_residual':     0,
+    'transformer_residual': 0,
 }
 
 # ---------------------------------------------------------------------------
@@ -137,7 +140,7 @@ TREE_FEATURE_CONFIG = {
                                 #   <= 9 → today at that hour (e.g. 0 = midnight, 9 = 9am)
                                 #   > 9  → previous day at that hour (e.g. 18 = yesterday 6pm)
     'split_strategy': 'tail',   # 'random' | 'head' | 'tail'
-    'test_frac': 0.19,
+    'test_frac': 0.16,
     'random_state': 42,         # only used when split_strategy='random'
 }
 
@@ -191,7 +194,7 @@ TRANSFORMER_FEATURE_CONFIG = {
     'split_strategy': 'tail',   # 'random' | 'head' | 'tail'
     'test_frac': 0.16,
     'val_strategy': 'tail',     # 'random' | 'head' | 'tail' — how to split val from train pool
-    'val_frac': 0.19,            # fraction of train pool used as validation
+    'val_frac': 0.1,            # fraction of train pool used as validation
     'random_state': 42,         # only used when split_strategy or val_strategy='random'
 }
 
@@ -236,7 +239,7 @@ TRANSFORMER_PARAMS = {
 MOE_TRANSFORMER_FEATURE_CONFIG = {
     **TRANSFORMER_FEATURE_CONFIG,
     'test_frac': 0.16,   # last ~1 year  = out-of-time test  (all seasons, dom: 2025-05→2026-05)
-    'val_frac':  0.19,   # prior ~1 year = validation        (all seasons, dom: 2024-04→2025-05)
+    'val_frac':  0.1,   # prior ~1 year = validation        (all seasons, dom: 2024-04→2025-05)
 }                        # train = the earlier ~4 years (dom: 2020-01→2024-04)
 
 MOE_TRANSFORMER_PARAMS = {
@@ -317,7 +320,7 @@ LSTM_FEATURE_CONFIG = {
     'lookback_hours': 168,
     'latest_info_hour': 0,
     'split_strategy': 'tail',
-    'test_frac': 0.1,
+    'test_frac': 0.16,
     'val_strategy': 'tail',
     'val_frac': 0.1,
     'random_state': 42,
@@ -392,6 +395,32 @@ JOINT_LSTM_PARAMS = {
     'early_stop_patience':  50,
 }
 
+# ---------------------------------------------------------------------------
+# Residual models  (src/models/xgboost_residual.py, transformer_residual.py)
+# ---------------------------------------------------------------------------
+# Same features, same estimator, same split as the plain models — only the TARGET moves:
+# predict the deviation from a naive same-hour-last-week baseline, then add the baseline
+# back at inference. The baseline is built per-sample from that sample's own lookback of
+# PRELIMINARY load, so nothing is fit on the training set (it cannot leak) and it is
+# available in real time — the residual models deploy on the same forecast path as the rest.
+#
+#   'baseline': 'hourly' -> baseline[h] = mean of the past 7 days at clock-hour h (24-dim)
+#               'scalar' -> one number per day (mean of the 168 h window), broadcast to 24 h
+_RESIDUAL_BASELINE = 'hourly'
+
+XGB_RESIDUAL_PARAMS = {
+    **XGB_PARAMS,
+    'baseline': _RESIDUAL_BASELINE,
+}
+
+TRANSFORMER_RESIDUAL_PARAMS = {
+    **TRANSFORMER_PARAMS,
+    'baseline': _RESIDUAL_BASELINE,
+    # NOTE: use_lds / use_fds bin on the TARGET, which for this model is the residual and
+    # not the load. Inherited from TRANSFORMER_PARAMS on purpose ("same model, only the
+    # target changes"), but it is a different thing than it is over there.
+}
+
 # --- Path suffixes (derived from param dicts, appended to model directory names) ---
 _xgb_lds  = '_lds' if XGB_PARAMS.get('use_lds')         else ''
 _lgbm_lds = '_lds' if LGBM_PARAMS.get('use_lds')        else ''
@@ -401,6 +430,9 @@ _tr_fds   = '_fds' if TRANSFORMER_PARAMS.get('use_fds') else ''
 _lstm_fds = '_fds' if LSTM_PARAMS.get('use_fds')        else ''
 _moe_lds  = '_lds' if MOE_TRANSFORMER_PARAMS.get('use_lds') else ''
 _mstnn_lds = '_lds' if MSTNN_PARAMS.get('use_lds') else ''
+_xgbres_lds = '_lds' if XGB_RESIDUAL_PARAMS.get('use_lds')         else ''
+_trres_lds  = '_lds' if TRANSFORMER_RESIDUAL_PARAMS.get('use_lds') else ''
+_trres_fds  = '_fds' if TRANSFORMER_RESIDUAL_PARAMS.get('use_fds') else ''
 
 # --- Evaluation Config ---
 EVAL_CONFIG = {
@@ -438,6 +470,14 @@ EVAL_CONFIG = {
             'enabled': 0,
             'model_path': f'models/{DATASET}/mstnn/tail_test0.16_tail_val0.19{_mstnn_lds}/mstnn_best.pth',
         },
+        'xgboost_residual': {
+            'enabled': 1,
+            'model_path': f'models/{DATASET}/xgboost_residual/tail_test0.1{_xgbres_lds}/xgboost_residual_24_models.pkl',
+        },
+        'transformer_residual': {
+            'enabled': 1,
+            'model_path': f'models/{DATASET}/transformer_residual/tail_test0.1_tail_val0.1{_trres_lds}{_trres_fds}/transformer_residual_best.pth',
+        },
     },
 
     # Single-day plot mode: load model, find date in matrix, show plot interactively
@@ -446,6 +486,65 @@ EVAL_CONFIG = {
         'model': 'transformer',
         'model_path': f'models/{DATASET}/transformer/tail_test0.1_tail_val0.1{_tr_lds}{_tr_fds}/transformer_best.pth',
         'date': '2026-01-24',
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Forecast Config  (src/model_predictor.py — run after evaluation, or standalone)
+# ---------------------------------------------------------------------------
+# Forecasts the days PJM has not verified yet: everything in cleaned/predict.csv that
+# has Load_Estimated + weather but no metered Load. Metered lags ~7 days and is only
+# ever the LABEL — every model input comes from Load_Estimated + weather — so those
+# days are fully forecastable, they just have no verified truth yet.
+PREDICT_CONFIG = {
+    'predict_path': PREDICT_PATH,
+    # No result_dir of its own: a model's forecast is written next to that model's
+    # detailed_errors.csv, under EVAL_CONFIG['result_dir'] / {model} / {run_tag}.
+
+    # Score the forecast against the preliminary load series?
+    #   dom: preliminary is load_area=DOM — the zone itself (prelim/metered ratio 1.01).
+    #        A real near-real-time truth. Scored.
+    #   bge: PJM publishes NO zone-level preliminary for BC. What we have is load_area=
+    #        MIDATL, the whole Mid-Atlantic region — ~8.8x BGE's load, and the ratio moves
+    #        seasonally (CV 4.2%, vs the model's own 8.7% MAPE). Rescaling it by a constant
+    #        would invent a truth noisier than the thing it is meant to judge. So bge emits
+    #        forecasts only; its true curve comes from metered, once PJM verifies it.
+    'compare_to_preliminary': DATASET == 'dom',
+
+    # Same shape as EVAL_CONFIG['models'] — enable a model and point at its weights.
+    'models': {
+        'xgboost': {
+            'enabled': 1,
+            'model_path': f'models/{DATASET}/xgboost/tail_test0.16{_xgb_lds}/xgboost_24_models.pkl',
+        },
+        'lightgbm': {
+            'enabled': 1,
+            'model_path': f'models/{DATASET}/lightgbm/tail_test0.16{_lgbm_lds}/lightgbm_24_models.pkl',
+        },
+        'transformer': {
+            'enabled': 1,
+            'model_path': f'models/{DATASET}/transformer/tail_test0.16_tail_val0.1{_tr_lds}{_tr_fds}/transformer_best.pth',
+        },
+        'lstm': {
+            'enabled': 1,
+            'model_path': f'models/{DATASET}/lstm/tail_test0.16_tail_val0.1{_lstm_lds}{_lstm_fds}/lstm_best.pth',
+        },
+        'moe_transformer': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/moe_transformer/tail_test0.16_tail_val0.1{_moe_lds}/moe_transformer_best.pth',
+        },
+        'mstnn': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/mstnn/tail_test0.16_tail_val0.1{_mstnn_lds}/mstnn_best.pth',
+        },
+        'xgboost_residual': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/xgboost_residual/tail_test0.16{_xgbres_lds}/xgboost_residual_24_models.pkl',
+        },
+        'transformer_residual': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/transformer_residual/tail_test0.16_tail_val0.1{_trres_lds}{_trres_fds}/transformer_residual_best.pth',
+        },
     },
 }
 

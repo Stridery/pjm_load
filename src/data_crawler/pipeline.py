@@ -260,8 +260,61 @@ def run_pipeline(
     cleaned = clean_and_engineer(clean_input_path, cleaned_path)
     os.remove(clean_input_path)
 
+    # Step 7 – Split into the training view and the forecast view.
+    #
+    # Metered (verified) lags ~7 days behind preliminary, so the most recent hours have
+    # Load_Estimated + weather but no Load. Every model INPUT comes from Load_Estimated
+    # and weather; only the label needs metered. So those hours are not junk — they are
+    # the days we forecast.
+    #
+    # train  : labelled rows only. Identical in shape to what training always consumed,
+    #          so nothing downstream changes: no NaN labels reach the loss, none leak
+    #          into the tail split (sklearn's MAPE does not skip NaN — a single NaN
+    #          label in the test set turns the reported MAPE into `nan`), and
+    #          split_idx = int(len(df) * (1 - test_frac)) keeps meaning what it meant.
+    # predict: EVERY row, with Load dropped. Not just the unlabelled tail — forecasting
+    #          one day reads 504 h (21 d) of history for the macro features, so the
+    #          recent days are worthless without the labelled history in front of them.
+    #          Dropping the column makes it impossible to train or score against a NaN.
+    predict_path = os.path.join(cleaned_dir, "predict.csv")
+
+    train   = cleaned[cleaned["has_label"] == 1].drop(columns=["has_label"])
+    predict = cleaned.drop(columns=["Load", "is_valid"], errors="ignore")
+
+    # Dropping the unlabelled rows is only safe because they form a single block at the
+    # END. The lookback is sliced BY POSITION (data_array[cutoff-168 : cutoff]), so a
+    # hole punched in the middle would make "168 rows" silently span more than 168 hours
+    # and corrupt every window that crosses it — without raising. Refuse to write a
+    # training file that would do that.
+    step = train.index.to_series().diff().dropna()
+    holes = step[step != pd.Timedelta("1h")]
+    if len(holes):
+        raise ValueError(
+            f"Training view is not contiguous: {len(holes)} gap(s) in the labelled "
+            f"hours, first at {holes.index[0]}. Metered must have no interior holes — "
+            f"backfill them (PJM's unverified rows are fine) and re-run. Writing this "
+            f"file would silently corrupt every lookback window that crosses a gap."
+        )
+
+    na_cols = predict.columns[predict.isna().any()].tolist()
+    if na_cols:
+        raise ValueError(
+            f"Prediction view has NaNs in {na_cols}. A NaN anywhere inside a 168 h "
+            f"lookback window silently turns that day's whole forecast into NaN, so "
+            f"this must be fixed upstream rather than filled here."
+        )
+
+    train.to_csv(cleaned_path)
     logger.info(
-        "=== Cleaned CSV saved → %s  (%d rows × %d cols) ===",
-        cleaned_path, *cleaned.shape,
+        "=== Training CSV saved → %s  (%d rows × %d cols, %s → %s) ===",
+        cleaned_path, *train.shape, train.index[0], train.index[-1],
     )
-    return cleaned
+
+    predict.to_csv(predict_path)
+    n_target = int((predict["has_label"] == 0).sum())
+    logger.info(
+        "=== Prediction CSV saved → %s  (%d rows × %d cols; %d h with no metered yet "
+        "= %.0f forecastable days) ===",
+        predict_path, *predict.shape, n_target, n_target / 24,
+    )
+    return train

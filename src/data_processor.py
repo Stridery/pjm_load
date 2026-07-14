@@ -28,11 +28,20 @@ def clean_and_engineer(input_path, output_path):
     if 'POP_pct' in df.columns:
         df = df.drop(columns=['POP_pct'])
 
-    # Handle impossible loads
+    # The most recent hours have Load_Estimated but no verified Load yet (metered
+    # lags ~7 days). Those rows are the prediction set — the model's inputs all come
+    # from Load_Estimated + weather, only the label needs metered. Record it before
+    # anything touches the Load column.
+    df['has_label'] = df['Load'].notna().astype(int)
+
+    # Handle impossible loads. limit_area='inside' is load-bearing: a plain
+    # interpolate() pads TRAILING NaNs with the last valid value, which would
+    # fabricate labels for the entire unlabelled tail — silently, and only when a
+    # Load<=0 row happens to exist to trigger this branch.
     invalid_mask = df['Load'] <= 0
     if invalid_mask.any():
         df.loc[invalid_mask, 'Load'] = np.nan
-        df['Load'] = df['Load'].interpolate(method='linear')
+        df['Load'] = df['Load'].interpolate(method='linear', limit_area='inside')
 
     # Temporal features — derived from EPT (local Eastern time), not UTC index
     ept = pd.to_datetime(df['Datetime_EPT'])
@@ -54,7 +63,10 @@ def clean_and_engineer(input_path, output_path):
     df['group_mean'] = df.groupby(['month', 'hour'])['Load'].transform('mean')
     df['group_std'] = df.groupby(['month', 'hour'])['Load'].transform('std')
     df['z_score'] = (df['Load'] - df['group_mean']) / (df['group_std'] + 1e-6)
-    df['is_valid'] = (df['z_score'].abs() <= 3.0).astype(int)
+    # is_valid is the TRAINING mask: a row must be both labelled and non-outlier.
+    # Unlabelled rows already fall out via NaN z-score comparing False, but say so
+    # explicitly — the mask must never let a NaN label reach the loss.
+    df['is_valid'] = ((df['z_score'].abs() <= 3.0) & (df['has_label'] == 1)).astype(int)
     
     df = df.drop(columns=['group_mean', 'group_std', 'z_score'])
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
