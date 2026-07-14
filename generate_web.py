@@ -162,7 +162,7 @@ HTML = r"""<!doctype html>
 * { box-sizing:border-box; }
 body { margin:0; background:var(--plane); color:var(--ink);
        font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
-.wrap { max-width:1180px; margin:0 auto; padding:28px 20px 64px; }
+.wrap { max-width:1560px; margin:0 auto; padding:28px 24px 64px; }
 header h1 { margin:0 0 4px; font-size:22px; font-weight:650; letter-spacing:-.01em; }
 header p { margin:0; color:var(--muted); font-size:13px; }
 
@@ -199,7 +199,7 @@ header p { margin:0; color:var(--muted); font-size:13px; }
 .seg button[aria-pressed="true"] { background:var(--ink); color:var(--surface); font-weight:600; }
 .spacer { flex:1; }
 
-.layout { display:grid; grid-template-columns:1fr 212px; gap:20px; align-items:start; }
+.layout { display:grid; grid-template-columns:minmax(0,1fr) 224px; gap:20px; align-items:start; }
 @media (max-width:820px) { .layout { grid-template-columns:1fr; } }
 .stack { display:flex; flex-direction:column; gap:16px; }
 .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px; }
@@ -279,7 +279,7 @@ td .dir { color:var(--muted); font-size:11px; }
     <div class="layout">
       <div class="card">
         <div class="chart-wrap" id="d-chartwrap">
-          <svg id="d-chart" height="420"></svg>
+          <svg id="d-chart" height="560"></svg>
           <div class="tooltip" id="d-tip"></div>
         </div>
         <div class="table-scroll hidden" id="d-table"></div>
@@ -303,7 +303,7 @@ td .dir { color:var(--muted); font-size:11px; }
           <h3>Forecast vs actual</h3>
           <p>Preliminary load is the baseline &mdash; PJM's near-real-time published load for this zone.</p>
           <div class="chart-wrap">
-            <svg id="r-load" height="340"></svg>
+            <svg id="r-load" height="470"></svg>
             <div class="tooltip" id="r-load-tip"></div>
           </div>
         </div>
@@ -311,7 +311,7 @@ td .dir { color:var(--muted); font-size:11px; }
           <h3>Error</h3>
           <p>Forecast minus actual. Above zero = over-forecast, below = under.</p>
           <div class="chart-wrap">
-            <svg id="r-err" height="260"></svg>
+            <svg id="r-err" height="320"></svg>
             <div class="tooltip" id="r-err-tip"></div>
           </div>
         </div>
@@ -445,11 +445,20 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
     p.push(`<text class="axis-title" x="${M.left}" y="${M.top - 3}">${getTitle()}</text>`,
            `<text class="axis-title" x="${M.left + iw}" y="${M.top + ih + 32}" text-anchor="end">Hour (EPT)</text>`);
 
-    for (const s of series) {
+    // Actual is drawn LAST so it sits on top. Painted in legend order it went down first and
+    // eight coloured model lines buried it — the reference curve was the one thing you could
+    // not see. It also gets a surface-coloured casing under it, which is what lets a single
+    // dark line stay legible crossing a bundle of bright ones.
+    for (const s of [...series].sort((a, b) => (a.top ? 1 : 0) - (b.top ? 1 : 0))) {
       const pts = s.values.map((v, h) => v == null ? null : `${x(h)},${y(v)}`).filter(Boolean).join(' ');
       const dim = emph && emph !== s.key;
+      const w = emph === s.key ? s.width + 1.5 : s.width;
+      if (s.top && !dim) {
+        p.push(`<polyline class="series" points="${pts}" stroke="var(--surface)" ` +
+               `stroke-width="${w + 3.5}" opacity=".9"/>`);
+      }
       p.push(`<polyline class="series" points="${pts}" stroke="${s.colour}" ` +
-             `opacity="${dim ? .16 : 1}" stroke-width="${emph === s.key ? s.width + 1.5 : s.width}"/>`);
+             `opacity="${dim ? .16 : 1}" stroke-width="${w}"/>`);
     }
     svg.innerHTML = p.join('');
   }
@@ -475,11 +484,11 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
     if (onEmph) onEmph(emph); else { getEmph = () => emph; paint(); }
 
     const layer = [`<line class="crosshair" x1="${geom.x(h)}" x2="${geom.x(h)}" y1="${M.top}" y2="${M.top + geom.ih}"/>`];
-    for (const s of geom.series) {
+    for (const s of [...geom.series].sort((a, b) => (a.top ? 1 : 0) - (b.top ? 1 : 0))) {
       const v = s.values[h];
       if (v == null) continue;
       const on = getEmph() === s.key;
-      layer.push(`<circle class="dot" cx="${geom.x(h)}" cy="${geom.y(v)}" r="${on ? 6 : 4}" ` +
+      layer.push(`<circle class="dot" cx="${geom.x(h)}" cy="${geom.y(v)}" r="${on ? 6 : (s.top ? 5.5 : 4)}" ` +
                  `fill="${s.colour}" opacity="${getEmph() && !on ? .22 : 1}"/>`);
     }
     svg.insertAdjacentHTML('beforeend', layer.join(''));
@@ -542,7 +551,8 @@ const dChart = makeChart($('d-chart'), $('d-tip'), { onEmph: e => { D.emph = e; 
 function dSeries() {
   const z = DATA.zones[ZONE], out = [];
   if (z.actual[D.date] && !D.off.has(ACTUAL))
-    out.push({ key: ACTUAL, name: 'Actual (prelim.)', values: z.actual[D.date], colour: ink(), width: 3 });
+    out.push({ key: ACTUAL, name: 'Actual (prelim.)', values: z.actual[D.date],
+               colour: ink(), width: 3.5, top: true });
   for (const m of z.models) {
     if (D.off.has(m)) continue;
     out.push({ key: m, name: pretty(m), values: z.series[D.date][m], colour: colourOf(m), width: 2 });
@@ -591,7 +601,8 @@ const rErr  = makeChart($('r-err'),  $('r-err-tip'),  { zero: true, onEmph: rEmp
 function rLoadSeries() {
   const z = DATA.zones[ZONE], out = [];
   if (!R.off.has(ACTUAL))
-    out.push({ key: ACTUAL, name: 'Actual (prelim.)', values: z.actual[R.date], colour: ink(), width: 3 });
+    out.push({ key: ACTUAL, name: 'Actual (prelim.)', values: z.actual[R.date],
+               colour: ink(), width: 3.5, top: true });
   for (const m of z.models) {
     if (R.off.has(m)) continue;
     out.push({ key: m, name: pretty(m), values: z.series[R.date][m], colour: colourOf(m), width: 2 });
