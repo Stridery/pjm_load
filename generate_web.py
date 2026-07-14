@@ -89,7 +89,20 @@ def build_payload():
         parts = path.split(os.sep)
         ds, model = parts[1], parts[3]
 
-        df = pd.read_csv(path, parse_dates=['datetime'])
+        df = pd.read_csv(path)
+        # A forecast written before the DST fix has a blind 24 rows per day and no UTC column:
+        # a phantom 2 a.m. in March, a missing hour in November. It is stale, and plotting it
+        # next to fresh ones would look completely normal. Name it and stop, rather than draw
+        # a chart that is quietly wrong for one model.
+        if 'datetime_utc' not in df.columns:
+            raise SystemExit(
+                f"{path} is from an older run (no datetime_utc column, 24 rows/day regardless "
+                f"of DST).\nEither re-run the forecast for {ds}/{model} — enable it in "
+                f"PREDICT_CONFIG and run Model_Prediction.py — or delete the file if that model "
+                f"is no longer part of the site."
+            )
+        df['datetime']     = pd.to_datetime(df['datetime'])
+        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
         pred_col = next(c for c in df.columns if c.endswith('_pred'))
         df['date'] = df['datetime'].dt.strftime('%Y-%m-%d')
         df['hour'] = df['datetime'].dt.hour
@@ -97,12 +110,17 @@ def build_payload():
         z = zones.setdefault(ds, {
             'label': ZONES.get(ds, {}).get('label', ds.upper()),
             'name':  ZONES.get(ds, {}).get('name', ''),
-            'models': [], 'series': {}, 'actual': {},
+            'models': [], 'hours': {}, 'series': {}, 'actual': {},
         })
         z['models'].append(model)
 
         for date, g in df.groupby('date'):
-            g = g.sort_values('hour')
+            # Sort by UTC, not by the local clock: on a fall-back day 01:00 appears twice and
+            # the local timestamp cannot order those two rows. A day holds 23, 24 or 25 hours
+            # and the page plots exactly that many points — no phantom 2 a.m. in March, no
+            # missing hour in November.
+            g = g.sort_values('datetime_utc')
+            z['hours'].setdefault(date, [int(h) for h in g['hour']])
             z['series'].setdefault(date, {})[model] = [round(v, 1) for v in g[pred_col]]
             # Preliminary load is the near-real-time actual — but only where PJM publishes it
             # for THIS zone. For bge it is the MIDATL regional aggregate, so the column is
@@ -421,10 +439,11 @@ const dayLabel = d => new Date(d + 'T00:00').toLocaleDateString('en-US',
    ========================================================================== */
 function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
   const M = { top: 16, right: 16, bottom: 34, left: 60 };
-  let geom = null, getSeries = () => [], getEmph = () => null, getTitle = () => '';
+  let geom = null, getSeries = () => [], getEmph = () => null, getTitle = () => '',
+      getHours = () => [];
 
   function paint() {
-    const series = getSeries(), emph = getEmph();
+    const series = getSeries(), emph = getEmph(), HRS = getHours(), N = HRS.length;
     const W = svg.clientWidth || 700, H = svg.height.baseVal.value;
     const iw = W - M.left - M.right, ih = H - M.top - M.bottom;
     const vals = series.flatMap(s => s.values).filter(v => v != null);
@@ -438,9 +457,11 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
     if (zero) { const m = Math.max(Math.abs(lo), Math.abs(hi)) * 1.15 || 1; lo = -m; hi = m; }
     else { const p = (hi - lo) * 0.12 || 1; lo -= p; hi += p; }
 
-    const x = h => M.left + iw * h / 23;
+    // Indexed by POSITION in the day, not by clock hour: a fall-back day has two 01:00s and
+    // they must sit at two different x positions.
+    const x = i => M.left + iw * i / Math.max(1, N - 1);
     const y = v => M.top + ih - ih * (v - lo) / (hi - lo);
-    geom = { x, y, iw, ih, series, M };
+    geom = { x, y, iw, ih, series, M, HRS, N };
 
     const step = Math.pow(10, Math.floor(Math.log10(hi - lo))) / 2;
     const p = [];
@@ -451,8 +472,10 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
     if (zero) p.push(`<line class="zeroline" x1="${M.left}" x2="${M.left + iw}" y1="${y(0)}" y2="${y(0)}"/>`);
     else p.push(`<line class="axisline" x1="${M.left}" x2="${M.left + iw}" y1="${M.top + ih}" y2="${M.top + ih}"/>`);
 
-    for (let h = 0; h <= 23; h += 3) {
-      p.push(`<text class="tick" x="${x(h)}" y="${M.top + ih + 18}" text-anchor="middle">${String(h).padStart(2, '0')}</text>`);
+    const every = N > 26 ? 3 : 3;
+    for (let i = 0; i < N; i++) {
+      if (i % every && i !== N - 1) continue;
+      p.push(`<text class="tick" x="${x(i)}" y="${M.top + ih + 18}" text-anchor="middle">${String(HRS[i]).padStart(2, '0')}</text>`);
     }
     p.push(`<text class="axis-title" x="${M.left}" y="${M.top - 3}">${getTitle()}</text>`,
            `<text class="axis-title" x="${M.left + iw}" y="${M.top + ih + 32}" text-anchor="end">Hour (EPT)</text>`);
@@ -472,7 +495,7 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
                        : 1;
     const order = s => (s.top ? 2 : s.faint ? 0 : 1);
     for (const s of [...series].sort((a, b) => order(a) - order(b))) {
-      const pts = s.values.map((v, h) => v == null ? null : `${x(h)},${y(v)}`).filter(Boolean).join(' ');
+      const pts = s.values.map((v, i) => v == null ? null : `${x(i)},${y(v)}`).filter(Boolean).join(' ');
       const w = emph === s.key ? s.width + 1.5 : s.width;
       if (s.top) {
         p.push(`<polyline class="series" points="${pts}" stroke="var(--surface)" ` +
@@ -493,13 +516,14 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
     const px = ev.clientX - r.left, py = ev.clientY - r.top;
     if (px < M.left - 10 || px > M.left + geom.iw + 10) return hide();
 
-    const h = Math.max(0, Math.min(23, Math.round((px - M.left) / geom.iw * 23)));
+    const i = Math.max(0, Math.min(geom.N - 1,
+      Math.round((px - M.left) / geom.iw * Math.max(1, geom.N - 1))));
     // Ghosts are background, not readable data: they cannot be picked and they are not listed.
     const live = geom.series.filter(s => !s.faint);
 
     let near = null, best = Infinity;
     for (const s of live) {
-      const v = s.values[h];
+      const v = s.values[i];
       if (v == null) continue;
       const d = Math.abs(geom.y(v) - py);
       if (d < best) { best = d; near = s.key; }
@@ -507,24 +531,24 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
     const emph = best < 28 ? near : null;
     if (onEmph) onEmph(emph); else { getEmph = () => emph; paint(); }
 
-    const layer = [`<line class="crosshair" x1="${geom.x(h)}" x2="${geom.x(h)}" y1="${M.top}" y2="${M.top + geom.ih}"/>`];
+    const layer = [`<line class="crosshair" x1="${geom.x(i)}" x2="${geom.x(i)}" y1="${M.top}" y2="${M.top + geom.ih}"/>`];
     for (const s of [...live].sort((a, b) => (a.top ? 1 : 0) - (b.top ? 1 : 0))) {
-      const v = s.values[h];
+      const v = s.values[i];
       if (v == null) continue;
       const on = getEmph() === s.key;
       // The baseline's marker never fades either — same reason its line does not.
       const faded = getEmph() && !on && !s.top;
-      layer.push(`<circle class="dot" cx="${geom.x(h)}" cy="${geom.y(v)}" r="${on ? 6 : (s.top ? 5.5 : 4)}" ` +
+      layer.push(`<circle class="dot" cx="${geom.x(i)}" cy="${geom.y(v)}" r="${on ? 6 : (s.top ? 5.5 : 4)}" ` +
                  `fill="${s.colour}" opacity="${faded ? .22 : 1}"/>`);
     }
     svg.insertAdjacentHTML('beforeend', layer.join(''));
 
-    tip.innerHTML = `<h4>${String(h).padStart(2, '0')}:00 EPT &middot; ${getTitle()}</h4>` +
-      live.filter(s => s.values[h] != null)
-        .sort((a, b) => b.values[h] - a.values[h])
+    tip.innerHTML = `<h4>${hourLabel(geom.HRS, i)} EPT &middot; ${getTitle()}</h4>` +
+      live.filter(s => s.values[i] != null)
+        .sort((a, b) => b.values[i] - a.values[i])
         .map(s => `<div class="tt-row${getEmph() === s.key ? ' emph' : ''}">` +
                   `<span class="swatch" style="background:${s.colour}"></span><span>${s.name}</span>` +
-                  `<span class="v">${s.values[h] > 0 && zero ? '+' : ''}${fmt(s.values[h])}</span></div>`).join('');
+                  `<span class="v">${s.values[i] > 0 && zero ? '+' : ''}${fmt(s.values[i])}</span></div>`).join('');
     tip.style.opacity = 1;
     tip.style.left = Math.min(geom.x(h) + 14, r.width - tip.offsetWidth - 4) + 'px';
     tip.style.top = Math.max(4, py - 12) + 'px';
@@ -534,14 +558,23 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
   svg.addEventListener('mouseleave', hide);
 
   return {
-    render(series, emphGetter, title) {
+    render(series, emphGetter, title, hours) {
       getSeries = () => series;
       getEmph = emphGetter;
       getTitle = () => title;
+      getHours = () => hours;
       paint();
     },
     repaint: paint,
   };
+}
+
+/* On a fall-back day 01:00 happens twice. Both are real hours with different real loads, so
+   both are plotted — and the second is marked so the repeat reads as the DST hour it is,
+   rather than as a rendering glitch. */
+function hourLabel(hours, i) {
+  const h = String(hours[i]).padStart(2, '0') + ':00';
+  return (i > 0 && hours[i] === hours[i - 1]) ? h + ' (2nd)' : h;
 }
 
 /* ============================================================================
@@ -608,8 +641,9 @@ function renderDay(paintOnly) {
   const chart = D.view === 'chart';
   $('d-chartwrap').classList.toggle('hidden', !chart);
   $('d-table').classList.toggle('hidden', chart);
-  if (chart) dChart.render(dSeries(), () => D.emph, 'MW');
-  else $('d-table').innerHTML = table(dSeries());
+  const hrs = z.hours[D.date];
+  if (chart) dChart.render(dSeries(), () => D.emph, 'MW', hrs);
+  else $('d-table').innerHTML = table(dSeries(), hrs);
 
   $('d-note').innerHTML = z.actual[D.date]
     ? `<b>${z.label}</b> &middot; ${z.name}. Actual is PJM's preliminary load for this zone.`
@@ -643,7 +677,7 @@ function rErrSeries() {
   for (const m of z.models) {
     const p = z.series[R.date][m];
     out.push({ key: m, name: pretty(m), colour: colourOf(m), width: 2, faint: R.off.has(m),
-               values: p.map((v, h) => a[h] == null ? null : v - a[h]) });
+               values: p.map((v, i) => a[i] == null ? null : v - a[i]) });
   }
   return out;
 }
@@ -652,7 +686,7 @@ function rMape() {
   const z = DATA.zones[ZONE], a = z.actual[R.date], out = {};
   for (const m of z.models) {
     const p = z.series[R.date][m];
-    const e = p.map((v, h) => a[h] == null ? null : Math.abs(v - a[h]) / a[h] * 100).filter(v => v != null);
+    const e = p.map((v, i) => a[i] == null ? null : Math.abs(v - a[i]) / a[i] * 100).filter(v => v != null);
     if (e.length) out[m] = e.reduce((x, y) => x + y, 0) / e.length;
   }
   return out;
@@ -724,8 +758,9 @@ function renderRT(paintOnly) {
   renderLegend($('r-legend'), [ACTUAL, ...z.models], R, renderRT, rMape());
   $('r-legend-note').textContent = 'MAPE for the selected day. The scoreboard below covers the whole test window.';
 
-  rLoad.render(rLoadSeries(), () => R.emph, 'MW');
-  rErr.render(rErrSeries(), () => R.emph, 'MW error');
+  const hrs = z.hours[R.date];
+  rLoad.render(rLoadSeries(), () => R.emph, 'MW', hrs);
+  rErr.render(rErrSeries(), () => R.emph, 'MW error', hrs);
 
   const s = z.scored;
   $('r-metrics-sub').textContent =
@@ -736,15 +771,16 @@ function renderRT(paintOnly) {
 
 /* The table is not a nicety: three light-mode hues sit under 3:1 contrast, so the exact
    numbers have to be reachable without depending on colour at all. */
-function table(all) {
+function table(all, hours) {
   // Ghosts are on the chart for shape, not for reading — a faint column of numbers would be
   // neither visible nor meaningfully excluded.
   const series = all.filter(s => !s.faint);
   if (!series.length) return '<p class="note">No series selected.</p>';
+  // As many rows as the day has hours: 23 in March, 25 in November.
   return `<table><thead><tr><th>Hour (EPT)</th>${series.map(s => `<th>${s.name}</th>`).join('')}</tr></thead><tbody>` +
-    Array.from({ length: 24 }, (_, h) =>
-      `<tr><td>${String(h).padStart(2, '0')}:00</td>` +
-      series.map(s => `<td>${fmt(s.values[h])}</td>`).join('') + '</tr>').join('') +
+    hours.map((_, i) =>
+      `<tr><td>${hourLabel(hours, i)}</td>` +
+      series.map(s => `<td>${fmt(s.values[i])}</td>`).join('') + '</tr>').join('') +
     '</tbody></table>';
 }
 

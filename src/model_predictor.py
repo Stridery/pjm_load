@@ -42,8 +42,8 @@ class ModelPredictor:
 
     def __init__(self, predict_cfg):
         self.cfg = predict_cfg
-        self.X_tree = self.prelim_tree = None
-        self.X_seq = self.ts_seq = self.prelim_seq = self.y_scaler = None
+        self.X_tree = self.cal_tree = None
+        self.X_seq = self.ts_seq = self.cal_seq = self.y_scaler = None
 
     def _enabled(self, names):
         return [m for m in names if self.cfg['models'].get(m, {}).get('enabled')]
@@ -67,11 +67,11 @@ class ModelPredictor:
         if self._enabled(SEQ_MODELS) and self.X_seq is None:
             if verify:
                 verify_against_training_matrix(MATRIX_DIR, path)
-            self.X_seq, self.ts_seq, self.prelim_seq, self.y_scaler = \
+            self.X_seq, self.ts_seq, self.cal_seq, self.y_scaler = \
                 build_sequence_features(path, MATRIX_DIR)
 
         if self._enabled(TREE_MODELS) and self.X_tree is None:
-            self.X_tree, self.prelim_tree = build_tree_features(path)
+            self.X_tree, self.cal_tree = build_tree_features(path)
 
         built = [len(x) for x in (self.ts_seq, self.X_tree) if x is not None]
         n = max(built) if built else 0
@@ -82,42 +82,55 @@ class ModelPredictor:
 
     # --- Output ---
 
-    def _write(self, model_name, model_path, timestamps, y_pred, prelim_df):
+    def _write(self, model_name, model_path, y_pred, calendars):
         # Straight into the model's evaluation folder — same run_tag convention as
         # ModelEvaluator — so a run's forecast sits beside its detailed_errors.csv.
         run_tag    = os.path.basename(os.path.dirname(model_path))
         result_dir = os.path.join(EVAL_CONFIG['result_dir'], model_name, run_tag)
         os.makedirs(result_dir, exist_ok=True)
-
-        dates     = pd.to_datetime(pd.Series(timestamps)).repeat(24)
-        hours     = np.tile(np.arange(24), len(timestamps))
-        datetimes = dates.values + pd.to_timedelta(hours, unit='h')
-
         col = f'{model_name.upper()}_pred'
-        df = pd.DataFrame({'datetime': datetimes, col: y_pred.flatten()})
+
+        # One row per hour the day ACTUALLY has — 23, 24 or 25 — not a blind 24. The model
+        # emits 24 numbers because the training target was squashed to 24; cal['hours'] maps
+        # them back onto the real clock, dropping the phantom 2 a.m. in March and applying the
+        # single 1 a.m. forecast to both real 1 a.m. hours in November. datetime_utc is carried
+        # because on a fall-back day the local timestamp repeats and cannot order the rows.
+        rows = []
+        for cal, pred in zip(calendars, y_pred):
+            for k, h in enumerate(cal['hours']):
+                rows.append({
+                    'datetime':     cal['local'][k],
+                    'datetime_utc': cal['utc'][k],
+                    col:            float(pred[h]),
+                    'preliminary_load': cal['prelim'][k],
+                })
+        df = pd.DataFrame(rows)
+
+        n_hours = len(df)
+        odd = [f"{c['date']} ({len(c['hours'])}h)" for c in calendars if len(c['hours']) != 24]
 
         if self.cfg.get('compare_to_preliminary'):
-            # The last two days reach PAST the data — a genuine day-ahead forecast, with no
-            # preliminary load to score against yet. Their truth columns are NaN, and the MAPE
-            # below is over the days that do have one. Say which is which; a single blended
-            # number would quietly imply we had scored days we have not.
-            df['preliminary_load'] = prelim_df.loc[list(timestamps)].values.flatten()
+            # The last days reach PAST the data — a genuine day-ahead forecast, with no
+            # preliminary load to score against yet. Their truth is NaN, and the MAPE below is
+            # over the days that do have one. Say which is which; one blended number would
+            # quietly imply we had scored days we have not.
             df['signed_error'] = df[col] - df['preliminary_load']
             df['abs_error']    = df['signed_error'].abs()
             df['mape_pct']     = df['abs_error'] / df['preliminary_load'] * 100
-
-            scored = int(prelim_df.loc[list(timestamps)].notna().any(axis=1).sum())
-            ahead  = len(timestamps) - scored
+            scored = sum(1 for c in calendars if any(v is not None for v in c['prelim']))
             summary = (f"{scored} day(s) scored vs preliminary: MAPE {df['mape_pct'].mean():.2f}%"
-                       f"  |  {ahead} day-ahead, no truth yet")
+                       f"  |  {len(calendars) - scored} day-ahead, no truth yet")
         else:
+            df = df.drop(columns=['preliminary_load'])
             summary = ("no truth column — this zone's preliminary series is a regional "
                        "aggregate, not its own load")
 
         out = os.path.join(result_dir, f'{model_name.upper()}_forecast.csv')
         df.to_csv(out, index=False)
-        print(f"  {model_name:16s} {len(timestamps)} day(s) → {out}")
+        print(f"  {model_name:16s} {len(calendars)} day(s), {n_hours} hours → {out}")
         print(f"  {'':16s} {summary}")
+        if odd:
+            print(f"  {'':16s} DST day(s) written at their real length: {', '.join(odd)}")
         return df
 
     # --- Run ---
@@ -130,7 +143,7 @@ class ModelPredictor:
             model_path = self.cfg['models'][name]['model_path']
             mod = TREE_MOD[name]
             y_pred = mod.predict(model_path, self.X_tree)        # trees emit MW directly
-            self._write(name, model_path, self.X_tree.index.values, y_pred, self.prelim_tree)
+            self._write(name, model_path, y_pred, self.cal_tree)
 
         for name in self._enabled(SEQ_MODELS):
             model_path = self.cfg['models'][name]['model_path']
@@ -142,4 +155,4 @@ class ModelPredictor:
             # Sequence models emit STANDARDIZED load. Invert with training's y_scaler —
             # a fresh scaler here would rescale every number and never raise.
             y_pred = self.y_scaler.inverse_transform(y_scaled)
-            self._write(name, model_path, self.ts_seq, y_pred, self.prelim_seq)
+            self._write(name, model_path, y_pred, self.cal_seq)

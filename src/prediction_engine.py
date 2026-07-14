@@ -82,10 +82,17 @@ def _extend_horizon(df):
     true, the NaN guard in the builders below turns it into a crash rather than a wrong number.
     """
     ept = pd.to_datetime(df['Datetime_EPT'])
-    per_day = ept.dt.date.value_counts()
-    complete = sorted(d for d, n in per_day.items() if n >= 24)
+    # "Complete" means the day RAN OUT — it reached hour 23 — not that it holds 24 rows.
+    # A spring-forward day has 23 rows (2 a.m. never happens) and a fall-back day has 25 (1
+    # a.m. happens twice), so a row count cannot tell a DST day from a half-finished one: a
+    # spring-forward day and a day that stops at 22:00 BOTH have exactly 23 rows. Counting
+    # rows drops the March transition day every year and quietly cuts a day off the forecast
+    # horizon — no error, just one day short, once a year.
+    # (The 23/25-hour days themselves are handled downstream by _normalize_to_24h.)
+    last_hour = ept.groupby(ept.dt.date).max().dt.hour
+    complete = sorted(last_hour.index[last_hour == 23])
     if not complete:
-        raise ValueError("predict.csv holds no complete 24 h day — nothing can be forecast.")
+        raise ValueError("predict.csv holds no day that reaches hour 23 — nothing to forecast.")
     last_complete = complete[-1]
 
     end_ept = pd.Timestamp(last_complete) + pd.Timedelta(days=FORECAST_HORIZON_DAYS, hours=23)
@@ -147,6 +154,41 @@ def _prepare(predict_path):
     return df, ept_dates, ept_hours, unique_days, n_train_rows, target_days
 
 
+def day_calendar(df, tmrw_pos, ept_hours, est_raw):
+    """The forecast day's REAL wall clock, and the raw published load lined up against it.
+
+    A model always emits 24 numbers, because _normalize_to_24h squashed the training target to
+    24. A day is not always 24 hours:
+
+        spring forward — 23 hours; 2 a.m. never happens. Training INTERPOLATED a value into
+                         that slot, so the model dutifully forecasts an hour that will not
+                         exist. Dropped here.
+        fall back      — 25 hours; 1 a.m. happens twice. Training AVERAGED the pair into one
+                         slot, so the model makes a single 1 a.m. forecast. Applied to both
+                         real hours here.
+
+    This is the inverse of _normalize_to_24h — it maps the 24-vector back onto the hours the
+    day actually has. Without it a DST day is plotted with a phantom 2 a.m. or silently loses
+    an hour, twice a year.
+
+    `prelim` is the RAW published preliminary load at each real hour, NOT the normalised
+    24-vector: on a fall-back day the two 1 a.m. hours carry two different real loads, and
+    averaging them into one slot would compare the forecast against a number PJM never
+    published. The actual has to be the actual.
+
+    Returns None if the day does not run to hour 23 — a partial day is not forecastable.
+    """
+    hours = [int(h) for h in ept_hours[tmrw_pos]]
+    if not hours or hours[-1] != 23:
+        return None
+    return {
+        'hours':  hours,                                              # 23, 24 or 25 entries
+        'utc':    [str(t) for t in df.index[tmrw_pos]],               # unambiguous ordering
+        'local':  [str(t) for t in df['Datetime_EPT'].values[tmrw_pos]],
+        'prelim': [None if np.isnan(v) else float(v) for v in est_raw[tmrw_pos]],
+    }
+
+
 def _cutoff_pos(i, unique_days, ept_dates, ept_hours, latest_info_hour, min_history):
     """Position of the forecast cutoff, or None if this day cannot be forecast.
 
@@ -194,7 +236,7 @@ def build_tree_features(predict_path=None, only_days=None):
     _thr, heat_streak, climatology, day_index, doy = build_thermal_references(
         df, ept_dates, unique_days, split_idx)
 
-    X_rows, prelim_rows = [], []
+    X_rows, calendars = [], []
     for i in range(len(unique_days) - 1):
         tomorrow = unique_days[i + 1]
         if tomorrow not in target_days:
@@ -206,9 +248,9 @@ def build_tree_features(predict_path=None, only_days=None):
             continue
 
         tmrw_pos = np.where(ept_dates == tomorrow)[0]
-        prelim = _normalize_to_24h(est_raw[tmrw_pos], ept_hours[tmrw_pos])
-        if prelim is None:
-            continue    # not a whole day — skip rather than forecast a partial one
+        cal = day_calendar(df, tmrw_pos, ept_hours, est_raw)
+        if cal is None:
+            continue    # partial day — skip rather than forecast half of one
 
         past_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]
         if np.isnan(past_window).any():
@@ -245,21 +287,20 @@ def build_tree_features(predict_path=None, only_days=None):
         # the model a column it was never trained on.
 
         X_rows.append(f)
-        prelim_rows.append({'timestamp': tomorrow,
-                            **{f'h{h}': prelim[h] for h in range(24)}})
+        cal['date'] = str(tomorrow)
+        calendars.append(cal)
 
     if not X_rows:
-        return pd.DataFrame(), pd.DataFrame()
-    return (pd.DataFrame(X_rows).set_index('timestamp'),
-            pd.DataFrame(prelim_rows).set_index('timestamp'))
+        return pd.DataFrame(), []
+    return pd.DataFrame(X_rows).set_index('timestamp'), calendars
 
 
 def build_sequence_features(predict_path=None, matrix_dir=None, only_days=None):
     """3D forecast features for transformer / lstm / moe / mstnn, scaled with the
     scalers TRAINING fitted.
 
-    Returns (X_3d, timestamps, preliminary_df, y_scaler). y_scaler is returned because the
-    models emit scaled output — the caller must inverse-transform with this exact object.
+    Returns (X_3d, timestamps, calendars, y_scaler). y_scaler is returned because the models
+    emit scaled output — the caller must inverse-transform with this exact object.
     """
     predict_path = predict_path or PREDICT_PATH
     matrix_dir   = matrix_dir or MATRIX_DIR
@@ -285,7 +326,7 @@ def build_sequence_features(predict_path=None, matrix_dir=None, only_days=None):
     _thr, heat_streak, climatology, day_index, doy = build_thermal_references(
         df, ept_dates, unique_days, split_idx)
 
-    X_list, static_list, ts_list, prelim_rows = [], [], [], []
+    X_list, static_list, ts_list, calendars = [], [], [], []
     for i in range(len(unique_days) - 1):
         tomorrow = unique_days[i + 1]
         if tomorrow not in target_days:
@@ -297,8 +338,8 @@ def build_sequence_features(predict_path=None, matrix_dir=None, only_days=None):
             continue
 
         tmrw_pos = np.where(ept_dates == tomorrow)[0]
-        prelim = _normalize_to_24h(est_raw[tmrw_pos], ept_hours[tmrw_pos])
-        if prelim is None:
+        cal = day_calendar(df, tmrw_pos, ept_hours, est_raw)
+        if cal is None:
             continue
 
         X_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]
@@ -329,11 +370,11 @@ def build_sequence_features(predict_path=None, matrix_dir=None, only_days=None):
 
         X_list.append(X_window)
         ts_list.append(tomorrow)
-        prelim_rows.append({'timestamp': tomorrow,
-                            **{f'h{h}': prelim[h] for h in range(24)}})
+        cal['date'] = str(tomorrow)
+        calendars.append(cal)
 
     if not X_list:
-        return np.empty((0,)), np.array([]), pd.DataFrame(), y_scaler
+        return np.empty((0,)), np.array([]), [], y_scaler
 
     X_3d = np.array(X_list, dtype='float32')
     static_scaled = static_scaler.transform(
@@ -341,8 +382,7 @@ def build_sequence_features(predict_path=None, matrix_dir=None, only_days=None):
     static_bc = np.repeat(static_scaled[:, None, :], lookback_hours, axis=1)
     X_3d = np.concatenate([X_3d, static_bc], axis=2)
 
-    return (X_3d, np.array(ts_list),
-            pd.DataFrame(prelim_rows).set_index('timestamp'), y_scaler)
+    return X_3d, np.array(ts_list), calendars, y_scaler
 
 
 # ---------------------------------------------------------------------------
