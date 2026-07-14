@@ -24,11 +24,14 @@ from sklearn.metrics import (mean_absolute_error, mean_absolute_percentage_error
 OUT = os.path.join('docs', 'index.html')
 FORECAST_GLOB = 'results/*/evaluation/*/*/*_forecast.csv'
 
-# Fixed order == fixed colour. A model keeps its hue no matter which others are on screen or
-# which zone is showing; colour follows the entity, never its rank in a filtered list.
+# Reading order, simplest first: trees, then plain sequence models, then the two that regress
+# a residual against a baseline. It doubles as the colour assignment — a model's slot here is
+# its hue everywhere, so it keeps that hue no matter which others are on screen or which zone
+# is showing. Colour follows the entity, never its rank in a filtered list.
 MODEL_ORDER = [
-    'xgboost', 'lightgbm', 'xgboost_residual', 'transformer',
-    'lstm', 'moe_transformer', 'mstnn', 'transformer_residual',
+    'xgboost', 'lightgbm',
+    'transformer', 'lstm', 'mstnn', 'moe_transformer',
+    'xgboost_residual', 'transformer_residual',
 ]
 
 # The dataviz reference palette, in its published slot order — that order IS the
@@ -353,7 +356,11 @@ const isDark = () => matchMedia('(prefers-color-scheme: dark)').matches;
 const colourOf = m => (isDark() ? DATA.paletteDark : DATA.paletteLight)[DATA.modelOrder.indexOf(m)];
 const ink = () => getComputedStyle(document.body).getPropertyValue('--ink').trim();
 const pretty = m => m.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-const fmt = v => v == null ? '—' : Math.round(v).toLocaleString();
+/* en-US, not the viewer's locale: a German browser groups 15,425 as "15.425" and an Indian one
+   as "15,425" with different grouping again. A report page must not change its numbers
+   depending on who opens it. */
+const num = v => Math.round(v).toLocaleString('en-US');
+const fmt = v => v == null ? '—' : num(v);
 
 /* Zone is global: one sub-tab under the main tabs, shared by both views. Both panels read it,
    so switching zone keeps you where you are instead of resetting the view. */
@@ -398,7 +405,12 @@ function seg(el, items, current, pick) {
   }
 }
 
-const dayLabel = d => new Date(d + 'T00:00').toLocaleDateString(undefined,
+/* Pinned to en-US, not the viewer's locale. This is a report page: it has to read the same
+   for whoever opens it, and a browser set to another language would otherwise render the
+   dates in that language inside an otherwise English page. 'T00:00' (not a bare date) parses
+   as LOCAL midnight — a bare '2026-07-13' is parsed as UTC and shows as the 12th west of
+   Greenwich. */
+const dayLabel = d => new Date(d + 'T00:00').toLocaleDateString('en-US',
   { weekday: 'short', month: 'short', day: 'numeric' });
 
 /* ============================================================================
@@ -434,7 +446,7 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
     const p = [];
     for (let t = Math.ceil(lo / step) * step; t <= hi + 1e-9; t += step) {
       p.push(`<line class="gridline" x1="${M.left}" x2="${M.left + iw}" y1="${y(t)}" y2="${y(t)}"/>`,
-             `<text class="tick" x="${M.left - 9}" y="${y(t) + 4}" text-anchor="end">${Math.round(t).toLocaleString()}</text>`);
+             `<text class="tick" x="${M.left - 9}" y="${y(t) + 4}" text-anchor="end">${num(t)}</text>`);
     }
     if (zero) p.push(`<line class="zeroline" x1="${M.left}" x2="${M.left + iw}" y1="${y(0)}" y2="${y(0)}"/>`);
     else p.push(`<line class="axisline" x1="${M.left}" x2="${M.left + iw}" y1="${M.top + ih}" y2="${M.top + ih}"/>`);
@@ -445,20 +457,29 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
     p.push(`<text class="axis-title" x="${M.left}" y="${M.top - 3}">${getTitle()}</text>`,
            `<text class="axis-title" x="${M.left + iw}" y="${M.top + ih + 32}" text-anchor="end">Hour (EPT)</text>`);
 
-    // Actual is drawn LAST so it sits on top. Painted in legend order it went down first and
-    // eight coloured model lines buried it — the reference curve was the one thing you could
-    // not see. It also gets a surface-coloured casing under it, which is what lets a single
-    // dark line stay legible crossing a bundle of bright ones.
-    for (const s of [...series].sort((a, b) => (a.top ? 1 : 0) - (b.top ? 1 : 0))) {
+    /* Draw order and opacity are the whole legibility story here.
+       - The baseline (`top`) is painted LAST, so it sits above the model lines instead of
+         under them, and it NEVER fades: it is the thing everything else is judged against, so
+         dimming it while you inspect a model hides exactly the curve you are comparing to.
+         The surface-coloured casing under it is what keeps one dark line readable while it
+         crosses a bundle of bright ones — thickness alone does not do it.
+       - Deselected models (`faint`) stay on the canvas as ghosts rather than vanishing, so
+         unchecking one still leaves you its shape for context. They are not hover targets and
+         they are not in the tooltip; they are background, not data you are reading. */
+    const opacity = s => s.top ? 1
+                       : s.faint ? .17
+                       : (emph && emph !== s.key) ? .16
+                       : 1;
+    const order = s => (s.top ? 2 : s.faint ? 0 : 1);
+    for (const s of [...series].sort((a, b) => order(a) - order(b))) {
       const pts = s.values.map((v, h) => v == null ? null : `${x(h)},${y(v)}`).filter(Boolean).join(' ');
-      const dim = emph && emph !== s.key;
       const w = emph === s.key ? s.width + 1.5 : s.width;
-      if (s.top && !dim) {
+      if (s.top) {
         p.push(`<polyline class="series" points="${pts}" stroke="var(--surface)" ` +
-               `stroke-width="${w + 3.5}" opacity=".9"/>`);
+               `stroke-width="${w + 4}" opacity=".92"/>`);
       }
       p.push(`<polyline class="series" points="${pts}" stroke="${s.colour}" ` +
-             `opacity="${dim ? .16 : 1}" stroke-width="${w}"/>`);
+             `opacity="${opacity(s)}" stroke-width="${s.faint ? 1.5 : w}"/>`);
     }
     svg.innerHTML = p.join('');
   }
@@ -473,8 +494,11 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
     if (px < M.left - 10 || px > M.left + geom.iw + 10) return hide();
 
     const h = Math.max(0, Math.min(23, Math.round((px - M.left) / geom.iw * 23)));
+    // Ghosts are background, not readable data: they cannot be picked and they are not listed.
+    const live = geom.series.filter(s => !s.faint);
+
     let near = null, best = Infinity;
-    for (const s of geom.series) {
+    for (const s of live) {
       const v = s.values[h];
       if (v == null) continue;
       const d = Math.abs(geom.y(v) - py);
@@ -484,17 +508,19 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
     if (onEmph) onEmph(emph); else { getEmph = () => emph; paint(); }
 
     const layer = [`<line class="crosshair" x1="${geom.x(h)}" x2="${geom.x(h)}" y1="${M.top}" y2="${M.top + geom.ih}"/>`];
-    for (const s of [...geom.series].sort((a, b) => (a.top ? 1 : 0) - (b.top ? 1 : 0))) {
+    for (const s of [...live].sort((a, b) => (a.top ? 1 : 0) - (b.top ? 1 : 0))) {
       const v = s.values[h];
       if (v == null) continue;
       const on = getEmph() === s.key;
+      // The baseline's marker never fades either — same reason its line does not.
+      const faded = getEmph() && !on && !s.top;
       layer.push(`<circle class="dot" cx="${geom.x(h)}" cy="${geom.y(v)}" r="${on ? 6 : (s.top ? 5.5 : 4)}" ` +
-                 `fill="${s.colour}" opacity="${getEmph() && !on ? .22 : 1}"/>`);
+                 `fill="${s.colour}" opacity="${faded ? .22 : 1}"/>`);
     }
     svg.insertAdjacentHTML('beforeend', layer.join(''));
 
     tip.innerHTML = `<h4>${String(h).padStart(2, '0')}:00 EPT &middot; ${getTitle()}</h4>` +
-      geom.series.filter(s => s.values[h] != null)
+      live.filter(s => s.values[h] != null)
         .sort((a, b) => b.values[h] - a.values[h])
         .map(s => `<div class="tt-row${getEmph() === s.key ? ' emph' : ''}">` +
                   `<span class="swatch" style="background:${s.colour}"></span><span>${s.name}</span>` +
@@ -554,8 +580,8 @@ function dSeries() {
     out.push({ key: ACTUAL, name: 'Actual (prelim.)', values: z.actual[D.date],
                colour: ink(), width: 3.5, top: true });
   for (const m of z.models) {
-    if (D.off.has(m)) continue;
-    out.push({ key: m, name: pretty(m), values: z.series[D.date][m], colour: colourOf(m), width: 2 });
+    out.push({ key: m, name: pretty(m), values: z.series[D.date][m], colour: colourOf(m),
+               width: 2, faint: D.off.has(m) });
   }
   return out;
 }
@@ -604,8 +630,8 @@ function rLoadSeries() {
     out.push({ key: ACTUAL, name: 'Actual (prelim.)', values: z.actual[R.date],
                colour: ink(), width: 3.5, top: true });
   for (const m of z.models) {
-    if (R.off.has(m)) continue;
-    out.push({ key: m, name: pretty(m), values: z.series[R.date][m], colour: colourOf(m), width: 2 });
+    out.push({ key: m, name: pretty(m), values: z.series[R.date][m], colour: colourOf(m),
+               width: 2, faint: R.off.has(m) });
   }
   return out;
 }
@@ -615,9 +641,8 @@ function rLoadSeries() {
 function rErrSeries() {
   const z = DATA.zones[ZONE], a = z.actual[R.date], out = [];
   for (const m of z.models) {
-    if (R.off.has(m)) continue;
     const p = z.series[R.date][m];
-    out.push({ key: m, name: pretty(m), colour: colourOf(m), width: 2,
+    out.push({ key: m, name: pretty(m), colour: colourOf(m), width: 2, faint: R.off.has(m),
                values: p.map((v, h) => a[h] == null ? null : v - a[h]) });
   }
   return out;
@@ -711,7 +736,10 @@ function renderRT(paintOnly) {
 
 /* The table is not a nicety: three light-mode hues sit under 3:1 contrast, so the exact
    numbers have to be reachable without depending on colour at all. */
-function table(series) {
+function table(all) {
+  // Ghosts are on the chart for shape, not for reading — a faint column of numbers would be
+  // neither visible nor meaningfully excluded.
+  const series = all.filter(s => !s.faint);
   if (!series.length) return '<p class="note">No series selected.</p>';
   return `<table><thead><tr><th>Hour (EPT)</th>${series.map(s => `<th>${s.name}</th>`).join('')}</tr></thead><tbody>` +
     Array.from({ length: 24 }, (_, h) =>
