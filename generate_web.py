@@ -246,6 +246,7 @@ svg { display:block; width:100%; overflow:visible; }
                cursor:pointer; font-size:13px; color:var(--ink-2); user-select:none; }
 .legend-item:hover { background:var(--hover); color:var(--ink); }
 .legend-item.off { opacity:.4; }
+.legend-item.emph { background:var(--hover); color:var(--ink); }
 .legend-item .mape { margin-left:auto; font-size:11px; font-variant-numeric:tabular-nums;
                      color:var(--muted); }
 .swatch { width:11px; height:11px; border-radius:3px; flex:none; }
@@ -271,10 +272,21 @@ th:first-child, td:first-child { text-align:left; }
 thead th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase;
            letter-spacing:.05em; }
 tbody tr:hover { background:var(--hover); }
-tbody tr:first-child td { font-weight:650; color:var(--ink); }
 td .dir { color:var(--muted); font-size:11px; }
 .table-scroll { overflow-x:auto; }
 .hidden { display:none; }
+
+/* Scoreboard = master selector. Rows carry a checkbox, dim when off, and sort by any column. */
+#r-metrics-table thead th { cursor:pointer; user-select:none; white-space:nowrap; }
+#r-metrics-table thead th:hover { color:var(--ink); }
+#r-metrics-table thead th[aria-sort] { color:var(--ink); font-weight:650; }
+#r-metrics-table thead th[aria-sort]::after { content:" \25BC"; font-size:9px; }
+#r-metrics-table thead th[aria-sort="ascending"]::after { content:" \25B2"; font-size:9px; }
+#r-metrics-table tbody tr { cursor:pointer; }
+#r-metrics-table tbody tr.off { opacity:.4; }
+#r-metrics-table tbody tr.emph { background:var(--hover); }
+#r-metrics-table td:first-child { display:flex; align-items:center; gap:8px; }
+#r-metrics-table input { pointer-events:none; }
 </style>
 </head>
 <body>
@@ -315,7 +327,24 @@ td .dir { color:var(--muted); font-size:11px; }
 
   <!-- ======================= Tab 2: real-time test ======================= -->
   <section class="panel" id="panel-realtime">
-    <div class="controls" id="r-controls">
+    <!-- Scoreboard first: it is the summary the whole tab exists to deliver, and it doubles
+         as the master model selector — the charts below follow whatever is ticked here. -->
+    <div class="card" id="r-metrics">
+      <div class="legend-head" style="margin-bottom:4px">
+        <h3 style="margin:0">Scoreboard</h3>
+        <button id="r-all">toggle all</button>
+      </div>
+      <p id="r-metrics-sub"></p>
+      <div class="table-scroll"><div id="r-metrics-table"></div></div>
+      <p class="note">
+        Tick a model to show it below; click a column to sort. <b>ME</b> mean error &mdash; the
+        constant part of the bias (over / under). <b>BRS</b> binned residual slope &mdash; error
+        regressed on load, catching the bias the ME hides: a model can average to zero and still
+        miss every peak. ME and BRS sort by magnitude (nearest zero first).
+      </p>
+    </div>
+
+    <div class="controls" id="r-controls" style="margin-top:18px">
       <div class="field"><label>Day</label><div class="seg" id="r-date"></div></div>
     </div>
     <div class="layout">
@@ -338,22 +367,10 @@ td .dir { color:var(--muted); font-size:11px; }
         </div>
       </div>
       <div class="card" id="r-side">
-        <div class="legend-head"><span>Models</span><button id="r-all">toggle all</button></div>
+        <div class="legend-head"><span>Models &middot; this day</span></div>
         <div id="r-legend"></div>
         <p class="legend-note" id="r-legend-note"></p>
       </div>
-    </div>
-
-    <div class="card" id="r-metrics" style="margin-top:16px">
-      <h3>Scoreboard</h3>
-      <p id="r-metrics-sub"></p>
-      <div class="table-scroll"><div id="r-metrics-table"></div></div>
-      <p class="note">
-        <b>ME</b> mean error &mdash; the constant part of the bias (over / under).
-        <b>BRS</b> binned residual slope &mdash; error regressed on load, so it catches the bias
-        the ME hides: a model can average out to zero and still miss every peak.
-        Negative = under-forecasts at high load.
-      </p>
     </div>
 
     <div class="card hidden" id="r-empty">
@@ -653,8 +670,24 @@ function renderDay(paintOnly) {
 /* ============================================================================
    Tab 2 — real-time test: the days that HAVE a published actual
    ========================================================================== */
-const R = { date: null, off: new Set(), emph: null };
-const rEmph = e => { R.emph = e; rLoad.repaint(); rErr.repaint(); };   // one hover lights both charts
+// off / emph are the tab's ONE shared selection+hover state. Scoreboard, side legend and both
+// charts all read it and all write it, so ticking a model anywhere updates everywhere at once.
+// sort is the scoreboard's column; ME and BRS sort by magnitude (nearest zero first).
+const R = { date: null, off: new Set(), emph: null, sort: { key: 'mape', dir: 1 } };
+
+const SCORE_COLS = [
+  { key: 'model', label: 'Model' },
+  { key: 'mape',  label: 'MAPE' },
+  { key: 'mae',   label: 'MAE (MW)' },
+  { key: 'rmse',  label: 'RMSE (MW)' },
+  { key: 'me',    label: 'ME (MW)' },
+  { key: 'brs',   label: 'BRS (MW/MW)' },
+];
+const sortVal = (r, key) =>
+  key === 'model' ? DATA.modelOrder.indexOf(r.model)
+  : (key === 'me' || key === 'brs') ? Math.abs(r[key])   // bias magnitude, either direction
+  : r[key];
+const rEmph = e => { R.emph = e; markEmph(); };   // hovering a chart line also lights its rows
 const rLoad = makeChart($('r-load'), $('r-load-tip'), { onEmph: rEmph });
 const rErr  = makeChart($('r-err'),  $('r-err-tip'),  { zero: true, onEmph: rEmph });
 
@@ -692,38 +725,84 @@ function rMape() {
   return out;
 }
 
-/* ---------- scoreboard ----------
-   The numbers arrive precomputed. BRS leans on pandas' qcut binning, and a hand-rolled
-   equal-count split here lands up to 0.003 MW/MW away — enough to print a different figure at
-   four decimals and have the page quietly contradict the console. So the browser sorts and
-   filters; it does not do the statistics. See metrics() in generate_web.py.               */
-function scoreboardTable() {
+/* ---------- scoreboard: master selector + sortable table ----------
+   Numbers arrive precomputed (BRS leans on pandas' qcut binning; a hand-rolled split here
+   lands up to 0.003 MW/MW away — enough to print a different figure at four decimals and have
+   the page quietly contradict the console). The browser only sorts, filters and highlights.  */
+function renderScoreboard() {
   const z = DATA.zones[ZONE];
-  const rows = z.models
-    .filter(m => !R.off.has(m) && z.metrics[m])        // one control drives the whole tab
-    .map(m => ({ model: m, ...z.metrics[m] }))
-    .sort((a, b) => a.mape - b.mape);
+  const rows = z.models.filter(m => z.metrics[m]).map(m => ({ model: m, ...z.metrics[m] }));
+  rows.sort((a, b) => (sortVal(a, R.sort.key) - sortVal(b, R.sort.key)) * R.sort.dir);
 
-  if (!rows.length) return '<p class="note">No models selected.</p>';
-  const sign = v => (v >= 0 ? '+' : '') + v.toFixed(v === Math.round(v * 100) / 100 ? 2 : 4);
-  const body = rows.map(r => `<tr>
-      <td><span class="swatch" style="background:${colourOf(r.model)};display:inline-block;margin-right:7px"></span>${pretty(r.model)}</td>
+  const head = SCORE_COLS.map(c =>
+    `<th data-k="${c.key}"${R.sort.key === c.key
+      ? ` aria-sort="${R.sort.dir > 0 ? 'ascending' : 'descending'}"` : ''}>${c.label}</th>`).join('');
+  const body = rows.map(r => {
+    const off = R.off.has(r.model);
+    return `<tr data-m="${r.model}" class="${off ? 'off' : ''}${R.emph === r.model ? ' emph' : ''}">
+      <td><input type="checkbox"${off ? '' : ' checked'}><span class="swatch" style="background:${colourOf(r.model)}"></span>${pretty(r.model)}</td>
       <td>${r.mape.toFixed(2)}%</td>
       <td>${r.mae.toFixed(2)}</td>
       <td>${r.rmse.toFixed(2)}</td>
       <td>${r.me >= 0 ? '+' : ''}${r.me.toFixed(2)} <span class="dir">(${r.me >= 0 ? 'over' : 'under'})</span></td>
-      <td>${r.brs >= 0 ? '+' : ''}${r.brs.toFixed(4)} <span class="dir">(${r.brs >= 0 ? 'over↑ at peak' : 'under↓ at peak'})</span></td>
-    </tr>`).join('');
-  return `<table><thead><tr>
-      <th>Model</th><th>MAPE</th><th>MAE (MW)</th><th>RMSE (MW)</th>
-      <th>ME (MW)</th><th>BRS (MW/MW)</th>
-    </tr></thead><tbody>${body}</tbody></table>`;
+      <td>${r.brs >= 0 ? '+' : ''}${r.brs.toFixed(4)} <span class="dir">(${r.brs >= 0 ? 'over&#8593; at peak' : 'under&#8595; at peak'})</span></td>
+    </tr>`;
+  }).join('');
+
+  const el = $('r-metrics-table');
+  el.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  el.querySelectorAll('th').forEach(th => th.onclick = () => {
+    const k = th.dataset.k;
+    if (R.sort.key === k) R.sort.dir *= -1; else R.sort = { key: k, dir: 1 };
+    renderScoreboard();          // only the row order changes — no need to touch the charts
+  });
+  el.querySelectorAll('tbody tr').forEach(tr => {
+    const m = tr.dataset.m;
+    tr.onclick = () => { R.off.has(m) ? R.off.delete(m) : R.off.add(m); renderRT(); };
+    tr.onmouseenter = () => { R.emph = m; markEmph(); };
+    tr.onmouseleave = () => { R.emph = null; markEmph(); };
+  });
+}
+
+/* Side legend: the same models, but ranked by THIS day's MAPE (so the order shifts day to
+   day), and the same shared selection — ticking here moves the scoreboard and charts too. */
+function renderRLegend() {
+  const z = DATA.zones[ZONE], mape = rMape();
+  const models = [...z.models].sort((a, b) => (mape[a] ?? Infinity) - (mape[b] ?? Infinity));
+  const el = $('r-legend');
+  el.innerHTML = '';
+  for (const k of [ACTUAL, ...models]) {
+    const actual = k === ACTUAL, off = R.off.has(k);
+    const row = document.createElement('label');
+    row.className = 'legend-item' + (off ? ' off' : '') + (R.emph === k ? ' emph' : '');
+    row.dataset.k = k;
+    row.innerHTML =
+      `<input type="checkbox"${off ? '' : ' checked'}>` +
+      `<span class="swatch" style="background:${actual ? ink() : colourOf(k)}"></span>` +
+      `<span>${actual ? 'Actual (prelim.)' : pretty(k)}</span>` +
+      (!actual && mape[k] != null ? `<span class="mape">${mape[k].toFixed(2)}%</span>` : '');
+    row.querySelector('input').onchange = () => { off ? R.off.delete(k) : R.off.add(k); renderRT(); };
+    row.onmouseenter = () => { R.emph = k; markEmph(); };
+    row.onmouseleave = () => { R.emph = null; markEmph(); };
+    el.appendChild(row);
+  }
+}
+
+/* Hover is shared too: emphasising a model lights its line in both charts and its row in both
+   the scoreboard and the legend. Repaint the charts, restyle the rows — no full rebuild. */
+function markEmph() {
+  rLoad.repaint(); rErr.repaint();
+  document.querySelectorAll('#r-metrics-table tbody tr').forEach(tr =>
+    tr.classList.toggle('emph', tr.dataset.m === R.emph));
+  document.querySelectorAll('#r-legend .legend-item').forEach(li =>
+    li.classList.toggle('emph', li.dataset.k === R.emph));
 }
 
 $('r-all').onclick = () => {
   const z = DATA.zones[ZONE];
-  const all = [ACTUAL, ...z.models];
-  if (R.off.size) R.off.clear(); else all.forEach(k => R.off.add(k));
+  // Operates on the models (the scoreboard's rows); the actual baseline is left to the legend.
+  if (z.models.every(m => R.off.has(m))) z.models.forEach(m => R.off.delete(m));
+  else z.models.forEach(m => R.off.add(m));
   renderRT();
 };
 
@@ -753,20 +832,20 @@ function renderRT(paintOnly) {
   if (!z.scored.includes(R.date)) R.date = z.scored[z.scored.length - 1];
   if (paintOnly) { rLoad.repaint(); rErr.repaint(); return; }
 
-  seg($('r-date'), z.scored.map(d => [d, dayLabel(d)]), R.date, v => { R.date = v; renderRT(); });
+  const s = z.scored;
+  const H = s.reduce((n, d) => n + z.hours[d].length, 0);   // real hours, DST-aware
+  $('r-metrics-sub').textContent =
+    `Whole test window: ${s.length} day${s.length > 1 ? 's' : ''} (${s[0]} → ${s[s.length - 1]}), ` +
+    `${H} hours, vs PJM's preliminary load. Click a column to sort.`;
+  renderScoreboard();
 
-  renderLegend($('r-legend'), [ACTUAL, ...z.models], R, renderRT, rMape());
-  $('r-legend-note').textContent = 'MAPE for the selected day. The scoreboard below covers the whole test window.';
+  seg($('r-date'), s.map(d => [d, dayLabel(d)]), R.date, v => { R.date = v; renderRT(); });
+  renderRLegend();
+  $('r-legend-note').textContent = "Ranked by this day's MAPE. Selection is shared with the scoreboard.";
 
   const hrs = z.hours[R.date];
   rLoad.render(rLoadSeries(), () => R.emph, 'MW', hrs);
   rErr.render(rErrSeries(), () => R.emph, 'MW error', hrs);
-
-  const s = z.scored;
-  $('r-metrics-sub').textContent =
-    `All ${s.length} scored day${s.length > 1 ? 's' : ''} (${s[0]} → ${s[s.length - 1]}), ` +
-    `${s.length * 24} hours, against PJM's preliminary load. Ranked by MAPE.`;
-  $('r-metrics-table').innerHTML = scoreboardTable();
 }
 
 /* The table is not a nicety: three light-mode hues sit under 3:1 contrast, so the exact
