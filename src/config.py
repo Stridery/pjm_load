@@ -2,7 +2,7 @@
 import os
 
 # --- Dataset Selection (controls all data / model / result paths) ---
-DATASET = os.environ.get('PJM_DATASET', 'bge')   # override: PJM_DATASET=dom python ...
+DATASET = os.environ.get('PJM_DATASET', 'dom')   # override: PJM_DATASET=dom python ...
 
 # --- Weather Features (per dataset) ---
 # dom columns match the output of data_crawler (Open-Meteo native variables).
@@ -530,19 +530,19 @@ PREDICT_CONFIG = {
             'model_path': f'models/{DATASET}/lstm/tail_test0.16_tail_val0.1{_lstm_lds}{_lstm_fds}/lstm_best.pth',
         },
         'moe_transformer': {
-            'enabled': 0,
+            'enabled': 1,
             'model_path': f'models/{DATASET}/moe_transformer/tail_test0.16_tail_val0.1{_moe_lds}/moe_transformer_best.pth',
         },
         'mstnn': {
-            'enabled': 0,
+            'enabled': 1,
             'model_path': f'models/{DATASET}/mstnn/tail_test0.16_tail_val0.1{_mstnn_lds}/mstnn_best.pth',
         },
         'xgboost_residual': {
-            'enabled': 0,
+            'enabled': 1,
             'model_path': f'models/{DATASET}/xgboost_residual/tail_test0.16{_xgbres_lds}/xgboost_residual_24_models.pkl',
         },
         'transformer_residual': {
-            'enabled': 0,
+            'enabled': 1,
             'model_path': f'models/{DATASET}/transformer_residual/tail_test0.16_tail_val0.1{_trres_lds}{_trres_fds}/transformer_residual_best.pth',
         },
     },

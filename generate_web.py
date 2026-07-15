@@ -367,7 +367,7 @@ td .dir { color:var(--muted); font-size:11px; }
         </div>
       </div>
       <div class="card" id="r-side">
-        <div class="legend-head"><span>Models &middot; this day</span></div>
+        <div class="legend-head"><span>Models &middot; this day</span><button id="r-legend-all">toggle all</button></div>
         <div id="r-legend"></div>
         <p class="legend-note" id="r-legend-note"></p>
       </div>
@@ -798,13 +798,15 @@ function markEmph() {
     li.classList.toggle('emph', li.dataset.k === R.emph));
 }
 
-$('r-all').onclick = () => {
-  const z = DATA.zones[ZONE];
-  // Operates on the models (the scoreboard's rows); the actual baseline is left to the legend.
-  if (z.models.every(m => R.off.has(m))) z.models.forEach(m => R.off.delete(m));
-  else z.models.forEach(m => R.off.add(m));
+// Both toggle-all buttons write the same shared state. The scoreboard's covers the models it
+// lists; the legend's also covers the actual baseline it carries, so its "all" means all.
+function toggleAll(keys) {
+  if (keys.every(k => R.off.has(k))) keys.forEach(k => R.off.delete(k));
+  else keys.forEach(k => R.off.add(k));
   renderRT();
-};
+}
+$('r-all').onclick        = () => toggleAll(DATA.zones[ZONE].models);
+$('r-legend-all').onclick = () => toggleAll([ACTUAL, ...DATA.zones[ZONE].models]);
 
 function renderRT(paintOnly) {
   const z = DATA.zones[ZONE];
