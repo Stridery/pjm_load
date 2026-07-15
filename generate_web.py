@@ -183,7 +183,7 @@ HTML = r"""<!doctype html>
 * { box-sizing:border-box; }
 body { margin:0; background:var(--plane); color:var(--ink);
        font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
-.wrap { max-width:1560px; margin:0 auto; padding:28px 24px 64px; }
+.wrap { max-width:1360px; margin:0 auto; padding:24px 22px 56px; }
 header h1 { margin:0 0 4px; font-size:22px; font-weight:650; letter-spacing:-.01em; }
 header p { margin:0; color:var(--muted); font-size:13px; }
 
@@ -282,11 +282,11 @@ td .dir { color:var(--muted); font-size:11px; }
 #r-metrics-table thead th[aria-sort] { color:var(--ink); font-weight:650; }
 #r-metrics-table thead th[aria-sort]::after { content:" \25BC"; font-size:9px; }
 #r-metrics-table thead th[aria-sort="ascending"]::after { content:" \25B2"; font-size:9px; }
+/* No checkboxes: the row's own dimming IS the selected state. Click anywhere on a row. */
 #r-metrics-table tbody tr { cursor:pointer; }
-#r-metrics-table tbody tr.off { opacity:.4; }
+#r-metrics-table tbody tr.off { opacity:.35; }
 #r-metrics-table tbody tr.emph { background:var(--hover); }
 #r-metrics-table td:first-child { display:flex; align-items:center; gap:8px; }
-#r-metrics-table input { pointer-events:none; }
 </style>
 </head>
 <body>
@@ -312,7 +312,7 @@ td .dir { color:var(--muted); font-size:11px; }
     <div class="layout">
       <div class="card">
         <div class="chart-wrap" id="d-chartwrap">
-          <svg id="d-chart" height="560"></svg>
+          <svg id="d-chart" height="480"></svg>
           <div class="tooltip" id="d-tip"></div>
         </div>
         <div class="table-scroll hidden" id="d-table"></div>
@@ -353,7 +353,7 @@ td .dir { color:var(--muted); font-size:11px; }
           <h3>Forecast vs actual</h3>
           <p>Preliminary load is the baseline &mdash; PJM's near-real-time published load for this zone.</p>
           <div class="chart-wrap">
-            <svg id="r-load" height="470"></svg>
+            <svg id="r-load" height="400"></svg>
             <div class="tooltip" id="r-load-tip"></div>
           </div>
         </div>
@@ -361,7 +361,7 @@ td .dir { color:var(--muted); font-size:11px; }
           <h3>Error</h3>
           <p>Forecast minus actual. Above zero = over-forecast, below = under.</p>
           <div class="chart-wrap">
-            <svg id="r-err" height="320"></svg>
+            <svg id="r-err" height="270"></svg>
             <div class="tooltip" id="r-err-tip"></div>
           </div>
         </div>
@@ -740,7 +740,7 @@ function renderScoreboard() {
   const body = rows.map(r => {
     const off = R.off.has(r.model);
     return `<tr data-m="${r.model}" class="${off ? 'off' : ''}${R.emph === r.model ? ' emph' : ''}">
-      <td><input type="checkbox"${off ? '' : ' checked'}><span class="swatch" style="background:${colourOf(r.model)}"></span>${pretty(r.model)}</td>
+      <td><span class="swatch" style="background:${colourOf(r.model)}"></span>${pretty(r.model)}</td>
       <td>${r.mape.toFixed(2)}%</td>
       <td>${r.mae.toFixed(2)}</td>
       <td>${r.rmse.toFixed(2)}</td>
