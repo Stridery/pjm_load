@@ -10,7 +10,8 @@ from src.feature_engine import build_or_load_matrix, build_timeseries_matrix, _s
 from src.config import (
     CLEANED_PATH, MATRIX_DIR, DATASET,
     TRANSFORMER_PARAMS, LSTM_PARAMS, MOE_TRANSFORMER_PARAMS, MSTNN_PARAMS,
-    TRANSFORMER_RESIDUAL_PARAMS,
+    TRANSFORMER_RESIDUAL_PARAMS, MOE_TRANSFORMER_RESIDUAL_PARAMS, MSTNN_RESIDUAL_PARAMS,
+    MOE_MSTNN_PARAMS, MOE_MSTNN_RESIDUAL_PARAMS,
 )
 from src.models import transformer as transformer_mod
 from src.models import lstm as lstm_mod
@@ -20,18 +21,36 @@ from src.models import xgboost as xgboost_mod
 from src.models import lightgbm as lightgbm_mod
 from src.models import xgboost_residual as xgb_res_mod
 from src.models import transformer_residual as tr_res_mod
+from src.models import moe_transformer_residual as moe_res_mod
+from src.models import mstnn_residual as mstnn_res_mod
+from src.models import moe_mstnn as moe_mstnn_mod
+from src.models import moe_mstnn_residual as moe_mstnn_res_mod
 from src.models._eval_utils import plot_single_day
 
 # Residual models are drop-ins: same matrices, same predict()/evaluate() signatures. They
 # only differ in what they regress on, and that lives entirely inside their modules.
 TREE_MODELS = ['xgboost', 'lightgbm', 'xgboost_residual']
-SEQ_MODELS  = ['transformer', 'lstm', 'moe_transformer', 'mstnn', 'transformer_residual']
+SEQ_MODELS  = ['transformer', 'lstm', 'moe_transformer', 'mstnn', 'transformer_residual', 'moe_transformer_residual', 'mstnn_residual',
+               'moe_mstnn', 'moe_mstnn_residual']
 
 TREE_MOD = {'xgboost': xgboost_mod, 'lightgbm': lightgbm_mod,
             'xgboost_residual': xgb_res_mod}
 SEQ_MOD  = {'transformer': transformer_mod, 'lstm': lstm_mod,
             'moe_transformer': moe_mod, 'mstnn': mstnn_mod,
-            'transformer_residual': tr_res_mod}
+            'transformer_residual': tr_res_mod, 'moe_transformer_residual': moe_res_mod,
+            'mstnn_residual': mstnn_res_mod,
+            'moe_mstnn': moe_mstnn_mod, 'moe_mstnn_residual': moe_mstnn_res_mod}
+
+# One params registry, keyed exactly like SEQ_MOD — imported by both the evaluator's own
+# call sites AND model_predictor, so a model can never be in one map and missing from the
+# other (which is how the forecast path used to KeyError on the residual models).
+SEQ_PARAMS = {'transformer': TRANSFORMER_PARAMS, 'lstm': LSTM_PARAMS,
+              'moe_transformer': MOE_TRANSFORMER_PARAMS, 'mstnn': MSTNN_PARAMS,
+              'transformer_residual': TRANSFORMER_RESIDUAL_PARAMS,
+              'moe_transformer_residual': MOE_TRANSFORMER_RESIDUAL_PARAMS,
+              'mstnn_residual': MSTNN_RESIDUAL_PARAMS,
+              'moe_mstnn': MOE_MSTNN_PARAMS, 'moe_mstnn_residual': MOE_MSTNN_RESIDUAL_PARAMS}
+assert set(SEQ_PARAMS) == set(SEQ_MOD), "SEQ_PARAMS and SEQ_MOD must cover the same models"
 
 
 class ModelEvaluator:
@@ -162,9 +181,7 @@ class ModelEvaluator:
                 run_tag    = os.path.basename(os.path.dirname(model_path))
                 result_dir = os.path.join(result_base, model_name, run_tag)
                 mod    = SEQ_MOD[model_name]
-                params = {'transformer': TRANSFORMER_PARAMS, 'lstm': LSTM_PARAMS,
-                          'moe_transformer': MOE_TRANSFORMER_PARAMS, 'mstnn': MSTNN_PARAMS,
-                          'transformer_residual': TRANSFORMER_RESIDUAL_PARAMS}[model_name]
+                params = SEQ_PARAMS[model_name]
                 mod.evaluate(model_path, X_te, y_true_mw, self.y_scaler,
                              test_timestamps, result_dir, params,
                              X_train=X_tr, y_true_train_mw=y_true_train_mw,
@@ -187,12 +204,10 @@ class ModelEvaluator:
             idx = np.where(pd.to_datetime(self.timestamps_3d) == target)[0]
             if len(idx) == 0:
                 raise ValueError(f"{date_str} not found in 3D matrix timestamps.")
-            if model_name == 'moe_transformer':
-                pred_scaled = moe_mod.predict(
-                    model_path, self.X_3d[idx], self.timestamps_3d[idx], MOE_TRANSFORMER_PARAMS)
+            mod, params = SEQ_MOD[model_name], SEQ_PARAMS[model_name]
+            if model_name in ('moe_transformer', 'moe_transformer_residual', 'moe_mstnn', 'moe_mstnn_residual'):
+                pred_scaled = mod.predict(model_path, self.X_3d[idx], self.timestamps_3d[idx], params)
             else:
-                mod    = {'transformer': transformer_mod, 'lstm': lstm_mod, 'mstnn': mstnn_mod}[model_name]
-                params = {'transformer': TRANSFORMER_PARAMS, 'lstm': LSTM_PARAMS, 'mstnn': MSTNN_PARAMS}[model_name]
                 pred_scaled = mod.predict(model_path, self.X_3d[idx], params)
             pred_24h = self._inverse_transform(pred_scaled).flatten()
             true_24h = self._inverse_transform(self.y_3d[idx]).flatten()

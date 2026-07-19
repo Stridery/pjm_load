@@ -24,14 +24,20 @@ from sklearn.metrics import (mean_absolute_error, mean_absolute_percentage_error
 OUT = os.path.join('docs', 'index.html')
 FORECAST_GLOB = 'results/*/evaluation/*/*/*_forecast.csv'
 
-# Reading order, simplest first: trees, then plain sequence models, then the two that regress
-# a residual against a baseline. It doubles as the colour assignment — a model's slot here is
-# its hue everywhere, so it keeps that hue no matter which others are on screen or which zone
-# is showing. Colour follows the entity, never its rank in a filtered list.
+# Reading order, grouped by architecture family with each base immediately followed by its
+# residual variant. This drives BOTH the legend order and — crucially — the colour scheme:
+# the page colours by FAMILY (7 hues, within the validated 8-colour palette) and marks the
+# residual variant with a dashed line, rather than trying to find 12 colourblind-safe hues,
+# which the palette cannot supply. Same-hue base/residual pairs also make the whole point of a
+# residual model visible: you can read it against its own baseline. See colourOf() in the page.
 MODEL_ORDER = [
-    'xgboost', 'lightgbm',
-    'transformer', 'lstm', 'mstnn', 'moe_transformer',
-    'xgboost_residual', 'transformer_residual',
+    'xgboost', 'xgboost_residual',
+    'lightgbm',
+    'transformer', 'transformer_residual',
+    'lstm',
+    'mstnn', 'mstnn_residual',
+    'moe_transformer', 'moe_transformer_residual',
+    'moe_mstnn', 'moe_mstnn_residual',
 ]
 
 # The dataviz reference palette, in its published slot order — that order IS the
@@ -388,7 +394,24 @@ const ACTUAL = '__actual__';
 const isDark = () => matchMedia('(prefers-color-scheme: dark)').matches;
 // Colour is keyed off the model's slot in the FIXED order, never its index in the visible
 // list — so hiding one model can never repaint the ones still on screen.
-const colourOf = m => (isDark() ? DATA.paletteDark : DATA.paletteLight)[DATA.modelOrder.indexOf(m)];
+// Colour follows the ARCHITECTURE FAMILY, not the model's rank in a filtered list: a base and
+// its residual share a hue, and the residual is told apart by a dashed line + a hollow swatch.
+// Seven families fit inside the eight-colour palette; twelve distinct CVD-safe hues would not.
+const FAMILY_HUE = (() => {
+  const map = {}; let n = 0;
+  for (const m of DATA.modelOrder) {
+    const base = m.replace(/_residual$/, '');
+    if (!(base in map)) map[base] = n++;
+  }
+  return m => map[m.replace(/_residual$/, '')];
+})();
+const isResidual = m => /_residual$/.test(m);
+const colourOf = m => (isDark() ? DATA.paletteDark : DATA.paletteLight)[FAMILY_HUE(m) % 8];
+// Swatch: filled square for a base model, hollow ring for its residual variant — the same
+// distinction the dashed line makes on the chart, so legend and plot read as one scheme.
+const swatch = (colour, residual) => residual
+  ? `<span class="swatch" style="background:transparent;box-shadow:inset 0 0 0 2px ${colour}"></span>`
+  : `<span class="swatch" style="background:${colour}"></span>`;
 const ink = () => getComputedStyle(document.body).getPropertyValue('--ink').trim();
 const pretty = m => m.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 /* en-US, not the viewer's locale: a German browser groups 15,425 as "15.425" and an Indian one
@@ -518,8 +541,10 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
         p.push(`<polyline class="series" points="${pts}" stroke="var(--surface)" ` +
                `stroke-width="${w + 4}" opacity=".92"/>`);
       }
+      // Residual variants are dashed — same hue as their base model, told apart by line style.
       p.push(`<polyline class="series" points="${pts}" stroke="${s.colour}" ` +
-             `opacity="${opacity(s)}" stroke-width="${s.faint ? 1.5 : w}"/>`);
+             `opacity="${opacity(s)}" stroke-width="${s.faint ? 1.5 : w}"` +
+             `${s.dash ? ' stroke-dasharray="5 3.5"' : ''}/>`);
     }
     svg.innerHTML = p.join('');
   }
@@ -564,7 +589,7 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
       live.filter(s => s.values[i] != null)
         .sort((a, b) => b.values[i] - a.values[i])
         .map(s => `<div class="tt-row${getEmph() === s.key ? ' emph' : ''}">` +
-                  `<span class="swatch" style="background:${s.colour}"></span><span>${s.name}</span>` +
+                  swatch(s.colour, s.dash) + `<span>${s.name}</span>` +
                   `<span class="v">${s.values[i] > 0 && zero ? '+' : ''}${fmt(s.values[i])}</span></div>`).join('');
     tip.style.opacity = 1;
     tip.style.left = Math.min(geom.x(h) + 14, r.width - tip.offsetWidth - 4) + 'px';
@@ -605,7 +630,7 @@ function renderLegend(el, keys, state, onChange, mape) {
     row.className = 'legend-item' + (state.off.has(k) ? ' off' : '');
     row.innerHTML =
       `<input type="checkbox"${state.off.has(k) ? '' : ' checked'}>` +
-      `<span class="swatch" style="background:${actual ? ink() : colourOf(k)}"></span>` +
+      (actual ? `<span class="swatch" style="background:${ink()}"></span>` : swatch(colourOf(k), isResidual(k))) +
       `<span>${actual ? 'Actual (prelim.)' : pretty(k)}</span>` +
       (mape && mape[k] != null ? `<span class="mape">${mape[k].toFixed(2)}%</span>` : '');
     row.querySelector('input').onchange = e => {
@@ -631,7 +656,7 @@ function dSeries() {
                colour: ink(), width: 3.5, top: true });
   for (const m of z.models) {
     out.push({ key: m, name: pretty(m), values: z.series[D.date][m], colour: colourOf(m),
-               width: 2, faint: D.off.has(m) });
+               width: 2, faint: D.off.has(m), dash: isResidual(m) });
   }
   return out;
 }
@@ -698,7 +723,7 @@ function rLoadSeries() {
                colour: ink(), width: 3.5, top: true });
   for (const m of z.models) {
     out.push({ key: m, name: pretty(m), values: z.series[R.date][m], colour: colourOf(m),
-               width: 2, faint: R.off.has(m) });
+               width: 2, faint: R.off.has(m), dash: isResidual(m) });
   }
   return out;
 }
@@ -710,7 +735,7 @@ function rErrSeries() {
   for (const m of z.models) {
     const p = z.series[R.date][m];
     out.push({ key: m, name: pretty(m), colour: colourOf(m), width: 2, faint: R.off.has(m),
-               values: p.map((v, i) => a[i] == null ? null : v - a[i]) });
+               dash: isResidual(m), values: p.map((v, i) => a[i] == null ? null : v - a[i]) });
   }
   return out;
 }
@@ -740,7 +765,7 @@ function renderScoreboard() {
   const body = rows.map(r => {
     const off = R.off.has(r.model);
     return `<tr data-m="${r.model}" class="${off ? 'off' : ''}${R.emph === r.model ? ' emph' : ''}">
-      <td><span class="swatch" style="background:${colourOf(r.model)}"></span>${pretty(r.model)}</td>
+      <td>${swatch(colourOf(r.model), isResidual(r.model))}${pretty(r.model)}</td>
       <td>${r.mape.toFixed(2)}%</td>
       <td>${r.mae.toFixed(2)}</td>
       <td>${r.rmse.toFixed(2)}</td>
@@ -778,7 +803,7 @@ function renderRLegend() {
     row.dataset.k = k;
     row.innerHTML =
       `<input type="checkbox"${off ? '' : ' checked'}>` +
-      `<span class="swatch" style="background:${actual ? ink() : colourOf(k)}"></span>` +
+      (actual ? `<span class="swatch" style="background:${ink()}"></span>` : swatch(colourOf(k), isResidual(k))) +
       `<span>${actual ? 'Actual (prelim.)' : pretty(k)}</span>` +
       (!actual && mape[k] != null ? `<span class="mape">${mape[k].toFixed(2)}%</span>` : '');
     row.querySelector('input').onchange = () => { off ? R.off.delete(k) : R.off.add(k); renderRT(); };

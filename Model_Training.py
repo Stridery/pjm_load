@@ -10,6 +10,10 @@ from src.models import moe_transformer as moe_mod
 from src.models import mstnn as mstnn_mod
 from src.models import xgboost_residual as xgb_res_mod
 from src.models import transformer_residual as tr_res_mod
+from src.models import moe_transformer_residual as moe_res_mod
+from src.models import mstnn_residual as mstnn_res_mod
+from src.models import moe_mstnn as moe_mstnn_mod
+from src.models import moe_mstnn_residual as moe_mstnn_res_mod
 
 TEST_STRATEGIES = ['tail']
 VAL_STRATEGIES  = ['tail']
@@ -185,3 +189,63 @@ if cfg.TRAIN_CONFIG['lstm']:
             _run_eval('lstm',
                       f'models/{cfg.DATASET}/lstm/{test_strategy}_test{lf["test_frac"]}_{val_strategy}_val{lf["val_frac"]}{cfg._lstm_lds}{cfg._lstm_fds}/lstm_best.pth',
                       test_strategy, lf)
+
+# --- MoE Transformer (residual target) ---
+if cfg.TRAIN_CONFIG['moe_transformer_residual']:
+    X_3d, y_3d, mask_3d, timestamps_3d = build_timeseries_matrix(cfg.CLEANED_PATH, cfg.MATRIX_DIR)
+
+    for test_strategy in TEST_STRATEGIES:
+        for val_strategy in VAL_STRATEGIES:
+            print(f"\n{'='*60}")
+            print(f"MoE Transformer (residual) | test split: {test_strategy} | val split: {val_strategy}")
+            print(f"{'='*60}")
+
+            cfg.MOE_TRANSFORMER_RESIDUAL_FEATURE_CONFIG['split_strategy'] = test_strategy
+            cfg.MOE_TRANSFORMER_RESIDUAL_FEATURE_CONFIG['val_strategy']   = val_strategy
+
+            moe_res_mod.train(X_3d, y_3d, mask_3d, timestamps_3d,
+                              cfg.MOE_TRANSFORMER_RESIDUAL_PARAMS, cfg.MOE_TRANSFORMER_RESIDUAL_FEATURE_CONFIG)
+            mf = cfg.MOE_TRANSFORMER_RESIDUAL_FEATURE_CONFIG
+            _run_eval('moe_transformer_residual',
+                      f'models/{cfg.DATASET}/moe_transformer_residual/{test_strategy}_test{mf["test_frac"]}_{val_strategy}_val{mf["val_frac"]}{cfg._moe_res_lds}/moe_transformer_residual_best.pth',
+                      test_strategy, mf)
+
+# --- MSTNN (residual target) ---
+if cfg.TRAIN_CONFIG['mstnn_residual']:
+    X_3d, y_3d, mask_3d, timestamps_3d = build_timeseries_matrix(cfg.CLEANED_PATH, cfg.MATRIX_DIR)
+
+    for test_strategy in TEST_STRATEGIES:
+        for val_strategy in VAL_STRATEGIES:
+            print(f"\n{'='*60}")
+            print(f"MSTNN (residual) | test split: {test_strategy} | val split: {val_strategy}")
+            print(f"{'='*60}")
+
+            cfg.MSTNN_FEATURE_CONFIG['split_strategy'] = test_strategy
+            cfg.MSTNN_FEATURE_CONFIG['val_strategy']   = val_strategy
+
+            mstnn_res_mod.train(X_3d, y_3d, mask_3d, cfg.MSTNN_RESIDUAL_PARAMS, cfg.MSTNN_FEATURE_CONFIG)
+            mf = cfg.MSTNN_FEATURE_CONFIG
+            _run_eval('mstnn_residual',
+                      f'models/{cfg.DATASET}/mstnn_residual/{test_strategy}_test{mf["test_frac"]}_{val_strategy}_val{mf["val_frac"]}{cfg._mstnnres_lds}/mstnn_residual_best.pth',
+                      test_strategy, mf)
+
+# --- MoE-MSTNN (+ residual) ---
+for _key, _mod, _P, _FC, _mt in [
+    ('moe_mstnn', moe_mstnn_mod, cfg.MOE_MSTNN_PARAMS, cfg.MOE_MSTNN_FEATURE_CONFIG, 'moe_mstnn'),
+    ('moe_mstnn_residual', moe_mstnn_res_mod, cfg.MOE_MSTNN_RESIDUAL_PARAMS, cfg.MOE_MSTNN_FEATURE_CONFIG, 'moe_mstnn_residual'),
+]:
+    if not cfg.TRAIN_CONFIG[_key]:
+        continue
+    X_3d, y_3d, mask_3d, timestamps_3d = build_timeseries_matrix(cfg.CLEANED_PATH, cfg.MATRIX_DIR)
+    for test_strategy in TEST_STRATEGIES:
+        for val_strategy in VAL_STRATEGIES:
+            print(f"\n{'='*60}")
+            print(f"{_key} | test split: {test_strategy} | val split: {val_strategy}")
+            print(f"{'='*60}")
+            _FC['split_strategy'] = test_strategy
+            _FC['val_strategy']   = val_strategy
+            _mod.train(X_3d, y_3d, mask_3d, timestamps_3d, _P, _FC)
+            _lds = '_lds' if _P.get('use_lds') else ''
+            _run_eval(_key,
+                      f'models/{cfg.DATASET}/{_mt}/{test_strategy}_test{_FC["test_frac"]}_{val_strategy}_val{_FC["val_frac"]}{_lds}/{_mt}_best.pth',
+                      test_strategy, _FC)

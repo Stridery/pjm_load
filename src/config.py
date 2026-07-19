@@ -71,14 +71,18 @@ CRAWLER_CONFIG = {
 
 # --- Models to Train (1 = train, 0 = skip) ---
 TRAIN_CONFIG = {
-    'xgboost':              0,
-    'lightgbm':             0,
-    'transformer':          0,
-    'lstm':                 0,
+    'xgboost':              1,
+    'lightgbm':             1,
+    'transformer':          1,
+    'lstm':                 1,
     'moe_transformer':      1,
     'mstnn':                1,
-    'xgboost_residual':     0,
-    'transformer_residual': 0,
+    'xgboost_residual':     1,
+    'transformer_residual': 1,
+    'moe_transformer_residual': 1,
+    'mstnn_residual':      1,
+    'moe_mstnn':           1,
+    'moe_mstnn_residual':  1,
 }
 
 # ---------------------------------------------------------------------------
@@ -280,6 +284,16 @@ MOE_TRANSFORMER_PARAMS = {
     'stage2_routing': 'pred',  # pinball: 'pred' (deployable) | 'true' (diagnostic upper bound)
 }
 
+# --- MoE Transformer RESIDUAL (same architecture, learns y_metered - baseline) ---
+# Same MoE model, but the target is the deviation from a naive same-hour-last-week
+# baseline (mean of the past 7 days' preliminary load per clock-hour); the baseline
+# is added back at inference. Treated as a SEPARATE model: own switch, own save path.
+MOE_TRANSFORMER_RESIDUAL_FEATURE_CONFIG = dict(MOE_TRANSFORMER_FEATURE_CONFIG)
+MOE_TRANSFORMER_RESIDUAL_PARAMS = {
+    **MOE_TRANSFORMER_PARAMS,
+    'residual_baseline': 'hourly',   # 'hourly' (24h profile) | 'scalar' (one number/day)
+}
+
 # --- MSTNN (simplified Multi-Scale Temporal NN; shares the 3D matrix + split) ---
 MSTNN_FEATURE_CONFIG = dict(MOE_TRANSFORMER_FEATURE_CONFIG)   # same 0.16/0.19 split + embargo
 
@@ -289,10 +303,10 @@ MSTNN_PARAMS = {
     'lookback_hours': 168,          # reshaped to (7 days, 24 hours) grid; must be a multiple of 24
     'n_seq_features': N_SEQ_FEATURES,   # per-timestep feats (Load+weather+thermal) -> conv;
                                     #   the rest (calendar+macro+thermal-static) bypass the conv
-    'mstnn_channels': 32,           # conv channels per multi-scale branch
-    'mstnn_kernels': [[3, 3], [5, 5]],   # parallel branches with different receptive fields
+    'mstnn_channels': 40,           # conv channels per branch (was 32 — that was too thin)
+    'mstnn_kernels': [[3, 3], [5, 5], [7, 3]],   # 3 scales: local / medium / full-week (7d x 3h)
     'mstnn_pool': 'avg',            # 'avg' = global avg pool (small head, less overfit) | 'flatten'
-    'fc_hidden': 128,
+    'fc_hidden': 128,               # ~69k params total: ~1.9x the old, well under transformer's 115k
     'dropout': 0.3,
     'out_dim': 24,
     'epochs': 200,
@@ -421,6 +435,23 @@ TRANSFORMER_RESIDUAL_PARAMS = {
     # target changes"), but it is a different thing than it is over there.
 }
 
+# --- MSTNN RESIDUAL (same MSTNN, learns y_metered - baseline) ---
+MSTNN_RESIDUAL_PARAMS = {
+    **MSTNN_PARAMS,
+    'baseline': _RESIDUAL_BASELINE,   # same model, only the target changes
+}
+
+# --- MoE-MSTNN (MoE regime head on the MSTNN conv encoder) ---
+MOE_MSTNN_FEATURE_CONFIG = dict(MSTNN_FEATURE_CONFIG)
+MOE_MSTNN_PARAMS = {
+    **MSTNN_PARAMS,
+    'expert_fc_hidden': 64,   # width of each of the 12 regime expert heads
+}
+MOE_MSTNN_RESIDUAL_PARAMS = {
+    **MOE_MSTNN_PARAMS,
+    'baseline': _RESIDUAL_BASELINE,
+}
+
 # --- Path suffixes (derived from param dicts, appended to model directory names) ---
 _xgb_lds  = '_lds' if XGB_PARAMS.get('use_lds')         else ''
 _lgbm_lds = '_lds' if LGBM_PARAMS.get('use_lds')        else ''
@@ -430,9 +461,13 @@ _tr_fds   = '_fds' if TRANSFORMER_PARAMS.get('use_fds') else ''
 _lstm_fds = '_fds' if LSTM_PARAMS.get('use_fds')        else ''
 _moe_lds  = '_lds' if MOE_TRANSFORMER_PARAMS.get('use_lds') else ''
 _mstnn_lds = '_lds' if MSTNN_PARAMS.get('use_lds') else ''
+_moe_res_lds = '_lds' if MOE_TRANSFORMER_RESIDUAL_PARAMS.get('use_lds') else ''
 _xgbres_lds = '_lds' if XGB_RESIDUAL_PARAMS.get('use_lds')         else ''
 _trres_lds  = '_lds' if TRANSFORMER_RESIDUAL_PARAMS.get('use_lds') else ''
 _trres_fds  = '_fds' if TRANSFORMER_RESIDUAL_PARAMS.get('use_fds') else ''
+_mstnnres_lds = '_lds' if MSTNN_RESIDUAL_PARAMS.get('use_lds') else ''
+_moemstnn_lds = '_lds' if MOE_MSTNN_PARAMS.get('use_lds') else ''
+_moemstnn_res_lds = '_lds' if MOE_MSTNN_RESIDUAL_PARAMS.get('use_lds') else ''
 
 # --- Evaluation Config ---
 EVAL_CONFIG = {
@@ -469,6 +504,22 @@ EVAL_CONFIG = {
         'mstnn': {
             'enabled': 0,
             'model_path': f'models/{DATASET}/mstnn/tail_test0.16_tail_val0.19{_mstnn_lds}/mstnn_best.pth',
+        },
+        'mstnn_residual': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/mstnn_residual/tail_test0.16_tail_val0.19{_mstnnres_lds}/mstnn_residual_best.pth',
+        },
+        'moe_mstnn': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/moe_mstnn/tail_test0.16_tail_val0.19{_moemstnn_lds}/moe_mstnn_best.pth',
+        },
+        'moe_mstnn_residual': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/moe_mstnn_residual/tail_test0.16_tail_val0.19{_moemstnn_res_lds}/moe_mstnn_residual_best.pth',
+        },
+        'moe_transformer_residual': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/moe_transformer_residual/tail_test0.16_tail_val0.19{_moe_res_lds}/moe_transformer_residual_best.pth',
         },
         'xgboost_residual': {
             'enabled': 1,
@@ -536,6 +587,18 @@ PREDICT_CONFIG = {
         'mstnn': {
             'enabled': 1,
             'model_path': f'models/{DATASET}/mstnn/tail_test0.16_tail_val0.1{_mstnn_lds}/mstnn_best.pth',
+        },
+        'mstnn_residual': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/mstnn_residual/tail_test0.16_tail_val0.1{_mstnnres_lds}/mstnn_residual_best.pth',
+        },
+        'moe_mstnn': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/moe_mstnn/tail_test0.16_tail_val0.1{_moemstnn_lds}/moe_mstnn_best.pth',
+        },
+        'moe_mstnn_residual': {
+            'enabled': 0,
+            'model_path': f'models/{DATASET}/moe_mstnn_residual/tail_test0.16_tail_val0.1{_moemstnn_res_lds}/moe_mstnn_residual_best.pth',
         },
         'xgboost_residual': {
             'enabled': 1,

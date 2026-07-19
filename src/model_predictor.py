@@ -31,11 +31,7 @@ from src.prediction_engine import (
 )
 # One registry, shared with the evaluator — a model added there is forecastable here for
 # free, and the two can never disagree about which models exist or how to drive them.
-from src.model_evaluator import TREE_MODELS, SEQ_MODELS, TREE_MOD, SEQ_MOD
-
-_SEQ_PARAMS = {'transformer': TRANSFORMER_PARAMS, 'lstm': LSTM_PARAMS,
-               'moe_transformer': MOE_TRANSFORMER_PARAMS, 'mstnn': MSTNN_PARAMS,
-               'transformer_residual': TRANSFORMER_RESIDUAL_PARAMS}
+from src.model_evaluator import TREE_MODELS, SEQ_MODELS, TREE_MOD, SEQ_MOD, SEQ_PARAMS as _SEQ_PARAMS
 
 
 class ModelPredictor:
@@ -148,7 +144,8 @@ class ModelPredictor:
         for name in self._enabled(SEQ_MODELS):
             model_path = self.cfg['models'][name]['model_path']
             mod, params = SEQ_MOD[name], _SEQ_PARAMS[name]
-            if name == 'moe_transformer':
+            # MoE models (and their residual variants) thread the per-sample season route.
+            if name.startswith('moe_'):
                 y_scaled = mod.predict(model_path, self.X_seq, self.ts_seq, params)
             else:
                 y_scaled = mod.predict(model_path, self.X_seq, params)

@@ -36,6 +36,7 @@ from src.models._eval_utils import EvalUtils
 from src.models._lds import compute_lds_weights
 from src.models._fds import FDSModule
 from src.models._seq_trainer import run_stage2, _fds_apply, make_criterion, _loss_tag
+from src.models._moe_head import RegimeHead
 from src.config import (
     REGIME_MAP, SEASON_ORDER, MONTH_TO_SEASON,
     MOE_TRANSFORMER_PARAMS, MOE_TRANSFORMER_FEATURE_CONFIG,
@@ -55,15 +56,6 @@ def season_indices(timestamps):
     )
 
 
-def _validate_regime_map(out_dim):
-    """Each season's hour lists must be disjoint and tile 0..out_dim-1."""
-    for season, experts in REGIME_MAP.items():
-        hours = [h for hrs in experts.values() for h in hrs]
-        if sorted(hours) != list(range(out_dim)):
-            raise ValueError(
-                f"REGIME_MAP['{season}'] hours {sorted(hours)} do not tile "
-                f"0..{out_dim - 1} exactly (check for gaps/overlaps)."
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -84,15 +76,6 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1)]
 
 
-def _expert_head(d_model, fc_hidden, n_out, dropout):
-    return nn.Sequential(
-        nn.Linear(d_model, fc_hidden),
-        nn.ReLU(),
-        nn.Dropout(dropout),
-        nn.Linear(fc_hidden, n_out),
-    )
-
-
 class MoETransformer(nn.Module):
     def __init__(self, num_features, params):
         super().__init__()
@@ -101,7 +84,6 @@ class MoETransformer(nn.Module):
         fc_hidden = params.get('expert_fc_hidden', 64)
         dropout   = params['dropout']
         self.out_dim = out_dim
-        _validate_regime_map(out_dim)
 
         # Static skip: per-timestep features (Load + weather) go through the shared
         # encoder; the broadcast constants (forecast-day calendar + 3-week macro)
@@ -121,20 +103,8 @@ class MoETransformer(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=params['num_layers'])
 
-        # --- expert heads, grouped by season; fixed iteration order per season ---
-        self.experts = nn.ModuleDict()
-        self._season_expert_names = {}     # season -> [expert names] (build order)
-        for season in SEASON_ORDER:
-            names = list(REGIME_MAP[season].keys())
-            self._season_expert_names[season] = names
-            concat_hours = []
-            for name in names:
-                hrs = REGIME_MAP[season][name]
-                self.experts[f'{season}__{name}'] = _expert_head(self.feat_dim, fc_hidden, len(hrs), dropout)
-                concat_hours.extend(hrs)
-            # inv_perm[h] = column of the season's concatenated expert output holding hour h
-            inv_perm = [concat_hours.index(h) for h in range(out_dim)]
-            self.register_buffer(f'inv_perm_{season}', torch.tensor(inv_perm, dtype=torch.long))
+        # --- shared MoE head: 12 regime experts + hard season routing ---
+        self.head = RegimeHead(self.feat_dim, out_dim, fc_hidden, dropout)
 
     def encode(self, x):
         h = self.input_projection(x[:, :, :self.n_seq])
@@ -145,18 +115,8 @@ class MoETransformer(nn.Module):
             z = torch.cat([z, x[:, 0, self.n_seq:]], dim=1)   # (batch, feat_dim)
         return z
 
-    def _season_forward(self, z, season):
-        """Full 24-vector prediction as if the whole batch were this season."""
-        cols = [self.experts[f'{season}__{n}'](z) for n in self._season_expert_names[season]]
-        cat = torch.cat(cols, dim=1)             # (batch, out_dim) in expert order
-        return cat[:, getattr(self, f'inv_perm_{season}')]   # reorder to hour 0..out_dim-1
-
     def decode(self, z, season_idx):
-        # Compute every season's head, then hard-select each sample's own season.
-        # Unselected season outputs receive no gradient (sliced away from the loss).
-        stacked = torch.stack([self._season_forward(z, s) for s in SEASON_ORDER], dim=0)  # (S,B,24)
-        batch_ar = torch.arange(z.size(0), device=z.device)
-        return stacked[season_idx, batch_ar]     # (batch, out_dim)
+        return self.head(z, season_idx)
 
     def forward(self, x, season_idx):
         return self.decode(self.encode(x), season_idx)
@@ -166,10 +126,16 @@ class MoETransformer(nn.Module):
 # Training
 # ---------------------------------------------------------------------------
 
-def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dataset=None):
+def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dataset=None,
+          model_type_name='moe_transformer', save_name='moe_transformer_best.pth',
+          model_cls=MoETransformer):
     """Dedicated trainer: same split/LDS/early-stop scheme as _seq_trainer, but
-    threads the per-sample season route through the DataLoader and forward pass."""
-    print("\n--- Training MoE Transformer ---")
+    threads the per-sample season route through the DataLoader and forward pass.
+
+    model_type_name / save_name let a variant (e.g. the residual model) save to its
+    OWN directory instead of overwriting the standard MoE checkpoint.
+    """
+    print(f"\n--- Training MoE Transformer [{model_type_name}] ---")
     params      = params or MOE_TRANSFORMER_PARAMS
     feature_cfg = feature_cfg or MOE_TRANSFORMER_FEATURE_CONFIG
 
@@ -177,8 +143,8 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
     print(f"GPU Acceleration: {device}")
 
     use_lds   = params.get('use_lds', False)
-    model_dir = _make_run_dir('models', 'moe_transformer', feature_cfg, dataset, use_lds=use_lds)
-    save_path = os.path.join(model_dir, 'moe_transformer_best.pth')
+    model_dir = _make_run_dir('models', model_type_name, feature_cfg, dataset, use_lds=use_lds)
+    save_path = os.path.join(model_dir, save_name)
 
     strategy     = feature_cfg['split_strategy']
     test_frac    = feature_cfg['test_frac']
@@ -226,7 +192,7 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
 
     loader = DataLoader(TensorDataset(X_tr, y_tr, s_tr, w_tr),
                         batch_size=params['batch_size'], shuffle=True)
-    model = MoETransformer(num_features=X_3d.shape[2], params=params).to(device)
+    model = model_cls(num_features=X_3d.shape[2], params=params).to(device)
 
     # --- FDS: calibrates the shared encoder representation (feat_dim = d_model) ---
     use_fds   = params.get('use_fds', False)
@@ -325,10 +291,10 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
 # Inference
 # ---------------------------------------------------------------------------
 
-def predict(model_path, X_np, timestamps, params):
+def predict(model_path, X_np, timestamps, params, model_cls=MoETransformer):
     """Load a saved model and return scaled predictions (N, out_dim)."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = MoETransformer(X_np.shape[2], params).to(device)
+    model = model_cls(X_np.shape[2], params).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
     season_idx = torch.LongTensor(season_indices(timestamps)).to(device)
@@ -340,7 +306,7 @@ def predict(model_path, X_np, timestamps, params):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def _regime_breakdown(y_true_mw, y_pred_mw, timestamps, result_dir):
+def _regime_breakdown(y_true_mw, y_pred_mw, timestamps, result_dir, name='MOE_TRANSFORMER'):
     """Per-expert (season x hour-set) MAPE — the regime view the professor wants."""
     from sklearn.metrics import mean_absolute_percentage_error
     season_idx = season_indices(timestamps)
@@ -358,21 +324,22 @@ def _regime_breakdown(y_true_mw, y_pred_mw, timestamps, result_dir):
                          'MAPE_pct': round(mape, 3)})
     df = pd.DataFrame(rows)
     os.makedirs(result_dir, exist_ok=True)
-    path = os.path.join(result_dir, 'MOE_TRANSFORMER_regime_mape.csv')
+    path = os.path.join(result_dir, f'{name}_regime_mape.csv')
     df.to_csv(path, index=False)
     print("\n====== MoE Regime Breakdown (test) ======")
     print(df.to_string(index=False))
     print(f"Regime MAPE saved to: {path}")
 
 
-def _predict_mw(model_path, X_np, timestamps, params, y_scaler):
-    scaled = predict(model_path, X_np, timestamps, params)
+def _predict_mw(model_path, X_np, timestamps, params, y_scaler, model_cls=MoETransformer):
+    scaled = predict(model_path, X_np, timestamps, params, model_cls=model_cls)
     N, P = scaled.shape
     return y_scaler.inverse_transform(scaled.flatten().reshape(-1, 1)).reshape(N, P)
 
 
 def _evaluate_experts(y_true_mw, y_pred_mw, timestamps, result_dir,
-                      y_true_train_mw=None, y_pred_train_mw=None, timestamps_train=None):
+                      y_true_train_mw=None, y_pred_train_mw=None, timestamps_train=None,
+                      name_prefix='MOE'):
     """Re-run the full evaluation suite for each of the 8 experts, on the days of
     its season restricted to the hours it owns, into experts/<season>__<name>/."""
     season_te = season_indices(timestamps)
@@ -386,7 +353,7 @@ def _evaluate_experts(y_true_mw, y_pred_mw, timestamps, result_dir,
             print(f"\n[expert eval] skip season '{season}': no {season} days in this test split")
             continue
         for expert, hours in REGIME_MAP[season].items():
-            name    = f'MOE_{season}_{expert}'.upper()
+            name    = f'{name_prefix}_{season}_{expert}'.upper()
             sub_dir = os.path.join(result_dir, 'experts', f'{season}__{expert}')
             train_df = None
             if have_train:
@@ -400,24 +367,25 @@ def _evaluate_experts(y_true_mw, y_pred_mw, timestamps, result_dir,
 
 
 def evaluate(model_path, X_test, y_true_mw, y_scaler, timestamps, result_dir,
-             params=None, X_train=None, y_true_train_mw=None, timestamps_train=None):
+             params=None, X_train=None, y_true_train_mw=None, timestamps_train=None,
+             model_cls=MoETransformer, name='MOE_TRANSFORMER', name_prefix='MOE'):
     """Predict, inverse-transform, run the full eval suite + per-regime breakdown +
     a full per-expert evaluation (one subfolder per expert)."""
     params = params or MOE_TRANSFORMER_PARAMS
-    y_pred_mw = _predict_mw(model_path, X_test, timestamps, params, y_scaler)
+    y_pred_mw = _predict_mw(model_path, X_test, timestamps, params, y_scaler, model_cls=model_cls)
 
     have_train = X_train is not None and y_true_train_mw is not None
-    y_pred_train_mw = (_predict_mw(model_path, X_train, timestamps_train, params, y_scaler)
+    y_pred_train_mw = (_predict_mw(model_path, X_train, timestamps_train, params, y_scaler, model_cls=model_cls)
                        if have_train else None)
 
-    train_df = (EvalUtils.build_detailed_df('MOE_TRANSFORMER', y_true_train_mw,
+    train_df = (EvalUtils.build_detailed_df(name, y_true_train_mw,
                                             y_pred_train_mw, timestamps_train)
                 if have_train else None)
 
     # --- whole-model evaluation (all 24h) ---
-    EvalUtils.evaluate_one('MOE_TRANSFORMER', y_true_mw, y_pred_mw, timestamps, result_dir, train_df)
-    _regime_breakdown(y_true_mw, y_pred_mw, timestamps, result_dir)
+    EvalUtils.evaluate_one(name, y_true_mw, y_pred_mw, timestamps, result_dir, train_df)
+    _regime_breakdown(y_true_mw, y_pred_mw, timestamps, result_dir, name=name)
 
     # --- per-expert evaluation (each expert's season-days x owned-hours) ---
     _evaluate_experts(y_true_mw, y_pred_mw, timestamps, result_dir,
-                      y_true_train_mw, y_pred_train_mw, timestamps_train)
+                      y_true_train_mw, y_pred_train_mw, timestamps_train, name_prefix=name_prefix)
