@@ -58,7 +58,7 @@ def train(X_train, y_train, params=None, feature_cfg=None):
         m.fit(X_train, y_res)
         models.append(m)
 
-    model_dir = _make_run_dir('models', MODEL_TYPE, feature_cfg)
+    model_dir = _make_run_dir('models', MODEL_TYPE, feature_cfg, params=params)
     save_path = os.path.join(model_dir, FILENAME)
     # The baseline mode rides along with the weights: predicting with a different mode than
     # the one trained on would add back a baseline the residuals were never measured from,

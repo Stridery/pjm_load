@@ -48,7 +48,8 @@ from src.config import (
 # That is what makes a genuine day-ahead forecast possible with no weather forecast at all.
 FORECAST_HORIZON_DAYS = 2
 TIMEZONE = 'America/New_York'
-from src.feature_engine import _normalize_to_24h
+from src.feature_engine import _normalize_to_24h, _load_forecast, _forecast_for
+from src.forecast_features import FC_FEATURE_NAMES
 from src.macro_features import (
     compute_macro_features, MACRO_FEATURE_NAMES, MACRO_WINDOW_HOURS,
 )
@@ -233,8 +234,9 @@ def build_tree_features(predict_path=None, only_days=None):
     min_history = max(lookback_hours, MACRO_WINDOW_HOURS)
     # Training's tree split_idx, so the heat threshold and climatology come out identical.
     split_idx = int(n_train_rows * (1 - TREE_FEATURE_CONFIG['test_frac']))
-    _thr, heat_streak, climatology, day_index, doy = build_thermal_references(
+    thr, heat_streak, climatology, day_index, doy = build_thermal_references(
         df, ept_dates, unique_days, split_idx)
+    fc_table = _load_forecast()
 
     X_rows, calendars = [], []
     for i in range(len(unique_days) - 1):
@@ -251,6 +253,13 @@ def build_tree_features(predict_path=None, only_days=None):
         cal = day_calendar(df, tmrw_pos, ept_hours, est_raw)
         if cal is None:
             continue    # partial day — skip rather than forecast half of one
+
+        fc_raw = None
+        if fc_table is not None:
+            fc_raw = _forecast_for(fc_table, tomorrow, temp_raw, ept_hours,
+                                   cutoff_pos, lookback_hours, thr)
+            if fc_raw is None:
+                continue    # no forecast for this day — same rule the matrix builder applies
 
         past_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]
         if np.isnan(past_window).any():
@@ -282,6 +291,9 @@ def build_tree_features(predict_path=None, only_days=None):
             day_index[ept_dates[cutoff_pos - 1]], heat_streak, climatology)
         for nm, val in zip(THERMAL_STATIC_NAMES, thermal_raw):
             f[nm] = float(val)
+        if fc_raw is not None:
+            for nm, val in zip(FC_FEATURE_NAMES, fc_raw):
+                f[nm] = float(val)
         # is_target_valid is NOT emitted: the training pipeline drops it before the model
         # ever sees it (model_evaluator._tree_test_split), so adding it here would hand
         # the model a column it was never trained on.
@@ -323,8 +335,9 @@ def build_sequence_features(predict_path=None, matrix_dir=None, only_days=None):
 
     min_history = max(lookback_hours, MACRO_WINDOW_HOURS)
     split_idx = int(n_train_rows * (1 - TRANSFORMER_FEATURE_CONFIG['test_frac']))
-    _thr, heat_streak, climatology, day_index, doy = build_thermal_references(
+    thr, heat_streak, climatology, day_index, doy = build_thermal_references(
         df, ept_dates, unique_days, split_idx)
+    fc_table = _load_forecast()
 
     X_list, static_list, ts_list, calendars = [], [], [], []
     for i in range(len(unique_days) - 1):
@@ -342,6 +355,13 @@ def build_sequence_features(predict_path=None, matrix_dir=None, only_days=None):
         if cal is None:
             continue
 
+        fc_raw = None
+        if fc_table is not None:
+            fc_raw = _forecast_for(fc_table, tomorrow, temp_raw, ept_hours,
+                                   cutoff_pos, lookback_hours, thr)
+            if fc_raw is None:
+                continue    # no forecast for this day — same rule the matrix builder applies
+
         X_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]
         if np.isnan(X_window).any():
             raise ValueError(
@@ -353,7 +373,8 @@ def build_sequence_features(predict_path=None, matrix_dir=None, only_days=None):
         thermal_raw = compute_thermal_static(
             temp_raw, cdd_raw, doy, cutoff_pos,
             day_index[ept_dates[cutoff_pos - 1]], heat_streak, climatology)
-        static_list.append(np.concatenate([macro_raw, thermal_raw]))
+        static_list.append(np.concatenate([macro_raw, thermal_raw]
+                                          + ([fc_raw] if fc_raw is not None else [])))
 
         tmrw_row = df.iloc[tmrw_pos[0]]
         tmrw_dow = tmrw_row['dayofweek']

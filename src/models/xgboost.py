@@ -27,7 +27,7 @@ def train(X_train, y_train, params=None, feature_cfg=None):
     lds_sigma     = xgb_params.pop('lds_sigma', 2.0)
     lds_min_freq  = xgb_params.pop('lds_min_freq_ratio', 0.05)
 
-    model_dir = _make_run_dir('models', 'xgboost', feature_cfg, use_lds=use_lds)
+    model_dir = _make_run_dir('models', 'xgboost', feature_cfg, params=(params or XGB_PARAMS))
 
     use_gpu = torch.cuda.is_available()
     if use_gpu:

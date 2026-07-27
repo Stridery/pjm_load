@@ -17,7 +17,13 @@ import pandas as pd
 
 # --- Paths (mirror src/config.py without importing the training stack) ---
 DATASET = os.environ.get("PJM_DATASET", "bge")
-MATRIX_DIR = f"data/{DATASET}/matrix/"
+# KEEP IN SYNC with USE_FORECAST_WEATHER in src/config.py. This script mirrors config
+# rather than importing it (see the header), so flipping the switch there and not here
+# means diagnosing the baseline matrix while believing you are looking at the forecast run.
+USE_FORECAST_WEATHER = False
+_FS = "_fc" if USE_FORECAST_WEATHER else ""
+MATRIX_DIR = f"data/{DATASET}/matrix{_FS}/"
+RESULT_ROOT = f"results/{DATASET}{_FS}"
 LOOKBACK = 168
 HORIZON = 0
 X_OPT_PATH = os.path.join(MATRIX_DIR, f"X_opt_lb{LOOKBACK}_h{HORIZON}.csv")
@@ -164,8 +170,10 @@ def task2_feature_overview_by_hour(X, y, hours=(0, 3, 9, 12, 15, 20)):
 #   the top-10% most positive and most negative signed errors. Terminal only.
 #   signed_error = pred - true  (positive = over-prediction, negative = under).
 # ---------------------------------------------------------------------------
-ERR_CSV = (f"results/{DATASET}/evaluation/transformer/"
-           f"tail_test0.1_tail_val0.1_fds/TRANSFORMER_detailed_errors.csv")
+# KEEP IN SYNC with the transformer run tag: split fracs + variant suffix (_lds/_fds/_s2).
+# This is just Task 3's default input; point --err-csv elsewhere to analyse another run.
+ERR_CSV = (f"{RESULT_ROOT}/evaluation/transformer/"
+           f"tail_test0.16_tail_val0.1_lds_fds/TRANSFORMER_detailed_errors.csv")
 
 
 def task3_error_hours(csv_path=ERR_CSV, frac=0.10):
@@ -314,6 +322,72 @@ def task6_feature_corr_heatmap(X, y, out_path="feature_correlation_heatmap.png")
     return corr
 
 
+# ---------------------------------------------------------------------------
+# Task 7: PJM's own estimated-vs-verified load error over time.
+#   Straight from the cleaned CSV (no matrix / no model): the `Load_Estimated`
+#   column is PJM's real-time estimate, `Load` is the later verified value.
+#   signed_error = Load_Estimated - Load  (positive = estimate ran high).
+#   This is the irreducible "measurement" error our models sit on top of.
+# ---------------------------------------------------------------------------
+CLEANED_PATH = os.path.join("data", DATASET, "cleaned", "cleaned_pjm_load_weather.csv")
+
+
+def task7_estimated_vs_true_error(csv_path=CLEANED_PATH,
+                                  out_path="estimated_vs_true_load_error.png"):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    print("=" * 70)
+    print("Task 7: estimated (Load_Estimated) vs true (Load) error over time")
+    print(f"  file: {csv_path}")
+    print("=" * 70)
+
+    if not os.path.exists(csv_path):
+        print(f"  NOT FOUND: {csv_path}\n")
+        return
+
+    df = pd.read_csv(csv_path, parse_dates=["Datetime_EPT"]).set_index("Datetime_EPT")
+    df = df[["Load", "Load_Estimated"]].dropna().sort_index()
+    err = df["Load_Estimated"] - df["Load"]          # + = estimate above verified
+    roll = err.rolling("7D").mean()                   # 7-day trend of the bias
+    mape = 100.0 * (err.abs() / df["Load"]).mean()
+
+    print(f"  n={len(err)}  mean={err.mean():+.1f} MW  std={err.std():.1f} MW  "
+          f"MAE={err.abs().mean():.1f} MW  MAPE={mape:.3f}%  "
+          f"range=[{err.min():+.0f}, {err.max():+.0f}] MW")
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+
+    # top: signed error — raw hourly (faint) + 7-day rolling mean (bold)
+    ax1.plot(err.index, err.values, lw=0.3, alpha=0.35, color="steelblue",
+             label="hourly signed error")
+    ax1.plot(roll.index, roll.values, lw=1.6, color="crimson",
+             label="7-day rolling mean")
+    ax1.axhline(0, color="black", lw=0.8)
+    ax1.axhline(err.mean(), color="crimson", lw=0.8, ls="--",
+                label=f"overall mean {err.mean():+.0f} MW")
+    ax1.set_ylabel("Load_Estimated - Load  (MW)")
+    ax1.set_title(f"PJM estimated vs verified load error  "
+                  f"(dataset={DATASET}, n={len(err)}, MAPE={mape:.2f}%)", fontsize=12)
+    ax1.legend(fontsize=8, loc="upper left")
+    ax1.grid(alpha=0.25)
+
+    # bottom: absolute error magnitude trend (7-day rolling)
+    ax2.plot(err.index, err.abs().rolling("7D").mean().values, lw=1.4,
+             color="darkorange", label="7-day rolling |error|")
+    ax2.set_ylabel("|error|  (MW)")
+    ax2.set_xlabel("date (EPT)")
+    ax2.legend(fontsize=8, loc="upper left")
+    ax2.grid(alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"  saved -> {os.path.abspath(out_path)}\n")
+
+
 def run_diagnostics():
     X, y = _load_opt()
     task1_feature_overview(X, y)
@@ -322,6 +396,7 @@ def run_diagnostics():
     task4_squared_feature_scatter(X, y)
     task5_squared_by_hour(X, y)
     task6_feature_corr_heatmap(X, y)
+    task7_estimated_vs_true_error()
 
 
 if __name__ == "__main__":

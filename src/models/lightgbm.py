@@ -26,7 +26,7 @@ def train(X_train, y_train, params=None, feature_cfg=None):
     lds_sigma     = _params.pop('lds_sigma', 2.0)
     lds_min_freq  = _params.pop('lds_min_freq_ratio', 0.05)
 
-    model_dir = _make_run_dir('models', 'lightgbm', feature_cfg, use_lds=use_lds)
+    model_dir = _make_run_dir('models', 'lightgbm', feature_cfg, params=(params or LGBM_PARAMS))
 
     print("LightGBM device: cpu")
     print(f"LightGBM LDS:    {'enabled' if use_lds else 'disabled'}")

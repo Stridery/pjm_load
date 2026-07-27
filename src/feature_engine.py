@@ -5,12 +5,46 @@ import os
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 import joblib
-from src.config import TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG, WEATHER_COLS, EMBARGO_DAYS
+from src.config import (
+    TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG, WEATHER_COLS, EMBARGO_DAYS,
+    USE_FORECAST_WEATHER, FORECAST_PATH,
+)
 from src.macro_features import compute_macro_features, MACRO_FEATURE_NAMES, MACRO_WINDOW_HOURS
 from src.thermal_features import (
     add_thermal_sequence_cols, build_thermal_references, compute_thermal_static,
     THERMAL_SEQ_COLS, THERMAL_STATIC_NAMES,
 )
+from src.forecast_features import (
+    load_forecast_table, forecast_issue_date, compute_forecast_features, FC_FEATURE_NAMES,
+)
+
+
+def _load_forecast(enabled=None):
+    """The forecast lookup table, or None when the feature set is off.
+
+    Kept in one place so both builders and the forecast-time mirror in prediction_engine
+    open the same file under the same switch, and so the sample counts they report line up.
+    """
+    if not (USE_FORECAST_WEATHER if enabled is None else enabled):
+        return None
+    table = load_forecast_table(FORECAST_PATH)
+    print(f"Forecast weather: ENABLED — {len(table)} complete issue date(s) from {FORECAST_PATH}")
+    return table
+
+
+def _forecast_for(fc_table, target_day, temp_raw, ept_hours, cutoff_pos, lookback_hours, thr):
+    """The 32 forecast features for one sample, or None if that day has no usable forecast.
+
+    Joined by EPT DATE. The forecast table is indexed by naive local time while the cleaned
+    frame is indexed by UTC, so matching on the frame's own index would land 4-5 h out and
+    pick up the wrong day's forecast without ever raising.
+    """
+    fc = fc_table.get(forecast_issue_date(target_day))
+    if fc is None:
+        return None
+    lo = cutoff_pos - lookback_hours
+    return compute_forecast_features(
+        fc[0], fc[1], temp_raw[lo:cutoff_pos], ept_hours[lo:cutoff_pos], thr)
 
 
 def _normalize_to_24h(load_vals, ept_hour_vals):
@@ -81,8 +115,10 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     min_history = max(lookback_hours, MACRO_WINDOW_HOURS)   # lookback + 3-week macro
     unique_days = np.unique(ept_dates)
     split_idx   = int(len(df_final) * (1 - TREE_FEATURE_CONFIG['test_frac']))
-    _thr, heat_streak, climatology, day_index, doy = build_thermal_references(
+    thr, heat_streak, climatology, day_index, doy = build_thermal_references(
         df_final, ept_dates, unique_days, split_idx)
+    fc_table = _load_forecast()
+    n_no_fc = 0
     X_list, y_list = [], []
 
     for i in tqdm(range(len(unique_days) - 1), desc="Building 2D Samples"):
@@ -104,6 +140,17 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
         y_tomorrow = _normalize_to_24h(load_raw[tmrw_pos], ept_hours[tmrw_pos])
         if y_tomorrow is None:
             continue
+
+        # A day with no complete forecast is not forecastable by this feature set, so it is
+        # dropped from the matrix entirely rather than carried with zeros — the model would
+        # otherwise read "no departure from normal" on days where we simply do not know.
+        fc_raw = None
+        if fc_table is not None:
+            fc_raw = _forecast_for(fc_table, tomorrow, temp_raw, ept_hours,
+                                   cutoff_pos, lookback_hours, thr)
+            if fc_raw is None:
+                n_no_fc += 1
+                continue
 
         tmrw_valid = 1 if valid_raw[tmrw_pos].all() else 0
         past_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]
@@ -135,6 +182,9 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
             day_index[ept_dates[cutoff_pos - 1]], heat_streak, climatology)
         for nm, val in zip(THERMAL_STATIC_NAMES, thermal_raw):
             f[nm] = float(val)
+        if fc_raw is not None:
+            for nm, val in zip(FC_FEATURE_NAMES, fc_raw):
+                f[nm] = float(val)
         f['is_target_valid'] = tmrw_valid
 
         y_dict = {'timestamp': tomorrow}
@@ -143,6 +193,9 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
         X_list.append(f)
         y_list.append(y_dict)
 
+    if n_no_fc:
+        print(f"Forecast weather: {n_no_fc} day(s) skipped — no complete 48 h forecast "
+              f"(archive starts 2021-03, with holes)")
     X_opt = pd.DataFrame(X_list).set_index('timestamp')
     y_opt = pd.DataFrame(y_list).set_index('timestamp')
     os.makedirs(matrix_dir, exist_ok=True)
@@ -212,8 +265,10 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     # Train-fitted thermal references (heat-wave threshold, streaks, climatology)
     cdd_raw = df['CDD_h'].values
     temp_raw = df['Temp_F'].values
-    _thr, heat_streak, climatology, day_index, doy = build_thermal_references(
+    thr, heat_streak, climatology, day_index, doy = build_thermal_references(
         df, ept_dates, unique_days, split_idx)
+    fc_table = _load_forecast()
+    n_no_fc = 0
 
     X_list, static_list, y_list, valid_mask_list, timestamps_list = [], [], [], [], []
 
@@ -237,16 +292,28 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
         if y_window is None:
             continue
 
+        # Same rule as the 2D builder: no complete forecast, no sample. Zero-filling would
+        # read as "exactly normal" on precisely the days we know nothing about.
+        fc_raw = None
+        if fc_table is not None:
+            fc_raw = _forecast_for(fc_table, tomorrow, temp_raw, ept_hours,
+                                   cutoff_pos, lookback_hours, thr)
+            if fc_raw is None:
+                n_no_fc += 1
+                continue
+
         is_seq_valid = bool(is_valid_array[tmrw_pos].all())
         X_window     = data_array[cutoff_pos - lookback_hours : cutoff_pos]
 
         # Per-sample static (broadcast) numeric features: 3-week macro + thermal state
+        # (+ the 48 h forecast departures when that feature set is on).
         macro_raw   = compute_macro_features(est_raw, ept_hours, cutoff_pos)
         thermal_raw = compute_thermal_static(
             temp_raw, cdd_raw, doy, cutoff_pos,
             day_index[ept_dates[cutoff_pos - 1]],      # last full day before cutoff
             heat_streak, climatology)
-        static_raw = np.concatenate([macro_raw, thermal_raw])
+        static_raw = np.concatenate([macro_raw, thermal_raw]
+                                    + ([fc_raw] if fc_raw is not None else []))
 
         # Forecast-day (tomorrow) calendar features, broadcast across the window.
         # These condition the prediction on the day being forecast, not the lookback.
@@ -269,6 +336,10 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
         valid_mask_list.append(is_seq_valid)
         timestamps_list.append(tomorrow)  # EPT date, consistent with tree-model index
 
+    if n_no_fc:
+        print(f"Forecast weather: {n_no_fc} day(s) skipped — no complete 48 h forecast "
+              f"(archive starts 2021-03, with holes)")
+
     X_3d = np.array(X_list, dtype='float32')                    # (N, 168, seq+calendar)
     y_3d = np.array(y_list, dtype='float32')
     mask_3d = np.array(valid_mask_list, dtype=bool)
@@ -277,7 +348,7 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     # Numeric static features (macro + thermal): standardize (fit on the first
     # 1-test_frac samples, like the sequence scaler), then broadcast across the
     # window and append after the calendar block.
-    static_arr = np.array(static_list, dtype='float32')        # (N, 7 macro + 7 thermal), raw
+    static_arr = np.array(static_list, dtype='float32')        # (N, 4 macro + 7 thermal [+ 32 fc]), raw
     m_split = int(len(static_arr) * (1 - TRANSFORMER_FEATURE_CONFIG['test_frac']))
     static_scaler = StandardScaler().fit(static_arr[:m_split])
     static_scaled = static_scaler.transform(static_arr).astype('float32')

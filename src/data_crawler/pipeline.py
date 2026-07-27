@@ -5,11 +5,17 @@ Expected raw file layout
 ------------------------
     data/{zone}/raw/metered/hrl_load_metered_{year}.csv     ← manually downloaded
     data/{zone}/raw/preliminary/hrl_load_prelim_{year}.csv  ← manually downloaded
-    data/{zone}/raw/weather_{year}.csv                      ← auto-fetched
+    data/{zone}/raw/weather/weather_{year}.csv              ← auto-fetched (observed)
+    data/{zone}/raw/forecast/forecast_{year}.csv            ← auto-fetched (forecast)
 
 Output
 ------
-    data/{zone}/joined/merged_pjm_load_weather.csv
+    data/{zone}/joined/merged_pjm_load_weather.csv     load + observed weather
+    data/{zone}/cleaned/cleaned_pjm_load_weather.csv   labelled rows  → training
+    data/{zone}/cleaned/predict.csv                    all rows, no Load → forecasting
+
+The forecast files are a side output on their own index (issue date x lead), not part
+of the joined/cleaned frames — see Step 3b for why.
 
 Usage
 -----
@@ -27,7 +33,9 @@ import sys
 import numpy as np
 import pandas as pd
 
+from src.config import LOAD_ESTIMATED_DIVISOR
 from . import open_meteo as om
+from . import open_meteo_forecast as omf
 from .aligner import merge_and_align
 
 logger = logging.getLogger(__name__)
@@ -197,9 +205,11 @@ def run_pipeline(
     metered_dir     = os.path.join(raw_dir, "metered")
     preliminary_dir = os.path.join(raw_dir, "preliminary")
     weather_dir     = os.path.join(raw_dir, "weather")
+    forecast_dir    = os.path.join(raw_dir, "forecast")
     joined_dir      = os.path.join(data_root, zone, "joined")
-    os.makedirs(weather_dir, exist_ok=True)
-    os.makedirs(joined_dir,  exist_ok=True)
+    os.makedirs(weather_dir,  exist_ok=True)
+    os.makedirs(forecast_dir, exist_ok=True)
+    os.makedirs(joined_dir,   exist_ok=True)
     joined_path = os.path.join(joined_dir, "merged_pjm_load_weather.csv")
 
     # Step 1 & 2 – Load and concat PJM CSVs
@@ -208,6 +218,16 @@ def run_pipeline(
 
     logger.info("=== Step 2: Loading preliminary load from %s ===", preliminary_dir)
     preliminary = load_preliminary(preliminary_dir)
+
+    # Scale a regional-aggregate preliminary series down to this zone's own magnitude. BGE has
+    # no zone-level preliminary — PJM only publishes the MIDATL aggregate (~8.8x BGE) — so we
+    # divide it here, at the source, before it is joined and written. One divide keeps every
+    # later stage byte-for-byte identical to a zone whose preliminary really is its own load.
+    divisor = LOAD_ESTIMATED_DIVISOR.get(zone, 1.0)
+    if divisor != 1.0 and "Load_Estimated" in preliminary.columns:
+        preliminary["Load_Estimated"] = preliminary["Load_Estimated"] / divisor
+        logger.info("Scaled Load_Estimated for zone '%s' by 1/%.2f (regional aggregate -> zone scale)",
+                    zone, divisor)
 
     # Auto-detect year range from metered files (override if caller specified)
     metered_files = _sorted_csvs(metered_dir, "hrl_load_metered_*.csv")
@@ -229,6 +249,44 @@ def run_pipeline(
     all_weather = pd.concat(weather_frames)
     all_weather = all_weather[~all_weather.index.duplicated(keep="first")].sort_index()
 
+    # Step 3b – Archived weather FORECASTS (what was predicted, not what happened).
+    #
+    # Deliberately a SIDE OUTPUT: it lands in raw/forecast/, beside raw/weather/, and is
+    # never joined into `merged`. Two reasons, and both matter.
+    #
+    #   Shape.  This is not another hourly column on the same index. It is, per issue
+    #           date, the 48 h that were forecast from it — the same valid hour appears
+    #           under two different issue dates at two different lead times. Flattening
+    #           that into the hourly frame would have to pick one lead and throw the
+    #           other away.
+    #   Blast radius. The archive only reaches back to ~2021-04, while the load history
+    #           starts 2020-01. Joining it in would put NaNs in the joined frame for the
+    #           first 15 months, which the prediction-view guard below (rightly) refuses
+    #           to write. Keeping it separate means the cleaned CSVs stay byte-identical
+    #           and every existing model keeps training on exactly what it trained on
+    #           before — the forecast features get spliced in at matrix-build time, for
+    #           the runs that ask for them.
+    logger.info("=== Step 3b: Fetching archived weather forecasts ===")
+    fc_frames = [
+        omf.fetch_or_load_forecast_year(lat, lon, year, forecast_dir,
+                                        timezone=timezone, skip_existing=skip_existing)
+        for year in range(start_year, end_year + 1)
+    ]
+    fc_rows = sum(len(f) for f in fc_frames)
+    if fc_rows:
+        issue_days = sorted({d for f in fc_frames if not f.empty
+                             for d in f["issue_date"].unique()})
+        logger.info(
+            "Forecast archive: %d rows over %d issue date(s), %s → %s  →  %s",
+            fc_rows, len(issue_days), issue_days[0], issue_days[-1], forecast_dir,
+        )
+    else:
+        logger.warning(
+            "Forecast archive: nothing fetched for %d-%d. Every year requested predates "
+            "%s, so no forecast-weather model can be trained on this range.",
+            start_year, end_year, omf.ARCHIVE_START,
+        )
+
     # Step 4 – Align to metered UTC index and join
     logger.info("=== Step 4: Aligning and joining ===")
     merged = merge_and_align(
@@ -247,7 +305,7 @@ def run_pipeline(
 
     # Step 6 – Clean and engineer features
     logger.info("=== Step 6: Cleaning and feature engineering ===")
-    from src.data_processor import clean_and_engineer  # type: ignore
+    from src.data_processor import clean_and_engineer, clean_forecast  # type: ignore
 
     cleaned_dir  = os.path.join(data_root, zone, "cleaned")
     os.makedirs(cleaned_dir, exist_ok=True)
@@ -259,6 +317,11 @@ def run_pipeline(
 
     cleaned = clean_and_engineer(clean_input_path, cleaned_path)
     os.remove(clean_input_path)
+
+    # Step 6b – Stitch the per-year forecast shards into one file, on their own index.
+    # Separate from the load/weather frame for the reasons in Step 3b; consolidated here
+    # so the feature layer reads one path and never has to know the shards exist.
+    clean_forecast(forecast_dir, os.path.join(cleaned_dir, "forecast.csv"))
 
     # Step 7 – Split into the training view and the forecast view.
     #

@@ -201,7 +201,7 @@ def main():
     def hslice(idx):
         return y[idx][:, hours]                              # (N, n_hours), scaled
 
-    save_dir = os.path.join('models', cfg.DATASET, 'single_expert', f'{season}__{expert}')
+    save_dir = os.path.join(cfg.MODEL_ROOT, 'single_expert', f'{season}__{expert}')
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, 'best.pth')
 
@@ -226,7 +226,7 @@ def main():
     true_tr = inv(hslice(trpool_i))
 
     # --- Evaluate on the expert's hours (full EvalUtils suite) ---
-    result_dir = os.path.join('results', cfg.DATASET, 'single_expert', f'{season}__{expert}')
+    result_dir = os.path.join(cfg.RESULT_ROOT, 'single_expert', f'{season}__{expert}')
     train_df = EvalUtils.build_detailed_df(name, scatter(true_tr), scatter(pred_tr),
                                            ts[trpool_i], hours=hours)
     EvalUtils.evaluate_one(name, scatter(true_te), scatter(pred_te), ts[te_i],

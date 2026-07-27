@@ -48,8 +48,8 @@ _LAG_RE = re.compile(r'_h(\d+)$')          # trailing "_h<k>" = flattened lookba
 
 def default_model_path():
     tf = cfg.TREE_FEATURE_CONFIG
-    tag = f"{tf['split_strategy']}_test{tf['test_frac']}{cfg._xgb_lds}"
-    return os.path.join('models', cfg.DATASET, 'xgboost', tag, 'xgboost_24_models.pkl')
+    tag = f"{tf['split_strategy']}_test{tf['test_frac']}{cfg.run_suffix(cfg.XGB_PARAMS)}"
+    return os.path.join(cfg.MODEL_ROOT, 'xgboost', tag, 'xgboost_24_models.pkl')
 
 
 def _split_name(col):
@@ -157,7 +157,7 @@ def main():
                          f"(train it first, or pass --model-path)")
 
     imp = collect_importance(model_path, args.importance)
-    out_dir = None if args.no_save else os.path.join('results', cfg.DATASET, 'diagnostics')
+    out_dir = None if args.no_save else os.path.join(cfg.RESULT_ROOT, 'diagnostics')
     report(imp, top=args.top, out_dir=out_dir)
 
 

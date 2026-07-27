@@ -293,8 +293,7 @@ def train_sequence(model_cls, model_type_name, save_name,
 
     use_lds = params.get('use_lds', False)
     use_fds = params.get('use_fds', False)
-    model_dir = _make_run_dir('models', model_type_name, feature_cfg, dataset,
-                              use_lds=use_lds, use_fds=use_fds)
+    model_dir = _make_run_dir('models', model_type_name, feature_cfg, dataset, params=params)
 
     random_state = feature_cfg['random_state']
     strategy     = feature_cfg['split_strategy']

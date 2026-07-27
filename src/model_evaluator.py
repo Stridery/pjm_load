@@ -8,7 +8,7 @@ import pandas as pd
 
 from src.feature_engine import build_or_load_matrix, build_timeseries_matrix, _split_indices
 from src.config import (
-    CLEANED_PATH, MATRIX_DIR, DATASET,
+    CLEANED_PATH, MATRIX_DIR, RESULT_ROOT,
     TRANSFORMER_PARAMS, LSTM_PARAMS, MOE_TRANSFORMER_PARAMS, MSTNN_PARAMS,
     TRANSFORMER_RESIDUAL_PARAMS, MOE_TRANSFORMER_RESIDUAL_PARAMS, MSTNN_RESIDUAL_PARAMS,
     MOE_MSTNN_PARAMS, MOE_MSTNN_RESIDUAL_PARAMS,
@@ -213,5 +213,5 @@ class ModelEvaluator:
             true_24h = self._inverse_transform(self.y_3d[idx]).flatten()
 
         model_subdir = os.path.join(*Path(model_path).parts[2:-1])
-        save_path = os.path.join('results', DATASET, 'singleday', model_subdir, f'{date_str}.png')
+        save_path = os.path.join(RESULT_ROOT, 'singleday', model_subdir, f'{date_str}.png')
         plot_single_day(model_name.upper(), date_str, true_24h, pred_24h, save_path=save_path)

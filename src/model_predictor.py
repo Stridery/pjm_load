@@ -8,7 +8,7 @@ split — and that there is no verified label to score against.
 
 Output, one file per model, dropped straight into that model's evaluation folder so a run's
 forecast and its backtest live together:
-    results/{DATASET}/evaluation/{model}/{run_tag}/{MODEL}_forecast.csv
+    results/{DATASET_TAG}/evaluation/{model}/{run_tag}/{MODEL}_forecast.csv
         datetime, {MODEL}_pred [, preliminary_load, signed_error, abs_error, mape_pct]
 
 The bracketed columns appear only when PREDICT_CONFIG['compare_to_preliminary'] is set —

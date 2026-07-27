@@ -138,14 +138,10 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
         return seq, joblib.load(res_path), ysc
 
     def _save_dir(params, dataset):
-        # match how each trainer names its dir: moe.train uses use_lds only; train_sequence
-        # uses use_lds AND use_fds (plain models get an _fds suffix when FDS is on).
-        if is_moe:
-            return _make_run_dir('models', model_type, feature_cfg, dataset,
-                                 use_lds=params.get('use_lds', False))
-        return _make_run_dir('models', model_type, feature_cfg, dataset,
-                             use_lds=params.get('use_lds', False),
-                             use_fds=params.get('use_fds', False))
+        # One code path now: _make_run_dir derives the whole variant tag from params via
+        # run_suffix, exactly as the base trainer (moe.train / train_sequence) does, so the
+        # residual scaler lands in the same directory the weights were written to.
+        return _make_run_dir('models', model_type, feature_cfg, dataset, params=params)
 
     def _train(X_3d, y_3d, mask_3d, timestamps_3d, params, dataset):
         params = {**(params or params_default)}

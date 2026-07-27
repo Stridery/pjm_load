@@ -143,7 +143,7 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
     print(f"GPU Acceleration: {device}")
 
     use_lds   = params.get('use_lds', False)
-    model_dir = _make_run_dir('models', model_type_name, feature_cfg, dataset, use_lds=use_lds)
+    model_dir = _make_run_dir('models', model_type_name, feature_cfg, dataset, params=params)
     save_path = os.path.join(model_dir, save_name)
 
     strategy     = feature_cfg['split_strategy']

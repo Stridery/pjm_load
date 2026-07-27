@@ -32,7 +32,7 @@ from src.models.moe_transformer import season_indices
 pd.set_option('display.width', 200)
 pd.set_option('display.max_columns', 30)
 
-_OUT_DIR = os.path.join('results', cfg.DATASET, 'diagnostics')
+_OUT_DIR = os.path.join(cfg.RESULT_ROOT, 'diagnostics')
 
 
 def _save(df, name):
