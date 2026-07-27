@@ -32,25 +32,32 @@ FORECAST_GLOB = 'results/*_fc/evaluation/*/*/*_forecast.csv'
 #   hue   : colour slot 0-7. A family shares one hue; its residual twin reuses it and is told
 #           apart by a dashed line (12 models, 7 hues — the palette has no 12 CVD-safe colours).
 #   klass : the big class — 'direct' vs 'residual' (the two top-level groups in the scoreboard).
+#   family: the architecture bucket for the Family filter — 5 buckets (xgboost, lightgbm,
+#           transformer, lstm, mstnn). MoE folds into its base architecture (moe_transformer →
+#           transformer, moe_mstnn → mstnn), so it is COARSER than hue on purpose: a filter
+#           grouping, while hue still tells moe_transformer from transformer on the chart.
 #   label : display name; base and residual share it because `klass` already separates them.
 # Dict order is the default legend/table order (each family's base then its residual).
-# The third axis — variant (baseline / lds / lds+fds) — is NOT here: it comes from the run_tag
-# (see variant_of) and shows as its own column + filter, never as a colour.
+# The remaining axis — variant (baseline / lds / lds+fds) — is NOT here: it comes from the
+# run_tag (see variant_of) and shows as its own column + filter, never as a colour.
 MODELS = {
-    'xgboost':                  {'hue': 0, 'klass': 'direct',   'label': 'XGBoost'},
-    'xgboost_residual':         {'hue': 0, 'klass': 'residual', 'label': 'XGBoost'},
-    'lightgbm':                 {'hue': 1, 'klass': 'direct',   'label': 'LightGBM'},
-    'transformer':              {'hue': 2, 'klass': 'direct',   'label': 'Transformer'},
-    'transformer_residual':     {'hue': 2, 'klass': 'residual', 'label': 'Transformer'},
-    'lstm':                     {'hue': 3, 'klass': 'direct',   'label': 'LSTM'},
-    'mstnn':                    {'hue': 4, 'klass': 'direct',   'label': 'MSTNN'},
-    'mstnn_residual':           {'hue': 4, 'klass': 'residual', 'label': 'MSTNN'},
-    'moe_transformer':          {'hue': 5, 'klass': 'direct',   'label': 'MoE-Transformer'},
-    'moe_transformer_residual': {'hue': 5, 'klass': 'residual', 'label': 'MoE-Transformer'},
-    'moe_mstnn':                {'hue': 6, 'klass': 'direct',   'label': 'MoE-MSTNN'},
-    'moe_mstnn_residual':       {'hue': 6, 'klass': 'residual', 'label': 'MoE-MSTNN'},
+    'xgboost':                  {'hue': 0, 'klass': 'direct',   'family': 'xgboost',     'label': 'XGBoost'},
+    'xgboost_residual':         {'hue': 0, 'klass': 'residual', 'family': 'xgboost',     'label': 'XGBoost'},
+    'lightgbm':                 {'hue': 1, 'klass': 'direct',   'family': 'lightgbm',    'label': 'LightGBM'},
+    'transformer':              {'hue': 2, 'klass': 'direct',   'family': 'transformer', 'label': 'Transformer'},
+    'transformer_residual':     {'hue': 2, 'klass': 'residual', 'family': 'transformer', 'label': 'Transformer'},
+    'lstm':                     {'hue': 3, 'klass': 'direct',   'family': 'lstm',        'label': 'LSTM'},
+    'mstnn':                    {'hue': 4, 'klass': 'direct',   'family': 'mstnn',       'label': 'MSTNN'},
+    'mstnn_residual':           {'hue': 4, 'klass': 'residual', 'family': 'mstnn',       'label': 'MSTNN'},
+    'moe_transformer':          {'hue': 5, 'klass': 'direct',   'family': 'transformer', 'label': 'MoE-Transformer'},
+    'moe_transformer_residual': {'hue': 5, 'klass': 'residual', 'family': 'transformer', 'label': 'MoE-Transformer'},
+    'moe_mstnn':                {'hue': 6, 'klass': 'direct',   'family': 'mstnn',       'label': 'MoE-MSTNN'},
+    'moe_mstnn_residual':       {'hue': 6, 'klass': 'residual', 'family': 'mstnn',       'label': 'MoE-MSTNN'},
 }
 VARIANT_ORDER = ['baseline', 'lds', 'lds+fds']
+# The 5 Family-filter buckets, in reading order, with display labels.
+FAMILY_ORDER = [('xgboost', 'XGBoost'), ('lightgbm', 'LightGBM'), ('transformer', 'Transformer'),
+                ('lstm', 'LSTM'), ('mstnn', 'MSTNN')]
 
 
 def variant_of(run_tag):
@@ -187,6 +194,7 @@ def build_payload():
         'generated': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'meta': meta,
         'variantOrder': VARIANT_ORDER,
+        'families': FAMILY_ORDER,
         'paletteLight': PALETTE_LIGHT,
         'paletteDark': PALETTE_DARK,
         'zones': zones,
@@ -463,15 +471,21 @@ const fmt = v => v == null ? '—' : num(v);
    variants of one model would draw as one indistinguishable line. Switch it on to compare them
    (they are told apart in the table and on hover). */
 const CLASSES = [['direct', 'Direct'], ['residual', 'Residual']];
-const newFilter = () => ({ types: new Set(['direct', 'residual']), vars: new Set(['baseline']) });
+const FAM_KEYS = DATA.families.map(([k]) => k);   // the 5 architecture buckets, in reading order
+const newFilter = () => ({
+  types: new Set(['direct', 'residual']),
+  vars:  new Set(['baseline']),
+  fams:  new Set(FAM_KEYS),            // all architectures on by default
+});
 const eligible = (zone, filt) => DATA.zones[zone].entities.filter(
-  e => filt.types.has(M(e).klass) && filt.vars.has(M(e).variant));
+  e => filt.types.has(M(e).klass) && filt.vars.has(M(e).variant) && filt.fams.has(M(e).family));
 
 function renderChips(el, filt, onChange) {
   const chip = (g, v, label) =>
     `<button class="chip" data-g="${g}" data-v="${v}" aria-pressed="${filt[g].has(v)}">${label}</button>`;
   el.innerHTML =
     `<span class="chip-label">Class</span>` + CLASSES.map(([v, l]) => chip('types', v, l)).join('') +
+    `<span class="chip-label">Family</span>` + DATA.families.map(([v, l]) => chip('fams', v, l)).join('') +
     `<span class="chip-label">Variant</span>` + DATA.variantOrder.map(v => chip('vars', v, v)).join('');
   el.querySelectorAll('.chip').forEach(b => b.onclick = () => {
     const set = filt[b.dataset.g], v = b.dataset.v;
