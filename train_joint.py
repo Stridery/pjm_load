@@ -83,7 +83,7 @@ for test_strategy in TEST_STRATEGIES:
         print(f'Joint Transformer | test: {test_strategy} | val: {val_strategy}')
         print('='*60)
         transformer_mod.train(X_3d, y_3d, mask_3d, T_PARAMS, FEAT_CFG, DATASET)
-        t_path = f'models/{DATASET}/transformer/{run_tag}{cfg.run_suffix(T_PARAMS)}/transformer_best.pth'
+        t_path = f'models/{DATASET}/transformer/{run_tag}/transformer_best.pth'
         eval_cfg['models']['transformer'] = {'enabled': 1, 'model_path': t_path}
         evaluator = JointModelEvaluator(eval_cfg, ZONES)
         evaluator.X_3d       = X_3d
@@ -99,7 +99,7 @@ for test_strategy in TEST_STRATEGIES:
         print(f'Joint LSTM | test: {test_strategy} | val: {val_strategy}')
         print('='*60)
         lstm_mod.train(X_3d, y_3d, mask_3d, L_PARAMS, FEAT_CFG, DATASET)
-        l_path = f'models/{DATASET}/lstm/{run_tag}{cfg.run_suffix(L_PARAMS)}/lstm_best.pth'
+        l_path = f'models/{DATASET}/lstm/{run_tag}/lstm_best.pth'
         eval_cfg['models']['lstm'] = {'enabled': 1, 'model_path': l_path}
         evaluator = JointModelEvaluator(eval_cfg, ZONES)
         evaluator.X_3d       = X_3d

@@ -22,10 +22,9 @@ from sklearn.metrics import (mean_absolute_error, mean_absolute_percentage_error
                              mean_squared_error)
 
 OUT = os.path.join('docs', 'index.html')
-# Only the forecast-weather runs (dom_fc / bge_fc). The archive-weather baselines have no
-# genuine future forecast — the whole reason the _fc variant exists — so they are not shown.
-# The _fc suffix is dropped for display: the viewer just sees DOM / BGE.
-FORECAST_GLOB = 'results/*_fc/evaluation/*/*/*_forecast.csv'
+# Every zone's forecast runs live under results/{zone}/evaluation/... (forecast weather is the
+# only feature set now). The viewer sees DOM / BGE.
+FORECAST_GLOB = 'results/*/evaluation/*/*/*_forecast.csv'
 
 # Hardcoded model registry — the taxonomy is spelled out, not parsed from names, so it is
 # eyeballable and one edit adds a model. Per model:
@@ -82,8 +81,8 @@ ZONES = {
     'bge': {'label': 'BGE', 'name': 'Baltimore Gas & Electric'},
 }
 
-# Matches src/prediction_engine.FORECAST_HORIZON_DAYS: the forecast reaches two days past the
-# last complete day of data, and those trailing days are exactly the ones with no truth yet.
+# The forecast reaches two days past the last complete day of data; those trailing days are the
+# ones with no actual yet (the day-ahead tab). Must match the serving layer's forecast horizon.
 DAY_AHEAD_DAYS = 2
 
 
@@ -130,7 +129,7 @@ def build_payload():
             raise SystemExit(f"{path}: model '{model}' is not in the MODELS registry — add it.")
         variant = variant_of(run_tag)
         eid = model if variant == 'baseline' else f'{model}@{variant}'
-        zone = ds[:-3] if ds.endswith('_fc') else ds     # dom_fc -> dom for display
+        zone = ds     # results/{zone}/ — zone is the display key directly
 
         df = pd.read_csv(path)
         # Forecasts must carry datetime_utc (added with the DST fix): without it a fall-back

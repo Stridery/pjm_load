@@ -29,8 +29,7 @@ MODEL_TYPE = 'xgboost_residual'
 FILENAME = 'xgboost_residual_24_models.pkl'
 
 # Flags this module consumes itself; XGBRegressor would reject them.
-_INTERNAL_KEYS = ['baseline', 'use_lds', 'lds_bin_width', 'lds_ks', 'lds_sigma',
-                  'lds_min_freq_ratio']
+_INTERNAL_KEYS = ['baseline']
 
 
 def _baseline_mode(params):
@@ -58,7 +57,7 @@ def train(X_train, y_train, params=None, feature_cfg=None):
         m.fit(X_train, y_res)
         models.append(m)
 
-    model_dir = _make_run_dir('models', MODEL_TYPE, feature_cfg, params=params)
+    model_dir = _make_run_dir('models', MODEL_TYPE, feature_cfg)
     save_path = os.path.join(model_dir, FILENAME)
     # The baseline mode rides along with the weights: predicting with a different mode than
     # the one trained on would add back a baseline the residuals were never measured from,

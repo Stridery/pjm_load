@@ -33,9 +33,7 @@ from src.feature_engine import _split_indices, apply_embargo
 from src.config import EMBARGO_DAYS
 from src.models._utils import _make_run_dir
 from src.models._eval_utils import EvalUtils
-from src.models._lds import compute_lds_weights
-from src.models._fds import FDSModule
-from src.models._seq_trainer import run_stage2, _fds_apply, make_criterion, _loss_tag
+from src.models._seq_trainer import make_criterion, _loss_tag
 from src.models._moe_head import RegimeHead
 from src.config import (
     REGIME_MAP, SEASON_ORDER, MONTH_TO_SEASON,
@@ -142,8 +140,7 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"GPU Acceleration: {device}")
 
-    use_lds   = params.get('use_lds', False)
-    model_dir = _make_run_dir('models', model_type_name, feature_cfg, dataset, params=params)
+    model_dir = _make_run_dir('models', model_type_name, feature_cfg, dataset)
     save_path = os.path.join(model_dir, save_name)
 
     strategy     = feature_cfg['split_strategy']
@@ -167,52 +164,20 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
     s_tr_np = season_all[train_idx][train_mask]
     print(f"Train after denoising: {len(X_tr_np)} | Val: {len(val_idx)} | Test: {len(_test_idx)}")
 
-    # --- LDS per-day sample weights (same as _seq_trainer) ---
-    if use_lds:
-        day_rep = y_tr_np.mean(axis=1)
-        lds_w = compute_lds_weights(
-            day_rep,
-            bin_width      = params.get('lds_bin_width', 200.0),
-            ks             = params.get('lds_ks', 5),
-            sigma          = params.get('lds_sigma', 2.0),
-            min_freq_ratio = params.get('lds_min_freq_ratio', 0.05),
-        )
-        print(f"LDS: enabled | weight range [{lds_w.min():.3f}, {lds_w.max():.3f}]")
-    else:
-        lds_w = np.ones(len(y_tr_np), dtype=np.float32)
-
     X_tr = torch.FloatTensor(X_tr_np)
     y_tr = torch.FloatTensor(y_tr_np)
     s_tr = torch.LongTensor(s_tr_np)
-    w_tr = torch.FloatTensor(lds_w)
 
     X_val = torch.FloatTensor(X_3d[val_idx]).to(device)
     y_val = torch.FloatTensor(y_3d[val_idx]).to(device)
     s_val = torch.LongTensor(season_all[val_idx]).to(device)
 
-    loader = DataLoader(TensorDataset(X_tr, y_tr, s_tr, w_tr),
+    loader = DataLoader(TensorDataset(X_tr, y_tr, s_tr),
                         batch_size=params['batch_size'], shuffle=True)
     model = model_cls(num_features=X_3d.shape[2], params=params).to(device)
 
-    # --- FDS: calibrates the shared encoder representation (feat_dim = d_model) ---
-    use_fds   = params.get('use_fds', False)
-    fds       = None
-    fds_start = 0
-    enc_dim = model.enc_dim          # calibrate only the learned repr, not the static-skip tail
-    if use_fds:
-        fds_start = params.get('fds_start_epoch', 5)
-        fds = FDSModule(
-            feature_dim=enc_dim,
-            bin_width=params.get('fds_bin_width', 200.0),
-            ks=params.get('fds_ks', 5),
-            sigma=params.get('fds_sigma', 2.0),
-            momentum=params.get('fds_momentum', 0.1),
-        )
-        print(f"FDS: enabled | feat_dim={enc_dim} | bin_width={fds.bin_width} "
-              f"| start_epoch={fds_start} | momentum={fds.momentum}")
-
-    train_criterion = make_criterion(params, reduction='none')
-    val_criterion   = make_criterion(params)
+    criterion     = make_criterion(params)
+    val_criterion = make_criterion(params)
     print(f"Loss: {_loss_tag(params)}")
     optimizer = optim.AdamW(model.parameters(), lr=params['learning_rate'],
                             weight_decay=params['weight_decay'])
@@ -222,39 +187,17 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
     epochs_no_improve = 0
     patience          = params.get('early_stop_patience', 30)
 
-    # ------------------------------------------------------------------ #
-    # Stage 1 — full training with LDS + FDS                              #
-    # ------------------------------------------------------------------ #
     for epoch in range(params['epochs']):
         model.train()
         train_loss = 0.0
-        for bx, by, bs, bw in loader:
-            bx, by, bs, bw = bx.to(device), by.to(device), bs.to(device), bw.to(device)
+        for bx, by, bs in loader:
+            bx, by, bs = bx.to(device), by.to(device), bs.to(device)
             optimizer.zero_grad()
-
-            if use_fds:
-                # encode / (calibrate) / decode so FDS can intervene on z, then route by season
-                features_raw = model.encode(bx)             # (batch, [enc | static])
-                by_rep       = by.mean(dim=1)
-                if epoch >= fds_start and fds._ready:
-                    features = _fds_apply(fds, features_raw, by_rep, enc_dim)
-                else:
-                    features = features_raw
-                pred = model.decode(features, bs)
-            else:
-                pred = model(bx, bs)
-
-            loss = (train_criterion(pred, by) * bw.unsqueeze(1)).mean()
+            loss = criterion(model(bx, bs), by)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item()
-
-            if use_fds:
-                fds.collect(features_raw[:, :enc_dim], by_rep)   # encoder slice only
-
-        if use_fds:
-            fds.update_and_smooth()
 
         model.eval()
         with torch.no_grad():
@@ -269,22 +212,14 @@ def train(X_3d, y_3d, mask_3d, timestamps_3d, params=None, feature_cfg=None, dat
             epochs_no_improve += 1
 
         if (epoch + 1) % 5 == 0:
-            fds_tag = ''
-            if use_fds:
-                fds_tag = f' | FDS: {"active" if (fds._ready and epoch >= fds_start) else "warmup"}'
             print(f"Epoch {epoch+1:03d} | Train: {train_loss/len(loader):.4f} | "
-                  f"Val: {v_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}{fds_tag}")
+                  f"Val: {v_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
 
         if epochs_no_improve >= patience:
             print(f"\nEarly stopping at Epoch {epoch+1}")
             break
 
-    print(f"Best Stage 1 MoE model saved to: {save_path}")
-
-    # ------------------------------------------------------------------ #
-    # Stage 2 — pluggable calibration on the expert heads (head_key='experts') #
-    # ------------------------------------------------------------------ #
-    run_stage2(model, X_tr, y_tr, params, device, save_path, season=s_tr, head_key='experts')
+    print(f"Best MoE model saved to: {save_path}")
 
 
 # ---------------------------------------------------------------------------

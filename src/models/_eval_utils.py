@@ -396,6 +396,29 @@ class EvalUtils:
         detailed_df.drop(columns=['date']).to_csv(csv_path, index=False)
         print(f"Detailed errors saved to: {csv_path}")
 
+        # Persist the headline metrics next to the plots so a run's score is a file, not a
+        # line that scrolled off the terminal. Peak MAPE (top-10% load hours) + worst/best day
+        # are included because they are the numbers we keep going back to look up.
+        peak_thr  = np.quantile(flat_true, 0.9)
+        peak_mask = flat_true >= peak_thr
+        peak_mape = mean_absolute_percentage_error(flat_true[peak_mask], flat_pred[peak_mask]) * 100
+        txt_path = os.path.join(result_dir, f'{model_name}_metrics.txt')
+        with open(txt_path, 'w') as f:
+            f.write(f"{model_name} — evaluation metrics\n")
+            f.write(f"generated:    {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}\n")
+            f.write(f"result_dir:   {result_dir}\n")
+            f.write(f"test samples: {len(flat_true)} ({detailed_df['date'].nunique()} days)"
+                    f"{'' if full else f', hours={hcols}'}\n\n")
+            f.write(f"MAPE:      {mape:8.3f} %\n")
+            f.write(f"MAE:       {mae:8.2f} MW\n")
+            f.write(f"RMSE:      {rmse:8.2f} MW\n")
+            f.write(f"ME (bias): {me:+8.2f} MW ({bias_dir}-prediction)\n")
+            f.write(f"BRS:       {brs:+8.4f} MW/MW ({brs_dir})\n")
+            f.write(f"Peak MAPE (top 10% load hours): {peak_mape:.3f} %\n")
+            f.write(f"Worst day: {daily_mape.index[0]} ({daily_mape.iloc[0]:.2f}%)\n")
+            f.write(f"Best day:  {daily_mape.index[-1]} ({daily_mape.iloc[-1]:.2f}%)\n")
+        print(f"Metrics summary saved to: {txt_path}")
+
         EvalUtils.plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, result_dir, hours=hcols)
         EvalUtils.plot_error_histogram(model_name, detailed_df, result_dir)
         EvalUtils.plot_error_cdf(model_name, detailed_df, result_dir)

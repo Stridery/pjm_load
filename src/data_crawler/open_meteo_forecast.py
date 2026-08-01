@@ -3,7 +3,7 @@
 Why this exists
 ---------------
 Every model in this repo currently sees the forecast day's CALENDAR and nothing
-else about it — no weather at all (see src/prediction_engine.FORECAST_HORIZON_DAYS).
+else about it — no weather at all.
 This module fetches the other half: for each issue date D, the 48 h forecast issued
 that day, covering D+1 00:00 – D+2 23:00.
 

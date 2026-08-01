@@ -12,7 +12,6 @@ Output
 ------
     data/{zone}/joined/merged_pjm_load_weather.csv     load + observed weather
     data/{zone}/cleaned/cleaned_pjm_load_weather.csv   labelled rows  → training
-    data/{zone}/cleaned/predict.csv                    all rows, no Load → forecasting
 
 The forecast files are a side output on their own index (issue date x lead), not part
 of the joined/cleaned frames — see Step 3b for why.
@@ -103,8 +102,22 @@ def load_metered(metered_dir: str) -> pd.DataFrame:
         "datetime_beginning_ept": "Datetime_EPT",
         "mw":                     "Load_Metered",
     })
-    df = df[["Datetime_EPT", "Load_Metered"]]
     df = df[~df.index.duplicated(keep="first")].sort_index()
+
+    # Drop the recent unverified tail. PJM marks the latest days is_verified=False until it
+    # finalises them; keep only through the last verified hour (by UTC) so the label series is
+    # all verified metered load. Earlier interspersed unverified hours (if any) are left alone.
+    if "is_verified" in df.columns:
+        is_true = df["is_verified"].astype(str).str.strip().str.lower().isin(["true", "1"])
+        if is_true.any():
+            last_verified = df.index[is_true].max()
+            n_before = len(df)
+            df = df[df.index <= last_verified]
+            if len(df) < n_before:
+                logger.info("Metered: dropped %d unverified tail row(s) after %s",
+                            n_before - len(df), last_verified)
+
+    df = df[["Datetime_EPT", "Load_Metered"]]
     logger.info("Metered load: %d rows  (%s → %s)",
                 len(df), df.index[0], df.index[-1])
     return df
@@ -178,6 +191,7 @@ def run_pipeline(
     timezone: str | None = None,
     data_root: str = "data",
     skip_existing: bool = True,
+    clear_matrix: bool = True,
 ) -> pd.DataFrame:
     """
     Full pipeline: concat manual PJM CSVs + crawl Open-Meteo weather → joined CSV.
@@ -212,6 +226,19 @@ def run_pipeline(
     os.makedirs(joined_dir,   exist_ok=True)
     joined_path = os.path.join(joined_dir, "merged_pjm_load_weather.csv")
 
+    # Step 0 – Auto-fetch PJM metered + preliminary load (writes raw/metered, raw/preliminary).
+    # Which years to fetch is set in config (UPDATE_YEARS, shared by all four sources); only
+    # those are (re)fetched, everything else loads from its cached file. --no-skip re-fetches
+    # the whole config range instead.
+    from src.config import UPDATE_YEARS
+    from src.data_crawler.pjm_load import fetch_load
+    if skip_existing:
+        met_years = pre_years = UPDATE_YEARS
+    else:
+        full = list(range(start_year or cfg["start_year"], (end_year or cfg["end_year"]) + 1))
+        met_years = pre_years = full
+    fetch_load(zone, met_years, pre_years, raw_dir)
+
     # Step 1 & 2 – Load and concat PJM CSVs
     logger.info("=== Step 1: Loading metered load from %s ===", metered_dir)
     metered = load_metered(metered_dir)
@@ -240,10 +267,13 @@ def run_pipeline(
     logger.info("=== Step 3: Geocoding '%s' ===", location_name)
     lat, lon = om.geocode(location_name)
 
+    # Weather shares UPDATE_YEARS with load: force-refresh those years, load the rest from cache.
+    # --no-skip (skip_existing=False) re-fetches every year in the range.
     weather_frames: list[pd.DataFrame] = []
     for year in range(start_year, end_year + 1):
+        load_cached = skip_existing and (year not in UPDATE_YEARS)
         weather_frames.append(
-            _fetch_or_load_weather(lat, lon, year, weather_dir, timezone, skip_existing)
+            _fetch_or_load_weather(lat, lon, year, weather_dir, timezone, load_cached)
         )
 
     all_weather = pd.concat(weather_frames)
@@ -267,9 +297,11 @@ def run_pipeline(
     #           before — the forecast features get spliced in at matrix-build time, for
     #           the runs that ask for them.
     logger.info("=== Step 3b: Fetching archived weather forecasts ===")
+    # Forecast archive shares UPDATE_YEARS too: force-refresh those years, load the rest.
     fc_frames = [
-        omf.fetch_or_load_forecast_year(lat, lon, year, forecast_dir,
-                                        timezone=timezone, skip_existing=skip_existing)
+        omf.fetch_or_load_forecast_year(
+            lat, lon, year, forecast_dir, timezone=timezone,
+            skip_existing=skip_existing and (year not in UPDATE_YEARS))
         for year in range(start_year, end_year + 1)
     ]
     fc_rows = sum(len(f) for f in fc_frames)
@@ -323,32 +355,17 @@ def run_pipeline(
     # so the feature layer reads one path and never has to know the shards exist.
     clean_forecast(forecast_dir, os.path.join(cleaned_dir, "forecast.csv"))
 
-    # Step 7 – Split into the training view and the forecast view.
+    # Step 7 – Write the training view: labelled rows only (metered present), Load kept.
     #
-    # Metered (verified) lags ~7 days behind preliminary, so the most recent hours have
-    # Load_Estimated + weather but no Load. Every model INPUT comes from Load_Estimated
-    # and weather; only the label needs metered. So those hours are not junk — they are
-    # the days we forecast.
-    #
-    # train  : labelled rows only. Identical in shape to what training always consumed,
-    #          so nothing downstream changes: no NaN labels reach the loss, none leak
-    #          into the tail split (sklearn's MAPE does not skip NaN — a single NaN
-    #          label in the test set turns the reported MAPE into `nan`), and
-    #          split_idx = int(len(df) * (1 - test_frac)) keeps meaning what it meant.
-    # predict: EVERY row, with Load dropped. Not just the unlabelled tail — forecasting
-    #          one day reads 504 h (21 d) of history for the macro features, so the
-    #          recent days are worthless without the labelled history in front of them.
-    #          Dropping the column makes it impossible to train or score against a NaN.
-    predict_path = os.path.join(cleaned_dir, "predict.csv")
+    # The forecast INPUT (the "predict" view — all rows incl. the unlabelled recent tail,
+    # Load dropped) is no longer produced here. Serving is a separate daily concern: it
+    # maintains its own rolling recent-window input, so the crawler stays a train-only path.
+    train = cleaned[cleaned["has_label"] == 1].drop(columns=["has_label"])
 
-    train   = cleaned[cleaned["has_label"] == 1].drop(columns=["has_label"])
-    predict = cleaned.drop(columns=["Load", "is_valid"], errors="ignore")
-
-    # Dropping the unlabelled rows is only safe because they form a single block at the
-    # END. The lookback is sliced BY POSITION (data_array[cutoff-168 : cutoff]), so a
-    # hole punched in the middle would make "168 rows" silently span more than 168 hours
-    # and corrupt every window that crosses it — without raising. Refuse to write a
-    # training file that would do that.
+    # Contiguity guard: the lookback is sliced BY POSITION (data_array[cutoff-168 : cutoff]),
+    # so a hole in the middle of the labelled hours would make "168 rows" silently span more
+    # than 168 hours and corrupt every window that crosses it — without raising. Refuse to
+    # write a training file that would do that.
     step = train.index.to_series().diff().dropna()
     holes = step[step != pd.Timedelta("1h")]
     if len(holes):
@@ -359,25 +376,25 @@ def run_pipeline(
             f"file would silently corrupt every lookback window that crosses a gap."
         )
 
-    na_cols = predict.columns[predict.isna().any()].tolist()
-    if na_cols:
-        raise ValueError(
-            f"Prediction view has NaNs in {na_cols}. A NaN anywhere inside a 168 h "
-            f"lookback window silently turns that day's whole forecast into NaN, so "
-            f"this must be fixed upstream rather than filled here."
-        )
-
     train.to_csv(cleaned_path)
     logger.info(
         "=== Training CSV saved → %s  (%d rows × %d cols, %s → %s) ===",
         cleaned_path, *train.shape, train.index[0], train.index[-1],
     )
 
-    predict.to_csv(predict_path)
-    n_target = int((predict["has_label"] == 0).sum())
-    logger.info(
-        "=== Prediction CSV saved → %s  (%d rows × %d cols; %d h with no metered yet "
-        "= %.0f forecastable days) ===",
-        predict_path, *predict.shape, n_target, n_target / 24,
-    )
+    # Step 8 – Wipe the stale matrix cache so the NEXT training run rebuilds from this fresh
+    # cleaned CSV. The feature builders cache aggressively (built once, reused across every
+    # model block and evaluator), so without this a re-crawl would silently keep training on
+    # the previous data. Pass clear_matrix=False (run_crawler --keep-matrix) to keep them.
+    if clear_matrix:
+        import glob
+        import shutil
+        wiped = 0
+        for mdir in sorted(glob.glob(os.path.join(data_root, zone, "matrix*"))):
+            shutil.rmtree(mdir, ignore_errors=True)
+            logger.info("Cleared stale matrix cache: %s", mdir)
+            wiped += 1
+        if not wiped:
+            logger.info("No matrix cache to clear under %s", os.path.join(data_root, zone))
+
     return train

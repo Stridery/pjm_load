@@ -34,7 +34,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 import joblib
-import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,7 +47,7 @@ _LAG_RE = re.compile(r'_h(\d+)$')          # trailing "_h<k>" = flattened lookba
 
 def default_model_path():
     tf = cfg.TREE_FEATURE_CONFIG
-    tag = f"{tf['split_strategy']}_test{tf['test_frac']}{cfg.run_suffix(cfg.XGB_PARAMS)}"
+    tag = f"{tf['split_strategy']}_test{tf['test_frac']}"
     return os.path.join(cfg.MODEL_ROOT, 'xgboost', tag, 'xgboost_24_models.pkl')
 
 

@@ -6,7 +6,6 @@ from tqdm import tqdm
 
 from src.models._utils import _make_run_dir
 from src.models._eval_utils import EvalUtils
-from src.models._lds import compute_lds_weights
 from src.config import TREE_FEATURE_CONFIG, LGBM_PARAMS
 
 
@@ -18,29 +17,17 @@ def train(X_train, y_train, params=None, feature_cfg=None):
     print("\n--- Training LightGBM Experts ---")
     feature_cfg = feature_cfg or TREE_FEATURE_CONFIG
 
-    # Copy so we can pop internal flags without mutating the caller's dict
     _params = {**(params or LGBM_PARAMS)}
-    use_lds       = _params.pop('use_lds', False)
-    lds_bin_width = _params.pop('lds_bin_width', 200.0)
-    lds_ks        = _params.pop('lds_ks', 5)
-    lds_sigma     = _params.pop('lds_sigma', 2.0)
-    lds_min_freq  = _params.pop('lds_min_freq_ratio', 0.05)
-
-    model_dir = _make_run_dir('models', 'lightgbm', feature_cfg, params=(params or LGBM_PARAMS))
+    model_dir = _make_run_dir('models', 'lightgbm', feature_cfg)
 
     print("LightGBM device: cpu")
-    print(f"LightGBM LDS:    {'enabled' if use_lds else 'disabled'}")
-    # Surgery: all remaining features are continuous (windowed numerics + cyclical
-    # sin/cos encodings) — no categorical columns left to declare.
+    # All features are continuous (windowed numerics + cyclical sin/cos) — no categoricals.
 
     models = []
     for h in tqdm(range(24), desc="LightGBM"):
         y_h = y_train[f'h{h}'].values
-        weights = compute_lds_weights(
-            y_h, bin_width=lds_bin_width, ks=lds_ks, sigma=lds_sigma, min_freq_ratio=lds_min_freq
-        ) if use_lds else None
         model = lgb.LGBMRegressor(**_params, n_estimators=1000)
-        model.fit(X_train, y_h, sample_weight=weights)
+        model.fit(X_train, y_h)
         models.append(model)
 
     save_path = os.path.join(model_dir, 'lightgbm_24_models.pkl')

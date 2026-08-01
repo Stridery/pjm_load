@@ -5,23 +5,6 @@ import numpy as np
 import os
 from pandas.tseries.holiday import USFederalHolidayCalendar as calendar
 
-def merge_raw_data(load_path, weather_path, output_path):
-    print("=== Merging Raw Data ===")
-    df_load = pd.read_csv(load_path)
-    df_load['date'] = pd.to_datetime(df_load['date'])
-    df_load = df_load.set_index('date')
-    df_load.rename(columns={'load': 'Load'}, inplace=True)
-
-    df_weather = pd.read_csv(weather_path)
-    df_weather['time'] = pd.to_datetime(df_weather['time'])
-    df_weather = df_weather.set_index('time')
-
-    df = df_load.join(df_weather, how='inner')
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    df.to_csv(output_path)
-    print(f"- Merged data saved to {output_path}. Shape: {df.shape}")
-    return df
-
 FC_LEAD_DAYS = (1, 2)                 # the two days a forecast issued on D covers
 FC_HOURS_PER_ISSUE = 24 * len(FC_LEAD_DAYS)
 

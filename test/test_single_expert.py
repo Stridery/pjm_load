@@ -11,9 +11,8 @@ per-expert eval reports on — directly comparable.
 Pipeline: build matrix -> filter to (season, hours) -> train -> predict ->
 evaluate (full EvalUtils suite, restricted to the expert's hours) -> save.
 
-The model, LDS, FDS and 2-stage calibration are all driven by TRANSFORMER_PARAMS
-in src/config.py (use_lds / use_fds / stage2_epochs / stage2_mode / ...), exactly
-like the vanilla transformer. Toggle them there.
+The model is driven by TRANSFORMER_PARAMS in src/config.py, exactly like the
+vanilla transformer.
 
 Usage:
   python test/test_single_expert.py                          # summer / low
@@ -46,9 +45,7 @@ from src.feature_engine import build_timeseries_matrix, _split_indices, apply_em
 from src.models.moe_transformer import season_indices
 from src.models.transformer import TimeSeriesTransformer3D, predict as tr_predict
 from src.models._eval_utils import EvalUtils
-from src.models._lds import compute_lds_weights
-from src.models._fds import FDSModule
-from src.models._seq_trainer import run_stage2, make_criterion, _loss_tag
+from src.models._seq_trainer import make_criterion, _loss_tag
 
 
 def _season_filter(idx, season_of_all, season_i):
@@ -57,77 +54,33 @@ def _season_filter(idx, season_of_all, season_i):
 
 
 def _train(Xtr, ytr, Xva, yva, params, device, save_path):
-    """Stage-1 (L1 + optional LDS/FDS) with early stopping, then optional Stage-2.
-
-    LDS / FDS / 2-stage are all toggled by the transformer config
-    (use_lds / use_fds / stage2_epochs), mirroring src/models/_seq_trainer.py.
-    """
-    use_lds = params.get('use_lds', False)
-    use_fds = params.get('use_fds', False)
-
+    """Plain Huber/L1 training with early stopping."""
     model = TimeSeriesTransformer3D(Xtr.shape[2], params).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=params['learning_rate'],
                             weight_decay=params['weight_decay'])
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', factor=0.5, patience=10)
 
-    # --- LDS per-day sample weights (representative = mean scaled load) ---
-    if use_lds:
-        day_rep = ytr.mean(axis=1)
-        w = compute_lds_weights(
-            day_rep, bin_width=params.get('lds_bin_width', 200.0),
-            ks=params.get('lds_ks', 5), sigma=params.get('lds_sigma', 2.0),
-            min_freq_ratio=params.get('lds_min_freq_ratio', 0.05))
-        print(f"LDS: enabled | weight range [{w.min():.3f}, {w.max():.3f}]")
-    else:
-        w = np.ones(len(ytr), dtype=np.float32)
-
-    X_tr = torch.FloatTensor(Xtr)
-    y_tr = torch.FloatTensor(ytr)
-    loader = DataLoader(TensorDataset(X_tr, y_tr, torch.FloatTensor(w)),
+    loader = DataLoader(TensorDataset(torch.FloatTensor(Xtr), torch.FloatTensor(ytr)),
                         batch_size=params['batch_size'], shuffle=True)
     Xva_t = torch.FloatTensor(Xva).to(device)
     yva_t = torch.FloatTensor(yva).to(device)
 
-    # --- FDS module (calibrates the encoder representation) ---
-    fds, fds_start = None, 0
-    if use_fds:
-        fds_start = params.get('fds_start_epoch', 5)
-        fds = FDSModule(feature_dim=params['d_model'], bin_width=params.get('fds_bin_width', 200.0),
-                        ks=params.get('fds_ks', 5), sigma=params.get('fds_sigma', 2.0),
-                        momentum=params.get('fds_momentum', 0.1))
-        print(f"FDS: enabled | feat_dim={params['d_model']} | start_epoch={fds_start}")
-
-    train_crit = make_criterion(params, reduction='none')
-    val_crit = make_criterion(params)
+    criterion = make_criterion(params)
+    val_crit  = make_criterion(params)
     print(f"Loss: {_loss_tag(params)}")
     patience = params.get('early_stop_patience', 50)
     best, no_improve = float('inf'), 0
 
-    # ---------------- Stage 1 — L1 + LDS + FDS ---------------- #
     for ep in range(params['epochs']):
         model.train(); tl = 0.0
-        for bx, by, bw in loader:
-            bx, by, bw = bx.to(device), by.to(device), bw.to(device)
+        for bx, by in loader:
+            bx, by = bx.to(device), by.to(device)
             opt.zero_grad()
-            if use_fds:
-                features_raw = model.encode(bx)
-                by_rep = by.mean(dim=1)
-                if ep >= fds_start and fds._ready:
-                    features = fds.calibrate(features_raw, by_rep)
-                else:
-                    features = features_raw
-                pred = model.decode(features)
-            else:
-                pred = model(bx)
-            loss = (train_crit(pred, by) * bw.unsqueeze(1)).mean()
+            loss = criterion(model(bx), by)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             tl += loss.item()
-            if use_fds:
-                fds.collect(features_raw, by_rep)
-        if use_fds:
-            fds.update_and_smooth()
 
         model.eval()
         with torch.no_grad():
@@ -139,18 +92,12 @@ def _train(Xtr, ytr, Xva, yva, params, device, save_path):
         else:
             no_improve += 1
         if (ep + 1) % 10 == 0:
-            tag = ''
-            if use_fds:
-                tag = f' | FDS {"active" if (fds._ready and ep >= fds_start) else "warmup"}'
             print(f"Epoch {ep+1:03d} | Train {tl/len(loader):.4f} | Val {vl:.4f} "
-                  f"| LR {opt.param_groups[0]['lr']:.6f}{tag}")
+                  f"| LR {opt.param_groups[0]['lr']:.6f}")
         if no_improve >= patience:
             print(f"Early stopping at epoch {ep+1}")
             break
-    print(f"Best Stage-1 val loss: {best:.4f} -> {save_path}")
-
-    # ---------------- Stage 2 — pluggable calibration of fc_out ---------------- #
-    run_stage2(model, X_tr, y_tr, params, device, save_path)   # head_key='fc_out', season=None
+    print(f"Best val loss: {best:.4f} -> {save_path}")
 
 
 def main():

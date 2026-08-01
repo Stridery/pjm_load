@@ -7,7 +7,7 @@ from sklearn.preprocessing import StandardScaler
 import joblib
 from src.config import (
     TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG, WEATHER_COLS, EMBARGO_DAYS,
-    USE_FORECAST_WEATHER, FORECAST_PATH,
+    FORECAST_PATH,
 )
 from src.macro_features import compute_macro_features, MACRO_FEATURE_NAMES, MACRO_WINDOW_HOURS
 from src.thermal_features import (
@@ -19,16 +19,14 @@ from src.forecast_features import (
 )
 
 
-def _load_forecast(enabled=None):
-    """The forecast lookup table, or None when the feature set is off.
+def _load_forecast():
+    """The forecast lookup table (always loaded — forecast weather is the only feature set).
 
-    Kept in one place so both builders and the forecast-time mirror in prediction_engine
-    open the same file under the same switch, and so the sample counts they report line up.
+    Kept in one place so both builders (and any forecast-time mirror that reuses them) open the
+    same file, and so the sample counts they report line up.
     """
-    if not (USE_FORECAST_WEATHER if enabled is None else enabled):
-        return None
     table = load_forecast_table(FORECAST_PATH)
-    print(f"Forecast weather: ENABLED — {len(table)} complete issue date(s) from {FORECAST_PATH}")
+    print(f"Forecast weather: {len(table)} complete issue date(s) from {FORECAST_PATH}")
     return table
 
 
@@ -89,6 +87,10 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     x_path = os.path.join(matrix_dir, f'X_opt_lb{lookback_hours}_h{latest_info_hour}.csv')
     y_path = os.path.join(matrix_dir, f'y_opt_lb{lookback_hours}_h{latest_info_hour}.csv')
 
+    # Cache-load: a run touches the builders many times (each model block + each evaluator),
+    # so building once and reusing keeps a run fast. Freshness is handled UPSTREAM — the
+    # crawler wipes data/{zone}/matrix* after a re-crawl (run_pipeline clear_matrix), so a
+    # cached matrix here only ever reflects the current cleaned CSV.
     if os.path.exists(x_path) and os.path.exists(y_path):
         print("=== Loading Pre-built 2D Matrix ===")
         return pd.read_csv(x_path, index_col=0, parse_dates=True), \
@@ -141,16 +143,14 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
         if y_tomorrow is None:
             continue
 
-        # A day with no complete forecast is not forecastable by this feature set, so it is
-        # dropped from the matrix entirely rather than carried with zeros — the model would
-        # otherwise read "no departure from normal" on days where we simply do not know.
-        fc_raw = None
-        if fc_table is not None:
-            fc_raw = _forecast_for(fc_table, tomorrow, temp_raw, ept_hours,
-                                   cutoff_pos, lookback_hours, thr)
-            if fc_raw is None:
-                n_no_fc += 1
-                continue
+        # A day with no complete forecast is not forecastable, so it is dropped from the matrix
+        # entirely rather than carried with zeros — the model would otherwise read "no departure
+        # from normal" on days where we simply do not know.
+        fc_raw = _forecast_for(fc_table, tomorrow, temp_raw, ept_hours,
+                               cutoff_pos, lookback_hours, thr)
+        if fc_raw is None:
+            n_no_fc += 1
+            continue
 
         tmrw_valid = 1 if valid_raw[tmrw_pos].all() else 0
         past_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]
@@ -182,9 +182,8 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
             day_index[ept_dates[cutoff_pos - 1]], heat_streak, climatology)
         for nm, val in zip(THERMAL_STATIC_NAMES, thermal_raw):
             f[nm] = float(val)
-        if fc_raw is not None:
-            for nm, val in zip(FC_FEATURE_NAMES, fc_raw):
-                f[nm] = float(val)
+        for nm, val in zip(FC_FEATURE_NAMES, fc_raw):
+            f[nm] = float(val)
         f['is_target_valid'] = tmrw_valid
 
         y_dict = {'timestamp': tomorrow}
@@ -219,6 +218,9 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     macro_scaler_path = os.path.join(matrix_dir, f'macro_scaler_lb{lookback_hours}_h{latest_info_hour}.pkl')
     os.makedirs(matrix_dir, exist_ok=True)
 
+    # Cache-load: a run touches this many times (each model block + each evaluator), so build
+    # once and reuse. Freshness is handled UPSTREAM — the crawler wipes data/{zone}/matrix*
+    # after a re-crawl, so a cached matrix here only reflects the current cleaned CSV.
     if all(os.path.exists(p) for p in [x_path, y_path, mask_path, timestamp_path]):
         print(f"=== Loading 3D Matrix (lb={lookback_hours}, h={latest_info_hour}) ===")
         return np.load(x_path), np.load(y_path), np.load(mask_path), np.load(timestamp_path, allow_pickle=True)
@@ -256,7 +258,6 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     # weeks and is not available for these windows at forecast time.
     est_raw       = df['Load_Estimated'].values
     is_valid_array = df['is_valid'].values
-    timestamps    = df.index
     unique_days   = np.unique(ept_dates)
 
     # Enough history for both the lookback window and the 3-week macro features.
@@ -294,26 +295,23 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
 
         # Same rule as the 2D builder: no complete forecast, no sample. Zero-filling would
         # read as "exactly normal" on precisely the days we know nothing about.
-        fc_raw = None
-        if fc_table is not None:
-            fc_raw = _forecast_for(fc_table, tomorrow, temp_raw, ept_hours,
-                                   cutoff_pos, lookback_hours, thr)
-            if fc_raw is None:
-                n_no_fc += 1
-                continue
+        fc_raw = _forecast_for(fc_table, tomorrow, temp_raw, ept_hours,
+                               cutoff_pos, lookback_hours, thr)
+        if fc_raw is None:
+            n_no_fc += 1
+            continue
 
         is_seq_valid = bool(is_valid_array[tmrw_pos].all())
         X_window     = data_array[cutoff_pos - lookback_hours : cutoff_pos]
 
-        # Per-sample static (broadcast) numeric features: 3-week macro + thermal state
-        # (+ the 48 h forecast departures when that feature set is on).
+        # Per-sample static (broadcast) numeric features: 3-week macro + thermal state + the
+        # 48 h forecast departures.
         macro_raw   = compute_macro_features(est_raw, ept_hours, cutoff_pos)
         thermal_raw = compute_thermal_static(
             temp_raw, cdd_raw, doy, cutoff_pos,
             day_index[ept_dates[cutoff_pos - 1]],      # last full day before cutoff
             heat_streak, climatology)
-        static_raw = np.concatenate([macro_raw, thermal_raw]
-                                    + ([fc_raw] if fc_raw is not None else []))
+        static_raw = np.concatenate([macro_raw, thermal_raw, fc_raw])
 
         # Forecast-day (tomorrow) calendar features, broadcast across the window.
         # These condition the prediction on the day being forecast, not the lookback.

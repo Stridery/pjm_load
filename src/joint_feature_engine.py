@@ -100,6 +100,8 @@ def build_joint_timeseries_matrix(
         for z in zones
     }
 
+    # Cache-load: build once per run and reuse. Freshness is handled UPSTREAM — the crawler
+    # wipes matrix* after a re-crawl, so a cached matrix only reflects the current cleaned CSV.
     if all(os.path.exists(p) for p in [x_path, y_path, mask_path, ts_path]):
         logger.info('=== Loading Joint 3D Matrix (lb=%d, h=%d) ===', lb, h)
         y_scalers = {z: joblib.load(ys_paths[z]) for z in zones}

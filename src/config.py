@@ -2,7 +2,7 @@
 import os
 
 # --- Dataset Selection (controls all data / model / result paths) ---
-DATASET = os.environ.get('PJM_DATASET', 'bge')   # override: PJM_DATASET=dom python ...
+DATASET = os.environ.get('PJM_DATASET', 'dom')   # override: PJM_DATASET=dom python ...
 
 # --- Weather Features (per dataset) ---
 # dom columns match the output of data_crawler (Open-Meteo native variables).
@@ -24,34 +24,19 @@ WEATHER_COLS = _WEATHER_COLS.get(DATASET, [])  # empty for 'joint'; joint uses _
 from src.thermal_features import THERMAL_SEQ_COLS   # per-hour thermal feats (go into the lookback)
 N_SEQ_FEATURES = 1 + len(WEATHER_COLS) + len(THERMAL_SEQ_COLS)   # Load + weather + thermal
 
-# --- Forecast Weather (feature set switch) ---
-# Off: models see the forecast day's CALENDAR and nothing else about it — the behaviour
-# every existing result was produced under. On: the 48 h forecast issued the day before
-# the cutoff (day d + the target day) is spliced into the STATIC feature block at matrix
-# build time. See src/forecast_features.py.
-#
-# The cleaned CSVs are identical either way — the forecast lives on its own index in
-# cleaned/forecast.csv and is joined by EPT date, never merged into the hourly frame. Only
-# MATRIX_DIR forks, so turning this on cannot overwrite a baseline matrix and turning it
-# off again reproduces the baseline exactly.
-USE_FORECAST_WEATHER = True     # flip to True to train/evaluate the forecast-weather variant
-_FS = '_fc' if USE_FORECAST_WEATHER else ''
-
-# Everything a run WRITES is keyed by this, not by DATASET, so a forecast-weather run and
-# a baseline run of the same zone cannot overwrite each other's matrices, weights or
-# results. With the switch off it is just DATASET, so every existing path is unchanged.
-DATASET_TAG = f'{DATASET}{_FS}'          # 'dom' | 'dom_fc'
-MODEL_ROOT  = f'models/{DATASET_TAG}'
-RESULT_ROOT = f'results/{DATASET_TAG}'
+# --- Forecast Weather ---
+# Always on: the 48 h forecast issued the day before the cutoff (day d + the target day) is
+# spliced into the STATIC feature block at matrix-build time (see src/forecast_features.py).
+# The cleaned CSVs don't carry it — it lives on its own index in cleaned/forecast.csv and is
+# joined by EPT date. Days without a complete forecast are dropped from the matrix.
+MODEL_ROOT  = f'models/{DATASET}'
+RESULT_ROOT = f'results/{DATASET}'
 
 # --- File Paths ---
-RAW_LOAD_PATH    = f'data/{DATASET}/raw/dom_load.csv'
-RAW_WEATHER_PATH = f'data/{DATASET}/raw/pjm_dominionhub_hourly_2015_2025_openmeteo.csv'
 MERGED_PATH      = f'data/{DATASET}/joined/merged_pjm_load_weather.csv'
 CLEANED_PATH     = f'data/{DATASET}/cleaned/cleaned_pjm_load_weather.csv'   # labelled rows -> training
-PREDICT_PATH     = f'data/{DATASET}/cleaned/predict.csv'                    # all rows, no Load -> forecasting
 FORECAST_PATH    = f'data/{DATASET}/cleaned/forecast.csv'                   # archived weather forecasts
-MATRIX_DIR       = f'data/{DATASET}/matrix{_FS}/'
+MATRIX_DIR       = f'data/{DATASET}/matrix/'
 
 # --- Load_Estimated scale correction (per zone) ---
 # Most zones publish their OWN preliminary load, so Load_Estimated is already at zone scale
@@ -99,25 +84,46 @@ CRAWLER_CONFIG = {
     # All output timestamps are normalised to this local time (naive).
     'timezone': 'America/New_York',
 
-    # Inclusive year range for batch crawling.
-    'start_year': int(os.environ.get('CRAWLER_START_YEAR', 2020)),
+    # Inclusive year range for batch crawling. History starts 2021 (2020 dropped).
+    'start_year': int(os.environ.get('CRAWLER_START_YEAR', 2021)),
     'end_year':   int(os.environ.get('CRAWLER_END_YEAR',   2026)),
 }
 
+# --- PJM load auto-fetch (Dataminer2 CSV-download endpoint) ---
+# Hardcoded per zone. metered uses the zone's own load_area; preliminary uses whatever
+# aggregate PJM actually publishes for it — DOM has its own, but BGE (zone 'BC') has no
+# zone-level preliminary, only the MIDATL regional total (rescaled by LOAD_ESTIMATED_DIVISOR).
+PJM_LOAD_FETCH = {
+    'dom': {'metered_area': 'DOM', 'prelim_area': 'DOM'},
+    'bge': {'metered_area': 'BC',  'prelim_area': 'MIDATL'},
+}
+# Public anonymous key the dataminer2.pjm.com web app ships to every browser — not a secret.
+# Override with your own PJM_API_KEY if you have one.
+PJM_SUBSCRIPTION_KEY = os.environ.get('PJM_API_KEY') or '6a75d9f6d933401dbb4f36f8e70b95b3'
+
+# --- Which years each crawl RE-FETCHES (EDIT THESE per run) ---
+# Only years listed here are fetched — overwriting/creating their per-year files. Every other
+# year is loaded from its cached file (a listed year is force-refreshed even if cached; a
+# missing unlisted year is still auto-fetched so the merge stays complete). `--no-skip` ignores
+# these and re-fetches the whole range.
+# All four sources share ONE list — the recent years whose data is still settling (metered
+# verifies for ~weeks into the next year; weather/forecast revise for a few days).
+UPDATE_YEARS = [2025, 2026]   # metered, preliminary, observed weather, weather-forecast archive
+
 # --- Models to Train (1 = train, 0 = skip) ---
 TRAIN_CONFIG = {
-    'xgboost':              0,
-    'lightgbm':             0,
-    'transformer':          0,
-    'lstm':                 0,
+    'xgboost':              1,
+    'lightgbm':             1,
+    'transformer':          1,
+    'lstm':                 1,
     'moe_transformer':      1,
-    'mstnn':                0,
-    'xgboost_residual':     0,
+    'mstnn':                1,
+    'xgboost_residual':     1,
     'transformer_residual': 1,
     'moe_transformer_residual': 1,
-    'mstnn_residual':      0,
-    'moe_mstnn':           0,
-    'moe_mstnn_residual':  0,
+    'mstnn_residual':      1,
+    'moe_mstnn':           1,
+    'moe_mstnn_residual':  1,
 }
 
 # ---------------------------------------------------------------------------
@@ -194,11 +200,6 @@ XGB_PARAMS = {
     'reg_alpha': 0.5117878514902956,
     'random_state': 42,
     'n_jobs': -1,
-    'use_lds': True,
-    'lds_bin_width': 40.0,
-    'lds_ks': 5,
-    'lds_sigma': 2.0,
-    'lds_min_freq_ratio': 0.05,
 }
 
 LGBM_PARAMS = {
@@ -217,11 +218,6 @@ LGBM_PARAMS = {
     'lambda_l2': 1.4022452913170822,
     'min_child_samples': 40,
     'n_jobs': -1,
-    'use_lds': False,
-    'lds_bin_width': 200.0,
-    'lds_ks': 5,
-    'lds_sigma': 2.0,
-    'lds_min_freq_ratio': 0.05,
 }
 
 # --- Transformer Feature Generation ---
@@ -251,25 +247,7 @@ TRANSFORMER_PARAMS = {
     'batch_size': 32,
     'learning_rate': 3e-4,
     'weight_decay': 1e-4,
-    'use_lds': True,
-    'lds_bin_width': 0.2,
-    'lds_ks': 5,
-    'lds_sigma': 1.0,
-    'lds_min_freq_ratio': 0.05,
-    'use_fds': True,
-    'fds_start_epoch': 30,
-    'fds_bin_width': 0.2,
-    'fds_ks': 5,
-    'fds_sigma': 0.5,
-    'fds_momentum': 0.1,   # EMA weight on current epoch's stats (lower = more stable history)
     'early_stop_patience': 50,
-    'stage2_epochs': 0,        # Stage 2 calibration epochs (0 = disabled)
-    'stage2_mode': 'pinball',       # 'mse' | 'bft' | 'pinball'
-    'stage2_lr': 3e-4,
-    'stage2_bft_n_bins': 10,    # bft: equal-width load bins for resampling
-    'stage2_q_max': 0.6,        # pinball: max quantile target for peak-load hours
-    'stage2_p': 4.0,            # pinball: curvature of q(load_pct) schedule
-    'stage2_routing': 'pred',   # pinball: 'pred' (deployable) | 'true' (diagnostic upper bound)
 }
 
 # --- MoE Transformer (shares the same 3D matrix + feature config as Transformer) ---
@@ -297,26 +275,8 @@ MOE_TRANSFORMER_PARAMS = {
     'learning_rate': 3e-4,
     'weight_decay': 1e-4,
     'early_stop_patience': 50,
-    'use_lds': True,          # per-day LDS sample weighting (same scheme as transformer)
-    'lds_bin_width': 0.2,
-    'lds_ks': 5,
-    'lds_sigma': 1.0,
-    'lds_min_freq_ratio': 0.05,
     # --- FDS: feature (encoder-representation) distribution smoothing ---
-    'use_fds': True,
-    'fds_start_epoch': 30,
-    'fds_bin_width': 0.2,
-    'fds_ks': 5,
-    'fds_sigma': 0.5,
-    'fds_momentum': 0.1,       # EMA weight on current epoch's stats (lower = more stable)
     # --- Stage 2: pluggable calibration of the expert heads (freezes encoder) ---
-    'stage2_epochs': 0,        # 0 = disabled
-    'stage2_mode': 'pinball',  # 'mse' | 'bft' | 'pinball'
-    'stage2_lr': 3e-4,
-    'stage2_bft_n_bins': 10,   # bft: equal-frequency load bins for resampling
-    'stage2_q_max': 0.6,       # pinball: max quantile target for peak-load hours
-    'stage2_p': 4.0,           # pinball: curvature of q(load_pct) schedule
-    'stage2_routing': 'pred',  # pinball: 'pred' (deployable) | 'true' (diagnostic upper bound)
 }
 
 # --- MoE Transformer RESIDUAL (same architecture, learns y_metered - baseline) ---
@@ -349,19 +309,6 @@ MSTNN_PARAMS = {
     'learning_rate': 3e-4,
     'weight_decay': 1e-4,
     'early_stop_patience': 50,
-    'use_lds': False,
-    'lds_bin_width': 0.2,
-    'lds_ks': 5,
-    'lds_sigma': 1.0,
-    'lds_min_freq_ratio': 0.05,
-    'use_fds': False,               # FDS needs a fixed encoder feat_dim; not wired for MSTNN
-    'stage2_epochs': 0,             # 0 = disabled; 'mse' | 'bft' | 'pinball' supported
-    'stage2_mode': 'pinball',
-    'stage2_lr': 3e-4,
-    'stage2_bft_n_bins': 10,
-    'stage2_q_max': 0.6,
-    'stage2_p': 4.0,
-    'stage2_routing': 'pred',
 }
 
 # --- LSTM Feature Generation (shares the same 3D matrix as Transformer) ---
@@ -388,25 +335,7 @@ LSTM_PARAMS = {
     'batch_size': 32,
     'learning_rate': 1e-3,
     'weight_decay': 1e-4,
-    'use_lds': False,
-    'lds_bin_width': 0.2,
-    'lds_ks': 5,
-    'lds_sigma': 1,
-    'lds_min_freq_ratio': 0.05,
-    'use_fds': False,
-    'fds_start_epoch': 30,
-    'fds_bin_width': 0.2,
-    'fds_ks': 5,
-    'fds_sigma': 0.5,
-    'fds_momentum': 0.1,
     'early_stop_patience': 50,
-    'stage2_epochs': 0,
-    'stage2_mode': 'pinball',       # 'mse' | 'bft' | 'pinball'
-    'stage2_lr': 1e-4,
-    'stage2_bft_n_bins': 10,    # bft: equal-width load bins for resampling
-    'stage2_q_max': 0.6,
-    'stage2_p': 4.0,
-    'stage2_routing': 'pred',
 }
 
 # --- Joint Model Configuration ---
@@ -465,9 +394,6 @@ XGB_RESIDUAL_PARAMS = {
 TRANSFORMER_RESIDUAL_PARAMS = {
     **TRANSFORMER_PARAMS,
     'baseline': _RESIDUAL_BASELINE,
-    # NOTE: use_lds / use_fds bin on the TARGET, which for this model is the residual and
-    # not the load. Inherited from TRANSFORMER_PARAMS on purpose ("same model, only the
-    # target changes"), but it is a different thing than it is over there.
 }
 
 # --- MSTNN RESIDUAL (same MSTNN, learns y_metered - baseline) ---
@@ -487,36 +413,6 @@ MOE_MSTNN_RESIDUAL_PARAMS = {
     'baseline': _RESIDUAL_BASELINE,
 }
 
-# --- Path suffixes (derived from param dicts, appended to model directory names) ---
-# LDS, FDS and Stage-2 are INDEPENDENT knobs — each gets its own token, kept separate in the
-# path (e.g. an FDS-only run is just '_fds', an LDS-only run is just '_lds') so no combination
-# is hidden. The three _tag_* helpers are the single source of truth: run_suffix (used by
-# _make_run_dir on the TRAIN side) composes the exact same tokens the config model_path
-# strings do below, so the directory a run writes and the path the evaluator/predictor read
-# can never drift — which is how runs used to land tagged '_lds' while FDS was silently on.
-def _tag_lds(p): return '_lds' if p.get('use_lds') else ''
-def _tag_fds(p): return '_fds' if p.get('use_fds') else ''
-def _tag_s2(p):  return ('_s2' + str(p.get('stage2_mode', 'pinball'))) if p.get('stage2_epochs', 0) > 0 else ''
-
-def run_suffix(params):
-    """Variant tag for a run directory: independent _lds / _fds / _s2<mode> tokens, in order."""
-    return _tag_lds(params) + _tag_fds(params) + _tag_s2(params)
-
-# Per-model, per-knob tokens. Independent on purpose: flip use_lds / use_fds / stage2 in any
-# combination and the directory name reflects exactly that combination.
-_xgb_lds  = _tag_lds(XGB_PARAMS)
-_lgbm_lds = _tag_lds(LGBM_PARAMS)
-_tr_lds,   _tr_fds,   _tr_s2   = _tag_lds(TRANSFORMER_PARAMS), _tag_fds(TRANSFORMER_PARAMS), _tag_s2(TRANSFORMER_PARAMS)
-_lstm_lds, _lstm_fds, _lstm_s2 = _tag_lds(LSTM_PARAMS),        _tag_fds(LSTM_PARAMS),        _tag_s2(LSTM_PARAMS)
-_moe_lds,  _moe_fds,  _moe_s2  = _tag_lds(MOE_TRANSFORMER_PARAMS), _tag_fds(MOE_TRANSFORMER_PARAMS), _tag_s2(MOE_TRANSFORMER_PARAMS)
-_mstnn_lds, _mstnn_fds, _mstnn_s2 = _tag_lds(MSTNN_PARAMS),    _tag_fds(MSTNN_PARAMS),       _tag_s2(MSTNN_PARAMS)
-_moe_res_lds, _moe_res_fds, _moe_res_s2 = _tag_lds(MOE_TRANSFORMER_RESIDUAL_PARAMS), _tag_fds(MOE_TRANSFORMER_RESIDUAL_PARAMS), _tag_s2(MOE_TRANSFORMER_RESIDUAL_PARAMS)
-_xgbres_lds = _tag_lds(XGB_RESIDUAL_PARAMS)
-_trres_lds, _trres_fds, _trres_s2 = _tag_lds(TRANSFORMER_RESIDUAL_PARAMS), _tag_fds(TRANSFORMER_RESIDUAL_PARAMS), _tag_s2(TRANSFORMER_RESIDUAL_PARAMS)
-_mstnnres_lds, _mstnnres_fds, _mstnnres_s2 = _tag_lds(MSTNN_RESIDUAL_PARAMS), _tag_fds(MSTNN_RESIDUAL_PARAMS), _tag_s2(MSTNN_RESIDUAL_PARAMS)
-_moemstnn_lds, _moemstnn_fds, _moemstnn_s2 = _tag_lds(MOE_MSTNN_PARAMS), _tag_fds(MOE_MSTNN_PARAMS), _tag_s2(MOE_MSTNN_PARAMS)
-_moemstnn_res_lds, _moemstnn_res_fds, _moemstnn_res_s2 = _tag_lds(MOE_MSTNN_RESIDUAL_PARAMS), _tag_fds(MOE_MSTNN_RESIDUAL_PARAMS), _tag_s2(MOE_MSTNN_RESIDUAL_PARAMS)
-
 # --- Evaluation Config ---
 EVAL_CONFIG = {
     # Shared test split (all models use the same split)
@@ -531,133 +427,64 @@ EVAL_CONFIG = {
     'models': {
         'xgboost': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/xgboost/tail_test0.1{_xgb_lds}/xgboost_24_models.pkl',
+            'model_path': f'{MODEL_ROOT}/xgboost/tail_test0.1/xgboost_24_models.pkl',
         },
         'lightgbm': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/lightgbm/tail_test0.1{_lgbm_lds}/lightgbm_24_models.pkl',
+            'model_path': f'{MODEL_ROOT}/lightgbm/tail_test0.1/lightgbm_24_models.pkl',
         },
         'transformer': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/transformer/tail_test0.1_tail_val0.1{_tr_lds}{_tr_fds}{_tr_s2}/transformer_best.pth',
+            'model_path': f'{MODEL_ROOT}/transformer/tail_test0.1_tail_val0.1/transformer_best.pth',
         },
         'lstm': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/lstm/tail_test0.1_tail_val0.1{_lstm_lds}{_lstm_fds}{_lstm_s2}/lstm_best.pth',
+            'model_path': f'{MODEL_ROOT}/lstm/tail_test0.1_tail_val0.1/lstm_best.pth',
         },
         'moe_transformer': {
-            'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/moe_transformer/tail_test0.16_tail_val0.19{_moe_lds}{_moe_fds}{_moe_s2}/moe_transformer_best.pth',
+            'enabled': 1,
+            'model_path': f'{MODEL_ROOT}/moe_transformer/tail_test0.16_tail_val0.1/moe_transformer_best.pth',
         },
         'mstnn': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/mstnn/tail_test0.16_tail_val0.19{_mstnn_lds}{_mstnn_fds}{_mstnn_s2}/mstnn_best.pth',
+            'model_path': f'{MODEL_ROOT}/mstnn/tail_test0.16_tail_val0.19/mstnn_best.pth',
         },
         'mstnn_residual': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/mstnn_residual/tail_test0.16_tail_val0.19{_mstnnres_lds}{_mstnnres_fds}{_mstnnres_s2}/mstnn_residual_best.pth',
+            'model_path': f'{MODEL_ROOT}/mstnn_residual/tail_test0.16_tail_val0.19/mstnn_residual_best.pth',
         },
         'moe_mstnn': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/moe_mstnn/tail_test0.16_tail_val0.19{_moemstnn_lds}{_moemstnn_fds}{_moemstnn_s2}/moe_mstnn_best.pth',
+            'model_path': f'{MODEL_ROOT}/moe_mstnn/tail_test0.16_tail_val0.19/moe_mstnn_best.pth',
         },
         'moe_mstnn_residual': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/moe_mstnn_residual/tail_test0.16_tail_val0.19{_moemstnn_res_lds}{_moemstnn_res_fds}{_moemstnn_res_s2}/moe_mstnn_residual_best.pth',
+            'model_path': f'{MODEL_ROOT}/moe_mstnn_residual/tail_test0.16_tail_val0.1/moe_mstnn_residual_best.pth',
         },
         'moe_transformer_residual': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/moe_transformer_residual/tail_test0.16_tail_val0.19{_moe_res_lds}{_moe_res_fds}{_moe_res_s2}/moe_transformer_residual_best.pth',
+            'model_path': f'{MODEL_ROOT}/moe_transformer_residual/tail_test0.16_tail_val0.1/moe_transformer_residual_best.pth',
         },
         'xgboost_residual': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/xgboost_residual/tail_test0.1{_xgbres_lds}/xgboost_residual_24_models.pkl',
+            'model_path': f'{MODEL_ROOT}/xgboost_residual/tail_test0.1/xgboost_residual_24_models.pkl',
         },
         'transformer_residual': {
             'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/transformer_residual/tail_test0.1_tail_val0.1{_trres_lds}{_trres_fds}{_trres_s2}/transformer_residual_best.pth',
+            'model_path': f'{MODEL_ROOT}/transformer_residual/tail_test0.1_tail_val0.1/transformer_residual_best.pth',
         },
     },
 
     # Single-day plot mode: load model, find date in matrix, show plot interactively
     'single_day': {
-        'enabled': 1,
+        'enabled': 0,
         'model': 'moe_transformer_residual',
-        'model_path': f'{MODEL_ROOT}/moe_transformer_residual/tail_test0.16_tail_val0.1{_moe_res_lds}{_moe_res_fds}{_moe_res_s2}/moe_transformer_residual_best.pth',
+        'model_path': f'{MODEL_ROOT}/moe_transformer_residual/tail_test0.16_tail_val0.1/moe_transformer_residual_best.pth',
         'date': '2026-01-24',
     },
 }
 
 # ---------------------------------------------------------------------------
-# Forecast Config  (src/model_predictor.py — run after evaluation, or standalone)
-# ---------------------------------------------------------------------------
-# Forecasts the days PJM has not verified yet: everything in cleaned/predict.csv that
-# has Load_Estimated + weather but no metered Load. Metered lags ~7 days and is only
-# ever the LABEL — every model input comes from Load_Estimated + weather — so those
-# days are fully forecastable, they just have no verified truth yet.
-PREDICT_CONFIG = {
-    'predict_path': PREDICT_PATH,
-    # No result_dir of its own: a model's forecast is written next to that model's
-    # detailed_errors.csv, under EVAL_CONFIG['result_dir'] / {model} / {run_tag}.
-
-    # Score the forecast against the preliminary load series?
-    #   dom: preliminary is load_area=DOM — the zone itself (prelim/metered ratio 1.01).
-    #        A real near-real-time truth. Scored.
-    #   bge: PJM publishes no zone-level preliminary for BC, only the MIDATL regional
-    #        aggregate — but the crawler now divides that to BGE scale at ingest
-    #        (LOAD_ESTIMATED_DIVISOR), giving a same-scale estimate that tracks metered to
-    #        ~3.3% MAPE, comfortably below the model's own error. That is a usable near-real-
-    #        time truth, so bge is scored on the same footing as dom (aligned).
-    'compare_to_preliminary': DATASET in ('dom', 'bge'),
-
-    # Same shape as EVAL_CONFIG['models'] — enable a model and point at its weights.
-    'models': {
-        'xgboost': {
-            'enabled': 1,
-            'model_path': f'{MODEL_ROOT}/xgboost/tail_test0.16{_xgb_lds}/xgboost_24_models.pkl',
-        },
-        'lightgbm': {
-            'enabled': 1,
-            'model_path': f'{MODEL_ROOT}/lightgbm/tail_test0.16{_lgbm_lds}/lightgbm_24_models.pkl',
-        },
-        'transformer': {
-            'enabled': 1,
-            'model_path': f'{MODEL_ROOT}/transformer/tail_test0.16_tail_val0.1{_tr_lds}{_tr_fds}{_tr_s2}/transformer_best.pth',
-        },
-        'lstm': {
-            'enabled': 1,
-            'model_path': f'{MODEL_ROOT}/lstm/tail_test0.16_tail_val0.1{_lstm_lds}{_lstm_fds}{_lstm_s2}/lstm_best.pth',
-        },
-        'moe_transformer': {
-            'enabled': 1,
-            'model_path': f'{MODEL_ROOT}/moe_transformer/tail_test0.16_tail_val0.1{_moe_lds}{_moe_fds}{_moe_s2}/moe_transformer_best.pth',
-        },
-        'mstnn': {
-            'enabled': 1,
-            'model_path': f'{MODEL_ROOT}/mstnn/tail_test0.16_tail_val0.1{_mstnn_lds}{_mstnn_fds}{_mstnn_s2}/mstnn_best.pth',
-        },
-        'mstnn_residual': {
-            'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/mstnn_residual/tail_test0.16_tail_val0.1{_mstnnres_lds}{_mstnnres_fds}{_mstnnres_s2}/mstnn_residual_best.pth',
-        },
-        'moe_mstnn': {
-            'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/moe_mstnn/tail_test0.16_tail_val0.1{_moemstnn_lds}{_moemstnn_fds}{_moemstnn_s2}/moe_mstnn_best.pth',
-        },
-        'moe_mstnn_residual': {
-            'enabled': 0,
-            'model_path': f'{MODEL_ROOT}/moe_mstnn_residual/tail_test0.16_tail_val0.1{_moemstnn_res_lds}{_moemstnn_res_fds}{_moemstnn_res_s2}/moe_mstnn_residual_best.pth',
-        },
-        'xgboost_residual': {
-            'enabled': 1,
-            'model_path': f'{MODEL_ROOT}/xgboost_residual/tail_test0.16{_xgbres_lds}/xgboost_residual_24_models.pkl',
-        },
-        'transformer_residual': {
-            'enabled': 1,
-            'model_path': f'{MODEL_ROOT}/transformer_residual/tail_test0.16_tail_val0.1{_trres_lds}{_trres_fds}{_trres_s2}/transformer_residual_best.pth',
-        },
-    },
-}
 
 # --- Joint Evaluation Config ---
 JOINT_EVAL_CONFIG = {
@@ -670,17 +497,17 @@ JOINT_EVAL_CONFIG = {
     'models': {
         'transformer': {
             'enabled': 1,
-            'model_path': f'models/{JOINT_DATASET}/transformer/tail_test0.1_tail_val0.1{_tr_lds}{_tr_fds}{_tr_s2}/transformer_best.pth',
+            'model_path': f'models/{JOINT_DATASET}/transformer/tail_test0.1_tail_val0.1/transformer_best.pth',
         },
         'lstm': {
             'enabled': 1,
-            'model_path': f'models/{JOINT_DATASET}/lstm/tail_test0.1_tail_val0.1{_lstm_lds}{_lstm_fds}{_lstm_s2}/lstm_best.pth',
+            'model_path': f'models/{JOINT_DATASET}/lstm/tail_test0.1_tail_val0.1/lstm_best.pth',
         },
     },
     'single_day': {
         'enabled':    0,
         'model_type': 'transformer',
-        'model_path': f'models/{JOINT_DATASET}/transformer/tail_test0.1_random_val0.1{_tr_lds}{_tr_fds}{_tr_s2}/transformer_best.pth',
+        'model_path': f'models/{JOINT_DATASET}/transformer/tail_test0.1_random_val0.1/transformer_best.pth',
         'date':       '2024-08-15',
     },
 }

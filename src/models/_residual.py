@@ -138,10 +138,9 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
         return seq, joblib.load(res_path), ysc
 
     def _save_dir(params, dataset):
-        # One code path now: _make_run_dir derives the whole variant tag from params via
-        # run_suffix, exactly as the base trainer (moe.train / train_sequence) does, so the
-        # residual scaler lands in the same directory the weights were written to.
-        return _make_run_dir('models', model_type, feature_cfg, dataset, params=params)
+        # Same directory the base trainer (moe.train / train_sequence) wrote the weights to,
+        # so the residual scaler lands beside them.
+        return _make_run_dir('models', model_type, feature_cfg, dataset)
 
     def _train(X_3d, y_3d, mask_3d, timestamps_3d, params, dataset):
         params = {**(params or params_default)}
@@ -169,9 +168,6 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
         print(f"Residual (MW):    mean {residual_mw[fit_idx].mean():+.1f}  "
               f"std {residual_mw[fit_idx].std():.1f}  -> standardized by its own scaler "
               f"(fit on {len(fit_idx)} train samples only)")
-        if params.get('use_lds') or params.get('use_fds'):
-            print(f"NOTE: use_lds={params.get('use_lds')} use_fds={params.get('use_fds')} — these "
-                  f"bin on the TARGET, which here is the residual, not the load.")
         print_metrics('naive baseline alone (train)', y_mw[fit_idx], baseline[fit_idx])
 
         if is_moe:

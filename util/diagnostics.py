@@ -17,13 +17,8 @@ import pandas as pd
 
 # --- Paths (mirror src/config.py without importing the training stack) ---
 DATASET = os.environ.get("PJM_DATASET", "bge")
-# KEEP IN SYNC with USE_FORECAST_WEATHER in src/config.py. This script mirrors config
-# rather than importing it (see the header), so flipping the switch there and not here
-# means diagnosing the baseline matrix while believing you are looking at the forecast run.
-USE_FORECAST_WEATHER = False
-_FS = "_fc" if USE_FORECAST_WEATHER else ""
-MATRIX_DIR = f"data/{DATASET}/matrix{_FS}/"
-RESULT_ROOT = f"results/{DATASET}{_FS}"
+MATRIX_DIR = f"data/{DATASET}/matrix/"
+RESULT_ROOT = f"results/{DATASET}"
 LOOKBACK = 168
 HORIZON = 0
 X_OPT_PATH = os.path.join(MATRIX_DIR, f"X_opt_lb{LOOKBACK}_h{HORIZON}.csv")
@@ -170,10 +165,10 @@ def task2_feature_overview_by_hour(X, y, hours=(0, 3, 9, 12, 15, 20)):
 #   the top-10% most positive and most negative signed errors. Terminal only.
 #   signed_error = pred - true  (positive = over-prediction, negative = under).
 # ---------------------------------------------------------------------------
-# KEEP IN SYNC with the transformer run tag: split fracs + variant suffix (_lds/_fds/_s2).
-# This is just Task 3's default input; point --err-csv elsewhere to analyse another run.
+# KEEP IN SYNC with the transformer run tag (split fracs). This is just Task 3's default
+# input; point --err-csv elsewhere to analyse another run.
 ERR_CSV = (f"{RESULT_ROOT}/evaluation/transformer/"
-           f"tail_test0.16_tail_val0.1_lds_fds/TRANSFORMER_detailed_errors.csv")
+           f"tail_test0.16_tail_val0.1/TRANSFORMER_detailed_errors.csv")
 
 
 def task3_error_hours(csv_path=ERR_CSV, frac=0.10):
