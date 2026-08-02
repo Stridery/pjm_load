@@ -37,8 +37,6 @@ WEB_GLOB = 'web/*.csv'   # the committed serving store, one wide table per zone
 #           grouping, while hue still tells moe_transformer from transformer on the chart.
 #   label : display name; base and residual share it because `klass` already separates them.
 # Dict order is the default legend/table order (each family's base then its residual).
-# The remaining axis — variant (baseline / lds / lds+fds) — is NOT here: it comes from the
-# run_tag (see variant_of) and shows as its own column + filter, never as a colour.
 MODELS = {
     'xgboost':                  {'hue': 0, 'klass': 'direct',   'family': 'xgboost',     'label': 'XGBoost'},
     'xgboost_residual':         {'hue': 0, 'klass': 'residual', 'family': 'xgboost',     'label': 'XGBoost'},
@@ -57,21 +55,9 @@ MODELS = {
     'moe_lstm':                 {'hue': 7, 'klass': 'direct',   'family': 'lstm',        'label': 'MoE-LSTM'},
     'moe_lstm_residual':        {'hue': 7, 'klass': 'residual', 'family': 'lstm',        'label': 'MoE-LSTM'},
 }
-VARIANT_ORDER = ['baseline', 'lds', 'lds+fds']
 # The 5 Family-filter buckets, in reading order, with display labels.
 FAMILY_ORDER = [('xgboost', 'XGBoost'), ('lightgbm', 'LightGBM'), ('transformer', 'Transformer'),
                 ('lstm', 'LSTM'), ('mstnn', 'MSTNN')]
-
-
-def variant_of(run_tag):
-    """The training-trick variant a run_tag encodes — same model, different loss/feature
-    smoothing. A config axis, not a different model, so it reads off the run_tag rather than
-    the registry, and lives in its own column."""
-    if run_tag.endswith('_lds_fds'):
-        return 'lds+fds'
-    if run_tag.endswith('_lds'):
-        return 'lds'
-    return 'baseline'
 
 # The dataviz reference palette, in its published slot order — that order IS the
 # colourblind-safety mechanism (worst adjacent CVD ΔE 24.2 light / 10.3 dark), not decoration.
@@ -141,7 +127,7 @@ def build_payload():
         for m in models:
             if m not in MODELS:
                 raise SystemExit(f"{path}: model '{m}' is not in the MODELS registry — add it.")
-            meta.setdefault(m, {**MODELS[m], 'model': m, 'variant': 'baseline'})
+            meta.setdefault(m, {**MODELS[m], 'model': m})
 
         z = zones.setdefault(zone, {
             'label': ZONES.get(zone, {}).get('label', zone.upper()),
@@ -182,7 +168,6 @@ def build_payload():
     return {
         'generated': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'meta': meta,
-        'variantOrder': VARIANT_ORDER,
         'families': FAMILY_ORDER,
         'paletteLight': PALETTE_LIGHT,
         'paletteDark': PALETTE_DARK,
@@ -247,7 +232,7 @@ header p { margin:0; color:var(--muted); font-size:13px; }
 .seg button[aria-pressed="true"] { background:var(--ink); color:var(--surface); font-weight:600; }
 .spacer { flex:1; }
 
-/* Filter chips — narrow which model variants are eligible to appear (class / variant). Separate
+/* Filter chips — narrow which models are eligible to appear (class / family). Separate
    from the on/off selection, which only dims among the eligible. */
 .chips { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:2px 0 14px; }
 .chip-label { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
@@ -393,7 +378,7 @@ td .dir { color:var(--muted); font-size:11px; }
       <div class="stack" id="r-charts">
         <div class="card">
           <h3>Forecast vs actual</h3>
-          <p>Preliminary load is the baseline &mdash; PJM's near-real-time published load for this zone.</p>
+          <p>Metered load is the baseline &mdash; PJM's published load for this zone; the most recent hours may still be unverified until PJM finalizes them.</p>
           <div class="chart-wrap">
             <svg id="r-load" height="400"></svg>
             <div class="tooltip" id="r-load-tip"></div>
@@ -430,14 +415,14 @@ const ACTUAL = '__actual__';
 const isDark = () => matchMedia('(prefers-color-scheme: dark)').matches;
 // Everything about an entity comes from DATA.meta[eid], written by the hardcoded MODELS
 // registry — never parsed from the id string here.
-//   colour = family hue (a base and its residual share it; twelve models, seven hues).
-//   dashed = residual class (the second visual channel; variant is NOT a channel — see name).
+//   colour = family hue (a base and its residual share it; sixteen models, eight hues).
+//   dashed = residual class (the second visual channel).
 const M = eid => DATA.meta[eid];
 const colourOf = eid => (isDark() ? DATA.paletteDark : DATA.paletteLight)[M(eid).hue % 8];
 const isResidual = eid => M(eid).klass === 'residual';
-// Display name: family label, with the variant appended when it is not the baseline. The big
-// class (direct/residual) is carried by the swatch shape and the dash, so it is not repeated.
-const nameOf = eid => M(eid).label + (M(eid).variant === 'baseline' ? '' : ' · ' + M(eid).variant);
+// Display name: family label. The big class (direct/residual) is carried by the swatch shape and
+// the dash, so it is not repeated.
+const nameOf = eid => M(eid).label;
 // Swatch: filled square for a direct model, hollow ring for a residual — the same distinction
 // the dashed line makes on the chart, so legend and plot read as one scheme.
 const swatch = (colour, residual) => residual
@@ -454,28 +439,23 @@ const fmt = v => v == null ? '—' : num(v);
 
 /* ---------- filters ----------
    A filter narrows which ENTITIES are eligible to appear at all, along two axes: the big class
-   (direct / residual) and the training variant (baseline / lds / lds+fds). It is separate from
-   the on/off selection, which only dims among the eligible. Variant defaults to baseline only,
-   because colour+dash already carry family+class and cannot also encode the variant — so all
-   variants of one model would draw as one indistinguishable line. Switch it on to compare them
-   (they are told apart in the table and on hover). */
+   (direct / residual) and the architecture family. It is separate from the on/off selection,
+   which only dims among the eligible. */
 const CLASSES = [['direct', 'Direct'], ['residual', 'Residual']];
 const FAM_KEYS = DATA.families.map(([k]) => k);   // the 5 architecture buckets, in reading order
 const newFilter = () => ({
   types: new Set(['direct', 'residual']),
-  vars:  new Set(['baseline']),
   fams:  new Set(FAM_KEYS),            // all architectures on by default
 });
 const eligible = (zone, filt) => DATA.zones[zone].entities.filter(
-  e => filt.types.has(M(e).klass) && filt.vars.has(M(e).variant) && filt.fams.has(M(e).family));
+  e => filt.types.has(M(e).klass) && filt.fams.has(M(e).family));
 
 function renderChips(el, filt, onChange) {
   const chip = (g, v, label) =>
     `<button class="chip" data-g="${g}" data-v="${v}" aria-pressed="${filt[g].has(v)}">${label}</button>`;
   el.innerHTML =
     `<span class="chip-label">Class</span>` + CLASSES.map(([v, l]) => chip('types', v, l)).join('') +
-    `<span class="chip-label">Family</span>` + DATA.families.map(([v, l]) => chip('fams', v, l)).join('') +
-    `<span class="chip-label">Variant</span>` + DATA.variantOrder.map(v => chip('vars', v, v)).join('');
+    `<span class="chip-label">Family</span>` + DATA.families.map(([v, l]) => chip('fams', v, l)).join('');
   el.querySelectorAll('.chip').forEach(b => b.onclick = () => {
     const set = filt[b.dataset.g], v = b.dataset.v;
     if (set.has(v)) { if (set.size > 1) set.delete(v); }   // never empty a group — that blanks the view
@@ -605,7 +585,7 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
         p.push(`<polyline class="series" points="${pts}" stroke="var(--surface)" ` +
                `stroke-width="${w + 4}" opacity=".92"/>`);
       }
-      // Residual variants are dashed — same hue as their base model, told apart by line style.
+      // Residual models are dashed — same hue as their base model, told apart by line style.
       p.push(`<polyline class="series" points="${pts}" stroke="${s.colour}" ` +
              `opacity="${opacity(s)}" stroke-width="${s.faint ? 1.5 : w}"` +
              `${s.dash ? ' stroke-dasharray="5 3.5"' : ''}/>`);
@@ -695,7 +675,7 @@ function renderLegend(el, keys, state, onChange, mape) {
     row.innerHTML =
       `<input type="checkbox"${state.off.has(k) ? '' : ' checked'}>` +
       (actual ? `<span class="swatch" style="background:${ink()}"></span>` : swatchOf(k)) +
-      `<span>${actual ? 'Actual (prelim.)' : nameOf(k)}</span>` +
+      `<span>${actual ? 'Actual (metered)' : nameOf(k)}</span>` +
       (mape && mape[k] != null ? `<span class="mape">${mape[k].toFixed(2)}%</span>` : '');
     row.querySelector('input').onchange = e => {
       e.target.checked ? state.off.delete(k) : state.off.add(k);
@@ -716,7 +696,7 @@ const dChart = makeChart($('d-chart'), $('d-tip'), { onEmph: e => { D.emph = e; 
 function dSeries() {
   const z = DATA.zones[ZONE], out = [];
   if (z.actual[D.date] && !D.off.has(ACTUAL))
-    out.push({ key: ACTUAL, name: 'Actual (prelim.)', values: z.actual[D.date],
+    out.push({ key: ACTUAL, name: 'Actual (metered)', values: z.actual[D.date],
                colour: ink(), width: 3.5, top: true });
   for (const e of eligible(ZONE, D.filt)) {
     const v = z.series[D.date][e];
@@ -755,7 +735,7 @@ function renderDay(paintOnly) {
   else $('d-table').innerHTML = table(dSeries(), hrs);
 
   $('d-note').innerHTML = z.actual[D.date]
-    ? `<b>${z.label}</b> &middot; ${z.name}. Actual is PJM's preliminary load for this zone.`
+    ? `<b>${z.label}</b> &middot; ${z.name}. Actual is PJM's metered load; the most recent hours may still be unverified until PJM finalizes them.`
     : `<b>${z.label}</b> &middot; ${z.name}. No actual line: this day has not happened yet, so PJM has published nothing to compare against.`;
 }
 
@@ -770,19 +750,17 @@ const R = { date: null, off: new Set(), emph: null, sort: { key: 'mape', dir: 1 
 const SCORE_COLS = [
   { key: 'model',   label: 'Model' },
   { key: 'klass',   label: 'Class' },
-  { key: 'variant', label: 'Variant' },
   { key: 'mape',    label: 'MAPE' },
   { key: 'mae',     label: 'MAE (MW)' },
   { key: 'rmse',    label: 'RMSE (MW)' },
   { key: 'me',      label: 'ME (MW)' },
   { key: 'brs',     label: 'BRS (MW/MW)' },
 ];
-// The three identity columns sort by a fixed rank (registry order / class / variant order); the
-// metric columns sort by value, and ME/BRS by magnitude — nearest zero is least biased.
+// The two identity columns sort by a fixed rank (registry order / class); the metric columns
+// sort by value, and ME/BRS by magnitude — nearest zero is least biased.
 const sortKey = (r, key) =>
   key === 'model'   ? r.ord
   : key === 'klass' ? (r.klass === 'direct' ? 0 : 1)
-  : key === 'variant' ? DATA.variantOrder.indexOf(r.variant)
   : (key === 'me' || key === 'brs') ? Math.abs(r[key])
   : r[key];
 const rEmph = e => { R.emph = e; markEmph(); };   // hovering a chart line also lights its rows
@@ -792,7 +770,7 @@ const rErr  = makeChart($('r-err'),  $('r-err-tip'),  { zero: true, onEmph: rEmp
 function rLoadSeries() {
   const z = DATA.zones[ZONE], out = [];
   if (!R.off.has(ACTUAL))
-    out.push({ key: ACTUAL, name: 'Actual (prelim.)', values: z.actual[R.date],
+    out.push({ key: ACTUAL, name: 'Actual (metered)', values: z.actual[R.date],
                colour: ink(), width: 3.5, top: true });
   for (const e of eligible(ZONE, R.filt)) {
     const v = z.series[R.date][e];
@@ -835,7 +813,7 @@ function renderScoreboard() {
   const z = DATA.zones[ZONE];
   const rows = eligible(ZONE, R.filt).filter(e => z.metrics[e]).map(e => ({
     eid: e, ord: z.entities.indexOf(e),
-    model: M(e).label, klass: M(e).klass, variant: M(e).variant, ...z.metrics[e],
+    model: M(e).label, klass: M(e).klass, ...z.metrics[e],
   }));
   rows.sort((a, b) => (sortKey(a, R.sort.key) - sortKey(b, R.sort.key)) * R.sort.dir);
 
@@ -847,7 +825,6 @@ function renderScoreboard() {
     return `<tr data-e="${r.eid}" class="${off ? 'off' : ''}${R.emph === r.eid ? ' emph' : ''}">
       <td>${swatchOf(r.eid)}${r.model}</td>
       <td>${r.klass}</td>
-      <td>${r.variant}</td>
       <td>${r.mape.toFixed(2)}%</td>
       <td>${r.mae.toFixed(2)}</td>
       <td>${r.rmse.toFixed(2)}</td>
@@ -887,7 +864,7 @@ function renderRLegend() {
     row.innerHTML =
       `<input type="checkbox"${off ? '' : ' checked'}>` +
       (actual ? `<span class="swatch" style="background:${ink()}"></span>` : swatchOf(k)) +
-      `<span>${actual ? 'Actual (prelim.)' : nameOf(k)}</span>` +
+      `<span>${actual ? 'Actual (metered)' : nameOf(k)}</span>` +
       (!actual && mape[k] != null ? `<span class="mape">${mape[k].toFixed(2)}%</span>` : '');
     row.querySelector('input').onchange = () => { off ? R.off.delete(k) : R.off.add(k); renderRT(); };
     row.onmouseenter = () => { R.emph = k; markEmph(); };
@@ -939,7 +916,7 @@ function renderRT(paintOnly) {
   const H = s.reduce((n, d) => n + z.hours[d].length, 0);   // real hours, DST-aware
   $('r-metrics-sub').textContent =
     `Whole test window: ${s.length} day${s.length > 1 ? 's' : ''} (${s[0]} → ${s[s.length - 1]}), ` +
-    `${H} hours, vs PJM's preliminary load. Click a column to sort.`;
+    `${H} hours, vs PJM's metered load. Click a column to sort.`;
   renderChips($('r-chips'), R.filt, renderRT);
   renderScoreboard();
 
