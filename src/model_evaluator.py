@@ -10,8 +10,9 @@ from src.feature_engine import build_or_load_matrix, build_timeseries_matrix, _s
 from src.config import (
     CLEANED_PATH, MATRIX_DIR, RESULT_ROOT,
     TRANSFORMER_PARAMS, LSTM_PARAMS, MOE_TRANSFORMER_PARAMS, MSTNN_PARAMS,
-    TRANSFORMER_RESIDUAL_PARAMS, MOE_TRANSFORMER_RESIDUAL_PARAMS, MSTNN_RESIDUAL_PARAMS,
-    MOE_MSTNN_PARAMS, MOE_MSTNN_RESIDUAL_PARAMS,
+    TRANSFORMER_RESIDUAL_PARAMS, LSTM_RESIDUAL_PARAMS, MOE_TRANSFORMER_RESIDUAL_PARAMS,
+    MSTNN_RESIDUAL_PARAMS, MOE_MSTNN_PARAMS, MOE_MSTNN_RESIDUAL_PARAMS,
+    MOE_LSTM_PARAMS, MOE_LSTM_RESIDUAL_PARAMS,
 )
 from src.models import transformer as transformer_mod
 from src.models import lstm as lstm_mod
@@ -20,26 +21,33 @@ from src.models import mstnn as mstnn_mod
 from src.models import xgboost as xgboost_mod
 from src.models import lightgbm as lightgbm_mod
 from src.models import xgboost_residual as xgb_res_mod
+from src.models import lightgbm_residual as lgbm_res_mod
 from src.models import transformer_residual as tr_res_mod
+from src.models import lstm_residual as lstm_res_mod
 from src.models import moe_transformer_residual as moe_res_mod
 from src.models import mstnn_residual as mstnn_res_mod
 from src.models import moe_mstnn as moe_mstnn_mod
 from src.models import moe_mstnn_residual as moe_mstnn_res_mod
+from src.models import moe_lstm as moe_lstm_mod
+from src.models import moe_lstm_residual as moe_lstm_res_mod
 from src.models._eval_utils import plot_single_day
 
 # Residual models are drop-ins: same matrices, same predict()/evaluate() signatures. They
 # only differ in what they regress on, and that lives entirely inside their modules.
-TREE_MODELS = ['xgboost', 'lightgbm', 'xgboost_residual']
-SEQ_MODELS  = ['transformer', 'lstm', 'moe_transformer', 'mstnn', 'transformer_residual', 'moe_transformer_residual', 'mstnn_residual',
-               'moe_mstnn', 'moe_mstnn_residual']
+TREE_MODELS = ['xgboost', 'lightgbm', 'xgboost_residual', 'lightgbm_residual']
+SEQ_MODELS  = ['transformer', 'lstm', 'moe_transformer', 'mstnn',
+               'transformer_residual', 'lstm_residual', 'moe_transformer_residual',
+               'mstnn_residual', 'moe_mstnn', 'moe_mstnn_residual',
+               'moe_lstm', 'moe_lstm_residual']
 
 TREE_MOD = {'xgboost': xgboost_mod, 'lightgbm': lightgbm_mod,
-            'xgboost_residual': xgb_res_mod}
+            'xgboost_residual': xgb_res_mod, 'lightgbm_residual': lgbm_res_mod}
 SEQ_MOD  = {'transformer': transformer_mod, 'lstm': lstm_mod,
             'moe_transformer': moe_mod, 'mstnn': mstnn_mod,
-            'transformer_residual': tr_res_mod, 'moe_transformer_residual': moe_res_mod,
-            'mstnn_residual': mstnn_res_mod,
-            'moe_mstnn': moe_mstnn_mod, 'moe_mstnn_residual': moe_mstnn_res_mod}
+            'transformer_residual': tr_res_mod, 'lstm_residual': lstm_res_mod,
+            'moe_transformer_residual': moe_res_mod, 'mstnn_residual': mstnn_res_mod,
+            'moe_mstnn': moe_mstnn_mod, 'moe_mstnn_residual': moe_mstnn_res_mod,
+            'moe_lstm': moe_lstm_mod, 'moe_lstm_residual': moe_lstm_res_mod}
 
 # One params registry, keyed exactly like SEQ_MOD — imported by both the evaluator's own
 # call sites AND model_predictor, so a model can never be in one map and missing from the
@@ -47,9 +55,11 @@ SEQ_MOD  = {'transformer': transformer_mod, 'lstm': lstm_mod,
 SEQ_PARAMS = {'transformer': TRANSFORMER_PARAMS, 'lstm': LSTM_PARAMS,
               'moe_transformer': MOE_TRANSFORMER_PARAMS, 'mstnn': MSTNN_PARAMS,
               'transformer_residual': TRANSFORMER_RESIDUAL_PARAMS,
+              'lstm_residual': LSTM_RESIDUAL_PARAMS,
               'moe_transformer_residual': MOE_TRANSFORMER_RESIDUAL_PARAMS,
               'mstnn_residual': MSTNN_RESIDUAL_PARAMS,
-              'moe_mstnn': MOE_MSTNN_PARAMS, 'moe_mstnn_residual': MOE_MSTNN_RESIDUAL_PARAMS}
+              'moe_mstnn': MOE_MSTNN_PARAMS, 'moe_mstnn_residual': MOE_MSTNN_RESIDUAL_PARAMS,
+              'moe_lstm': MOE_LSTM_PARAMS, 'moe_lstm_residual': MOE_LSTM_RESIDUAL_PARAMS}
 assert set(SEQ_PARAMS) == set(SEQ_MOD), "SEQ_PARAMS and SEQ_MOD must cover the same models"
 
 

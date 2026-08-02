@@ -8,6 +8,11 @@ __pycache__/
 *.pkl
 data/
 
+# The daily forecast store IS committed — it is the site's data and must persist across the
+# ephemeral CI runners. Re-allow it past the blanket *.csv / data/ ignores above.
+!/web/
+!/web/*.csv
+
 # 模型权重和结果
 /models/
 /results/

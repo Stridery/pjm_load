@@ -1,3 +1,9 @@
+#!/bin/bash
+# Full retrain: crawl fresh data + train every model, on both zones.
+# Submit with:  sbatch Train_Model.sbatch
+# The job itself holds one GPU — it sits in the queue until a GPU is free (no timeout,
+# no CPU fallback), then runs the whole pipeline for dom and bge in turn.
+
 #SBATCH --job-name=pjm_train
 #SBATCH --account=gts-sd111
 #SBATCH --partition=gpu-v100

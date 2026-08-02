@@ -8,11 +8,15 @@ from src.models import lstm as lstm_mod
 from src.models import moe_transformer as moe_mod
 from src.models import mstnn as mstnn_mod
 from src.models import xgboost_residual as xgb_res_mod
+from src.models import lightgbm_residual as lgbm_res_mod
 from src.models import transformer_residual as tr_res_mod
+from src.models import lstm_residual as lstm_res_mod
 from src.models import moe_transformer_residual as moe_res_mod
 from src.models import mstnn_residual as mstnn_res_mod
 from src.models import moe_mstnn as moe_mstnn_mod
 from src.models import moe_mstnn_residual as moe_mstnn_res_mod
+from src.models import moe_lstm as moe_lstm_mod
+from src.models import moe_lstm_residual as moe_lstm_res_mod
 
 TEST_STRATEGIES = ['tail']
 VAL_STRATEGIES  = ['tail']
@@ -74,6 +78,13 @@ if cfg.TRAIN_CONFIG['xgboost'] or cfg.TRAIN_CONFIG['lightgbm']:
             tf = cfg.TREE_FEATURE_CONFIG
             _run_eval('xgboost_residual',
                       f'{cfg.MODEL_ROOT}/xgboost_residual/{test_strategy}_test{tf["test_frac"]}/xgboost_residual_24_models.pkl',
+                      test_strategy, tf)
+
+        if cfg.TRAIN_CONFIG['lightgbm_residual']:
+            lgbm_res_mod.train(X_train, y_train, cfg.LGBM_RESIDUAL_PARAMS, cfg.TREE_FEATURE_CONFIG)
+            tf = cfg.TREE_FEATURE_CONFIG
+            _run_eval('lightgbm_residual',
+                      f'{cfg.MODEL_ROOT}/lightgbm_residual/{test_strategy}_test{tf["test_frac"]}/lightgbm_residual_24_models.pkl',
                       test_strategy, tf)
 
 # --- Transformer ---
@@ -175,6 +186,25 @@ if cfg.TRAIN_CONFIG['lstm']:
                       f'{cfg.MODEL_ROOT}/lstm/{test_strategy}_test{lf["test_frac"]}_{val_strategy}_val{lf["val_frac"]}/lstm_best.pth',
                       test_strategy, lf)
 
+# --- LSTM (residual target) ---
+if cfg.TRAIN_CONFIG['lstm_residual']:
+    X_3d, y_3d, mask_3d, timestamps_3d = build_timeseries_matrix(cfg.CLEANED_PATH, cfg.MATRIX_DIR)
+
+    for test_strategy in TEST_STRATEGIES:
+        for val_strategy in VAL_STRATEGIES:
+            print(f"\n{'='*60}")
+            print(f"LSTM (residual) | test split: {test_strategy} | val split: {val_strategy}")
+            print(f"{'='*60}")
+
+            cfg.LSTM_FEATURE_CONFIG['split_strategy'] = test_strategy
+            cfg.LSTM_FEATURE_CONFIG['val_strategy']   = val_strategy
+
+            lstm_res_mod.train(X_3d, y_3d, mask_3d, cfg.LSTM_RESIDUAL_PARAMS, cfg.LSTM_FEATURE_CONFIG)
+            lf = cfg.LSTM_FEATURE_CONFIG
+            _run_eval('lstm_residual',
+                      f'{cfg.MODEL_ROOT}/lstm_residual/{test_strategy}_test{lf["test_frac"]}_{val_strategy}_val{lf["val_frac"]}/lstm_residual_best.pth',
+                      test_strategy, lf)
+
 # --- MoE Transformer (residual target) ---
 if cfg.TRAIN_CONFIG['moe_transformer_residual']:
     X_3d, y_3d, mask_3d, timestamps_3d = build_timeseries_matrix(cfg.CLEANED_PATH, cfg.MATRIX_DIR)
@@ -214,10 +244,12 @@ if cfg.TRAIN_CONFIG['mstnn_residual']:
                       f'{cfg.MODEL_ROOT}/mstnn_residual/{test_strategy}_test{mf["test_frac"]}_{val_strategy}_val{mf["val_frac"]}/mstnn_residual_best.pth',
                       test_strategy, mf)
 
-# --- MoE-MSTNN (+ residual) ---
+# --- MoE-MSTNN + MoE-LSTM (+ residuals) ---
 for _key, _mod, _P, _FC, _mt in [
     ('moe_mstnn', moe_mstnn_mod, cfg.MOE_MSTNN_PARAMS, cfg.MOE_MSTNN_FEATURE_CONFIG, 'moe_mstnn'),
     ('moe_mstnn_residual', moe_mstnn_res_mod, cfg.MOE_MSTNN_RESIDUAL_PARAMS, cfg.MOE_MSTNN_FEATURE_CONFIG, 'moe_mstnn_residual'),
+    ('moe_lstm', moe_lstm_mod, cfg.MOE_LSTM_PARAMS, cfg.MOE_LSTM_FEATURE_CONFIG, 'moe_lstm'),
+    ('moe_lstm_residual', moe_lstm_res_mod, cfg.MOE_LSTM_RESIDUAL_PARAMS, cfg.MOE_LSTM_FEATURE_CONFIG, 'moe_lstm_residual'),
 ]:
     if not cfg.TRAIN_CONFIG[_key]:
         continue

@@ -24,12 +24,12 @@ from sklearn.metrics import (mean_absolute_error, mean_absolute_percentage_error
 OUT = os.path.join('docs', 'index.html')
 # Every zone's forecast runs live under results/{zone}/evaluation/... (forecast weather is the
 # only feature set now). The viewer sees DOM / BGE.
-FORECAST_GLOB = 'results/*/evaluation/*/*/*_forecast.csv'
+WEB_GLOB = 'web/*.csv'   # the committed serving store, one wide table per zone
 
 # Hardcoded model registry — the taxonomy is spelled out, not parsed from names, so it is
 # eyeballable and one edit adds a model. Per model:
-#   hue   : colour slot 0-7. A family shares one hue; its residual twin reuses it and is told
-#           apart by a dashed line (12 models, 7 hues — the palette has no 12 CVD-safe colours).
+#   hue   : colour slot 0-7. A base model and its residual twin share one hue, told apart by a
+#           dashed line (16 models, 8 hues — the palette has no 16 CVD-safe colours).
 #   klass : the big class — 'direct' vs 'residual' (the two top-level groups in the scoreboard).
 #   family: the architecture bucket for the Family filter — 5 buckets (xgboost, lightgbm,
 #           transformer, lstm, mstnn). MoE folds into its base architecture (moe_transformer →
@@ -43,15 +43,19 @@ MODELS = {
     'xgboost':                  {'hue': 0, 'klass': 'direct',   'family': 'xgboost',     'label': 'XGBoost'},
     'xgboost_residual':         {'hue': 0, 'klass': 'residual', 'family': 'xgboost',     'label': 'XGBoost'},
     'lightgbm':                 {'hue': 1, 'klass': 'direct',   'family': 'lightgbm',    'label': 'LightGBM'},
+    'lightgbm_residual':        {'hue': 1, 'klass': 'residual', 'family': 'lightgbm',    'label': 'LightGBM'},
     'transformer':              {'hue': 2, 'klass': 'direct',   'family': 'transformer', 'label': 'Transformer'},
     'transformer_residual':     {'hue': 2, 'klass': 'residual', 'family': 'transformer', 'label': 'Transformer'},
     'lstm':                     {'hue': 3, 'klass': 'direct',   'family': 'lstm',        'label': 'LSTM'},
+    'lstm_residual':            {'hue': 3, 'klass': 'residual', 'family': 'lstm',        'label': 'LSTM'},
     'mstnn':                    {'hue': 4, 'klass': 'direct',   'family': 'mstnn',       'label': 'MSTNN'},
     'mstnn_residual':           {'hue': 4, 'klass': 'residual', 'family': 'mstnn',       'label': 'MSTNN'},
     'moe_transformer':          {'hue': 5, 'klass': 'direct',   'family': 'transformer', 'label': 'MoE-Transformer'},
     'moe_transformer_residual': {'hue': 5, 'klass': 'residual', 'family': 'transformer', 'label': 'MoE-Transformer'},
     'moe_mstnn':                {'hue': 6, 'klass': 'direct',   'family': 'mstnn',       'label': 'MoE-MSTNN'},
     'moe_mstnn_residual':       {'hue': 6, 'klass': 'residual', 'family': 'mstnn',       'label': 'MoE-MSTNN'},
+    'moe_lstm':                 {'hue': 7, 'klass': 'direct',   'family': 'lstm',        'label': 'MoE-LSTM'},
+    'moe_lstm_residual':        {'hue': 7, 'klass': 'residual', 'family': 'lstm',        'label': 'MoE-LSTM'},
 }
 VARIANT_ORDER = ['baseline', 'lds', 'lds+fds']
 # The 5 Family-filter buckets, in reading order, with display labels.
@@ -81,9 +85,11 @@ ZONES = {
     'bge': {'label': 'BGE', 'name': 'Baltimore Gas & Electric'},
 }
 
-# The forecast reaches two days past the last complete day of data; those trailing days are the
-# ones with no actual yet (the day-ahead tab). Must match the serving layer's forecast horizon.
-DAY_AHEAD_DAYS = 2
+# A day is classified by whether it HAS a published actual yet, not by a fixed count: days with
+# metered are the real-time test, days still awaiting it are the day-ahead tab. Metered verifies
+# oldest-first, so the no-actual days are always the trailing ones (today's lagging actual + the
+# genuine day-ahead horizon), and a day migrates from day-ahead to real-time on its own as its
+# metered fills in — no constant to keep in sync with the serving horizon.
 
 
 def metrics(actual, pred):
@@ -119,64 +125,48 @@ def metrics(actual, pred):
 
 
 def build_payload():
-    # The unit of display is an ENTITY = (model, variant), e.g. xgboost baseline vs xgboost
-    # lds are two entities. eid is the key everywhere; meta[eid] carries its taxonomy.
+    # One wide table per zone (web/{zone}.csv): datetime, datetime_utc, metered, {model}_pred...
+    # The daily serving run freezes each prediction and fills metered as it verifies; this just
+    # reshapes it into the per-day series the page draws.
     zones, meta = {}, {}
-    for path in sorted(glob.glob(FORECAST_GLOB)):
-        parts = path.split(os.sep)
-        ds, model, run_tag = parts[1], parts[3], parts[4]
-        if model not in MODELS:
-            raise SystemExit(f"{path}: model '{model}' is not in the MODELS registry — add it.")
-        variant = variant_of(run_tag)
-        eid = model if variant == 'baseline' else f'{model}@{variant}'
-        zone = ds     # results/{zone}/ — zone is the display key directly
-
+    for path in sorted(glob.glob(WEB_GLOB)):
+        zone = os.path.basename(path)[:-4]                 # web/dom.csv -> dom
         df = pd.read_csv(path)
-        # Forecasts must carry datetime_utc (added with the DST fix): without it a fall-back
-        # day cannot be ordered and a spring-forward day plots a phantom 2 a.m. Refuse stale
-        # files rather than draw one quietly wrong.
-        if 'datetime_utc' not in df.columns:
-            raise SystemExit(
-                f"{path} predates the DST fix (no datetime_utc column). Re-run the forecast "
-                f"for {ds}/{model} ({run_tag}), or delete the file."
-            )
         df['datetime']     = pd.to_datetime(df['datetime'])
         df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
-        pred_col = next(c for c in df.columns if c.endswith('_pred'))
         df['date'] = df['datetime'].dt.strftime('%Y-%m-%d')
         df['hour'] = df['datetime'].dt.hour
 
-        meta[eid] = {**MODELS[model], 'model': model, 'variant': variant}
+        models = [c[:-5] for c in df.columns if c.endswith('_pred')]
+        for m in models:
+            if m not in MODELS:
+                raise SystemExit(f"{path}: model '{m}' is not in the MODELS registry — add it.")
+            meta.setdefault(m, {**MODELS[m], 'model': m, 'variant': 'baseline'})
+
         z = zones.setdefault(zone, {
             'label': ZONES.get(zone, {}).get('label', zone.upper()),
             'name':  ZONES.get(zone, {}).get('name', ''),
-            'entities': [], 'hours': {}, 'series': {}, 'actual': {},
+            'entities': [m for m in MODELS if m in models],   # registry order
+            'hours': {}, 'series': {}, 'actual': {},
         })
-        if eid not in z['entities']:
-            z['entities'].append(eid)
 
         for date, g in df.groupby('date'):
             # Sort by UTC, not the local clock: on a fall-back day 01:00 appears twice and the
-            # local timestamp cannot order those two rows. A day holds 23, 24 or 25 hours and
-            # the page plots exactly that many points.
+            # local timestamp cannot order those two rows. A day holds 23/24/25 hours and the
+            # page plots exactly that many points.
             g = g.sort_values('datetime_utc')
-            z['hours'].setdefault(date, [int(h) for h in g['hour']])
-            z['series'].setdefault(date, {})[eid] = [round(v, 1) for v in g[pred_col]]
-            if 'preliminary_load' in g.columns and g['preliminary_load'].notna().any():
-                z['actual'][date] = [None if pd.isna(v) else round(v, 1)
-                                     for v in g['preliminary_load']]
-
-    # Default entity order: registry (family) order, each family's baseline then its variants.
-    order = list(MODELS)
-    def eid_key(eid):
-        m = meta[eid]
-        return (order.index(m['model']), VARIANT_ORDER.index(m['variant']))
+            z['hours'][date] = [int(h) for h in g['hour']]
+            for m in models:
+                z['series'].setdefault(date, {})[m] = [
+                    None if pd.isna(v) else round(float(v), 1) for v in g[f'{m}_pred']]
+            if 'metered' in g.columns and g['metered'].notna().any():
+                z['actual'][date] = [None if pd.isna(v) else round(float(v), 1)
+                                     for v in g['metered']]
 
     for z in zones.values():
-        z['entities'] = sorted(z['entities'], key=eid_key)
         z['dates'] = sorted(z['series'])
-        z['dayAhead'] = z['dates'][-DAY_AHEAD_DAYS:]
         z['scored'] = [d for d in z['dates'] if d in z['actual']]
+        z['dayAhead'] = [d for d in z['dates'] if d not in z['actual']]
 
         z['metrics'] = {}
         for eid in z['entities']:
@@ -994,7 +984,7 @@ def main():
     payload = build_payload()
     if not payload['zones']:
         raise SystemExit(
-            f"No files match {FORECAST_GLOB}. Run Model_Training.py — it forecasts as part of "
+            f"No files match {WEB_GLOB}. Run the serving job (src.serving.run) to build the store."
             f"the same pass — before generating the site."
         )
 

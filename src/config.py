@@ -119,11 +119,15 @@ TRAIN_CONFIG = {
     'moe_transformer':      1,
     'mstnn':                1,
     'xgboost_residual':     1,
+    'lightgbm_residual':    1,
     'transformer_residual': 1,
+    'lstm_residual':        1,
     'moe_transformer_residual': 1,
     'mstnn_residual':      1,
     'moe_mstnn':           1,
     'moe_mstnn_residual':  1,
+    'moe_lstm':            1,
+    'moe_lstm_residual':   1,
 }
 
 # ---------------------------------------------------------------------------
@@ -391,8 +395,18 @@ XGB_RESIDUAL_PARAMS = {
     'baseline': _RESIDUAL_BASELINE,
 }
 
+LGBM_RESIDUAL_PARAMS = {
+    **LGBM_PARAMS,
+    'baseline': _RESIDUAL_BASELINE,
+}
+
 TRANSFORMER_RESIDUAL_PARAMS = {
     **TRANSFORMER_PARAMS,
+    'baseline': _RESIDUAL_BASELINE,
+}
+
+LSTM_RESIDUAL_PARAMS = {
+    **LSTM_PARAMS,
     'baseline': _RESIDUAL_BASELINE,
 }
 
@@ -410,6 +424,17 @@ MOE_MSTNN_PARAMS = {
 }
 MOE_MSTNN_RESIDUAL_PARAMS = {
     **MOE_MSTNN_PARAMS,
+    'baseline': _RESIDUAL_BASELINE,
+}
+
+# --- MoE-LSTM (MoE regime head on the LSTM encoder) ---
+MOE_LSTM_FEATURE_CONFIG = dict(LSTM_FEATURE_CONFIG)
+MOE_LSTM_PARAMS = {
+    **LSTM_PARAMS,
+    'expert_fc_hidden': 64,   # width of each of the 12 regime expert heads
+}
+MOE_LSTM_RESIDUAL_PARAMS = {
+    **MOE_LSTM_PARAMS,
     'baseline': _RESIDUAL_BASELINE,
 }
 
