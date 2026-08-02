@@ -37,7 +37,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download serving-latest --pattern serving_bundle.tar.gz
+          gh release download serving-latest --pattern serving_bundle.tar.gz --clobber
           tar -xzf serving_bundle.tar.gz
           rm serving_bundle.tar.gz
 

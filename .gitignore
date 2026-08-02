@@ -17,6 +17,10 @@ data/
 /models/
 /results/
 
+# Serving bundle — built by bundle_serving.sh and uploaded to a GitHub Release, never committed
+# (the CI job downloads it from the release; a copy in the repo would block that download).
+serving_bundle.tar.gz
+
 # 日志文件
 logs/
 *.out
