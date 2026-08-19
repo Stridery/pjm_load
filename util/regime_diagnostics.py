@@ -11,7 +11,6 @@ Run:
   PJM_DATASET=dom python util/regime_diagnostics.py
 """
 
-import glob
 import os
 import sys
 
@@ -123,12 +122,21 @@ def month_hour_load_stats(df=None, save=True):
 
 def _feature_names(num_features):
     """Names for the 3D-matrix feature axis, in build_timeseries_matrix order."""
+    from src.congestion_features import CONG_FEATURE_NAMES
+    from src.forecast_features import FC_FEATURE_NAMES
     from src.macro_features import MACRO_FEATURE_NAMES
     from src.thermal_features import THERMAL_SEQ_COLS, THERMAL_STATIC_NAMES
+    # Same order build_timeseries_matrix concatenates in: the per-timestep channels, the
+    # broadcast forecast-day calendar, then the static block (macro, thermal, forecast,
+    # congestion). Every name list is imported rather than spelled out, so a block that
+    # changes width here cannot drift from the matrix — the length check below is the
+    # backstop, and it used to fire on every run because the forecast block was missing.
+    static = list(MACRO_FEATURE_NAMES) + list(THERMAL_STATIC_NAMES) + list(FC_FEATURE_NAMES)
+    if cfg.CONGESTION_CONFIG['enabled']:
+        static += list(CONG_FEATURE_NAMES)
     names = (['Load_Estimated'] + list(cfg.WEATHER_COLS) + list(THERMAL_SEQ_COLS) +
              ['tmrw_month_sin', 'tmrw_month_cos', 'tmrw_dow_sin', 'tmrw_dow_cos',
-              'tmrw_is_weekend', 'tmrw_is_holiday'] +
-             list(MACRO_FEATURE_NAMES) + list(THERMAL_STATIC_NAMES))
+              'tmrw_is_weekend', 'tmrw_is_holiday'] + static)
     return names if len(names) == num_features else [f'feat_{i}' for i in range(num_features)]
 
 
@@ -147,7 +155,7 @@ def y_vs_lookback_feature_scatter(save=True):
     feat_x = X.mean(axis=1)                                      # (N, F)
     feat_x[:, is_forecast] = X[:, 0, :][:, is_forecast]
 
-    y_scaler = joblib.load(glob.glob(os.path.join(cfg.MATRIX_DIR, 'y_scaler_*.pkl'))[0])
+    y_scaler = joblib.load(os.path.join(cfg.MATRIX_DIR, f'y_scaler_lb{cfg.TRANSFORMER_FEATURE_CONFIG["lookback_hours"]}_h{cfg.TRANSFORMER_FEATURE_CONFIG["latest_info_hour"]}{cfg.MATRIX_TAG}.pkl'))
     y_rep = y_scaler.inverse_transform(y.mean(axis=1).reshape(-1, 1)).ravel()   # (N,) MW
 
     season = season_indices(ts)

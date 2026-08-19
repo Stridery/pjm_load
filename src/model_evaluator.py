@@ -1,5 +1,4 @@
 # src/model_evaluator.py
-import glob
 import os
 
 import joblib
@@ -8,7 +7,7 @@ import pandas as pd
 
 from src.feature_engine import build_or_load_matrix, build_timeseries_matrix, _split_indices
 from src.config import (
-    CLEANED_PATH, MATRIX_DIR, RESULT_ROOT,
+    CLEANED_PATH, MATRIX_DIR, RESULT_ROOT, MATRIX_TAG, TRANSFORMER_FEATURE_CONFIG,
     TRANSFORMER_PARAMS, LSTM_PARAMS, MOE_TRANSFORMER_PARAMS, MSTNN_PARAMS,
     TRANSFORMER_RESIDUAL_PARAMS, LSTM_RESIDUAL_PARAMS, MOE_TRANSFORMER_RESIDUAL_PARAMS,
     MSTNN_RESIDUAL_PARAMS, MOE_MSTNN_PARAMS, MOE_MSTNN_RESIDUAL_PARAMS,
@@ -95,10 +94,16 @@ class ModelEvaluator:
             self.X_3d, self.y_3d, self.mask_3d, self.timestamps_3d = build_timeseries_matrix(
                 CLEANED_PATH, MATRIX_DIR
             )
-            y_scaler_files = glob.glob(os.path.join(MATRIX_DIR, 'y_scaler_*.pkl'))
-            if not y_scaler_files:
-                raise FileNotFoundError(f"No y_scaler file found in {MATRIX_DIR}")
-            self.y_scaler = joblib.load(y_scaler_files[0])
+            # Name the scaler exactly rather than globbing 'y_scaler_*.pkl' and taking [0]:
+            # both feature-set arms leave a file here, glob order is arbitrary, and the two are
+            # only interchangeable by luck (the y scaler happens not to depend on the feature
+            # block). Matching MATRIX_TAG keeps it true by construction.
+            lb = TRANSFORMER_FEATURE_CONFIG['lookback_hours']
+            hh = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
+            y_scaler_path = os.path.join(MATRIX_DIR, f'y_scaler_lb{lb}_h{hh}{MATRIX_TAG}.pkl')
+            if not os.path.exists(y_scaler_path):
+                raise FileNotFoundError(f"No y_scaler at {y_scaler_path} — train first.")
+            self.y_scaler = joblib.load(y_scaler_path)
 
     # --- Split helpers ---
 

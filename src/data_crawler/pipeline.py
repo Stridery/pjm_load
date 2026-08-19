@@ -239,6 +239,21 @@ def run_pipeline(
         met_years = pre_years = full
     fetch_load(zone, met_years, pre_years, raw_dir)
 
+    # Step 0b – Day-Ahead marginal value (transmission shadow prices) → raw/marginal_price/.
+    # Shares UPDATE_YEARS with everything else. Skipped entirely when the congestion block is
+    # off, so switching it off also stops paying for the download.
+    from src.config import CONGESTION_CONFIG
+    if CONGESTION_CONFIG['enabled']:
+        from src.data_crawler.pjm_marginal_value import fetch_marginal_value
+        have = {int(re.search(r'(\d{4})\.csv$', os.path.basename(p)).group(1))
+                for p in glob.glob(os.path.join(raw_dir, 'marginal_price',
+                                                'da_marginal_value_*.csv'))}
+        # A listed year is force-refreshed; an unlisted year that was never cached is still
+        # fetched, so the stitched table stays complete (same rule as the load sources).
+        # met_years is already the full range when skip_existing is False.
+        want = sorted(set(met_years) | (set(range(cfg["start_year"], cfg["end_year"] + 1)) - have))
+        fetch_marginal_value(want, raw_dir)
+
     # Step 1 & 2 – Load and concat PJM CSVs
     logger.info("=== Step 1: Loading metered load from %s ===", metered_dir)
     metered = load_metered(metered_dir)
@@ -355,6 +370,14 @@ def run_pipeline(
     # so the feature layer reads one path and never has to know the shards exist.
     clean_forecast(forecast_dir, os.path.join(cleaned_dir, "forecast.csv"))
 
+    # Step 6c – Same treatment for the marginal-value shards: one hourly table on its own
+    # index, joined by EPT date at matrix-build time. Kept out of the load/weather frame for
+    # the same reason as the forecasts — it is RTO-wide, not a zone column, and folding it in
+    # would change the cleaned CSV every existing model trained on.
+    if CONGESTION_CONFIG['enabled']:
+        from src.data_crawler.pjm_marginal_value import clean_marginal_value
+        clean_marginal_value(raw_dir, os.path.join(cleaned_dir, "congestion.csv"))
+
     # Step 7 – Write the training view: labelled rows only (metered present), Load kept.
     #
     # The forecast INPUT (the "predict" view — all rows incl. the unlabelled recent tail,
@@ -387,7 +410,10 @@ def run_pipeline(
     # model block and evaluator), so without this a re-crawl would silently keep training on
     # the previous data. Pass clear_matrix=False (run_crawler --keep-matrix) to keep them.
     if clear_matrix:
-        import glob
+        # NB: no `import glob` here. glob is imported at module level, and re-importing it in
+        # this scope would make it a LOCAL name for the whole function — so every earlier use
+        # (Step 0b reads the cached marginal-value years with it) would raise UnboundLocalError
+        # before this line ever ran.
         import shutil
         wiped = 0
         for mdir in sorted(glob.glob(os.path.join(data_root, zone, "matrix*"))):

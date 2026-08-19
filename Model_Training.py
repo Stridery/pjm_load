@@ -1,5 +1,8 @@
+import os
+
 import src.config as cfg
 from src.feature_engine import build_or_load_matrix, get_train_test_split, build_timeseries_matrix
+from src.models._utils import run_tag
 from src.model_evaluator import ModelEvaluator, TREE_MODELS, SEQ_MODELS
 from src.models import xgboost as xgb_mod
 from src.models import lightgbm as lgb_mod
@@ -20,6 +23,18 @@ from src.models import moe_lstm_residual as moe_lstm_res_mod
 
 TEST_STRATEGIES = ['tail']
 VAL_STRATEGIES  = ['tail']
+
+
+def _model_path(model_type, feature_cfg, filename):
+    """Where the trainer just saved this model, so the evaluator reads the same directory.
+
+    The run tag comes from the SAME helper the trainers call (src/models/_utils.run_tag), not
+    from a second copy of the format string. It used to be spelled out inline at each of the
+    thirteen call sites, which meant any change to the tag — the feature-set suffix being the
+    first — had to be made thirteen times or the evaluator would look in a directory the
+    trainer had not written.
+    """
+    return os.path.join(cfg.MODEL_ROOT, model_type, run_tag(feature_cfg), filename)
 
 
 def _only(model_name, model_path):
@@ -48,7 +63,12 @@ def _run_eval(model_name, model_path, split_strategy, feature_cfg):
 
 
 # --- Tree Models (XGBoost / LightGBM) ---
-if cfg.TRAIN_CONFIG['xgboost'] or cfg.TRAIN_CONFIG['lightgbm']:
+# Guard on the whole TREE_MODELS registry, not on the two plain variants: the residual
+# ones are trained INSIDE this block, so naming only xgboost/lightgbm here meant asking
+# for lightgbm_residual alone built no matrix, entered no loop, and exited silently with
+# nothing trained. Deriving it from the registry also means a new tree model cannot
+# reintroduce the omission.
+if any(cfg.TRAIN_CONFIG[_m] for _m in TREE_MODELS):
     X_opt, y_opt = build_or_load_matrix(cfg.CLEANED_PATH, cfg.MATRIX_DIR)
 
     for test_strategy in TEST_STRATEGIES:
@@ -63,28 +83,28 @@ if cfg.TRAIN_CONFIG['xgboost'] or cfg.TRAIN_CONFIG['lightgbm']:
             xgb_mod.train(X_train, y_train, cfg.XGB_PARAMS, cfg.TREE_FEATURE_CONFIG)
             tf = cfg.TREE_FEATURE_CONFIG
             _run_eval('xgboost',
-                      f'{cfg.MODEL_ROOT}/xgboost/{test_strategy}_test{tf["test_frac"]}/xgboost_24_models.pkl',
+                      _model_path('xgboost', tf, 'xgboost_24_models.pkl'),
                       test_strategy, tf)
 
         if cfg.TRAIN_CONFIG['lightgbm']:
             lgb_mod.train(X_train, y_train, cfg.LGBM_PARAMS, cfg.TREE_FEATURE_CONFIG)
             tf = cfg.TREE_FEATURE_CONFIG
             _run_eval('lightgbm',
-                      f'{cfg.MODEL_ROOT}/lightgbm/{test_strategy}_test{tf["test_frac"]}/lightgbm_24_models.pkl',
+                      _model_path('lightgbm', tf, 'lightgbm_24_models.pkl'),
                       test_strategy, tf)
 
         if cfg.TRAIN_CONFIG['xgboost_residual']:
             xgb_res_mod.train(X_train, y_train, cfg.XGB_RESIDUAL_PARAMS, cfg.TREE_FEATURE_CONFIG)
             tf = cfg.TREE_FEATURE_CONFIG
             _run_eval('xgboost_residual',
-                      f'{cfg.MODEL_ROOT}/xgboost_residual/{test_strategy}_test{tf["test_frac"]}/xgboost_residual_24_models.pkl',
+                      _model_path('xgboost_residual', tf, 'xgboost_residual_24_models.pkl'),
                       test_strategy, tf)
 
         if cfg.TRAIN_CONFIG['lightgbm_residual']:
             lgbm_res_mod.train(X_train, y_train, cfg.LGBM_RESIDUAL_PARAMS, cfg.TREE_FEATURE_CONFIG)
             tf = cfg.TREE_FEATURE_CONFIG
             _run_eval('lightgbm_residual',
-                      f'{cfg.MODEL_ROOT}/lightgbm_residual/{test_strategy}_test{tf["test_frac"]}/lightgbm_residual_24_models.pkl',
+                      _model_path('lightgbm_residual', tf, 'lightgbm_residual_24_models.pkl'),
                       test_strategy, tf)
 
 # --- Transformer ---
@@ -103,7 +123,7 @@ if cfg.TRAIN_CONFIG['transformer']:
             transformer_mod.train(X_3d, y_3d, mask_3d, cfg.TRANSFORMER_PARAMS, cfg.TRANSFORMER_FEATURE_CONFIG)
             tf = cfg.TRANSFORMER_FEATURE_CONFIG
             _run_eval('transformer',
-                      f'{cfg.MODEL_ROOT}/transformer/{test_strategy}_test{tf["test_frac"]}_{val_strategy}_val{tf["val_frac"]}/transformer_best.pth',
+                      _model_path('transformer', tf, 'transformer_best.pth'),
                       test_strategy, tf)
 
 # --- Transformer (residual target) ---
@@ -125,7 +145,7 @@ if cfg.TRAIN_CONFIG['transformer_residual']:
                              cfg.TRANSFORMER_RESIDUAL_PARAMS, cfg.TRANSFORMER_FEATURE_CONFIG)
             tf = cfg.TRANSFORMER_FEATURE_CONFIG
             _run_eval('transformer_residual',
-                      f'{cfg.MODEL_ROOT}/transformer_residual/{test_strategy}_test{tf["test_frac"]}_{val_strategy}_val{tf["val_frac"]}/transformer_residual_best.pth',
+                      _model_path('transformer_residual', tf, 'transformer_residual_best.pth'),
                       test_strategy, tf)
 
 # --- MoE Transformer ---
@@ -145,7 +165,7 @@ if cfg.TRAIN_CONFIG['moe_transformer']:
                           cfg.MOE_TRANSFORMER_PARAMS, cfg.MOE_TRANSFORMER_FEATURE_CONFIG)
             mf = cfg.MOE_TRANSFORMER_FEATURE_CONFIG
             _run_eval('moe_transformer',
-                      f'{cfg.MODEL_ROOT}/moe_transformer/{test_strategy}_test{mf["test_frac"]}_{val_strategy}_val{mf["val_frac"]}/moe_transformer_best.pth',
+                      _model_path('moe_transformer', mf, 'moe_transformer_best.pth'),
                       test_strategy, mf)
 
 # --- MSTNN ---
@@ -164,7 +184,7 @@ if cfg.TRAIN_CONFIG['mstnn']:
             mstnn_mod.train(X_3d, y_3d, mask_3d, cfg.MSTNN_PARAMS, cfg.MSTNN_FEATURE_CONFIG)
             mf = cfg.MSTNN_FEATURE_CONFIG
             _run_eval('mstnn',
-                      f'{cfg.MODEL_ROOT}/mstnn/{test_strategy}_test{mf["test_frac"]}_{val_strategy}_val{mf["val_frac"]}/mstnn_best.pth',
+                      _model_path('mstnn', mf, 'mstnn_best.pth'),
                       test_strategy, mf)
 
 # --- LSTM ---
@@ -183,7 +203,7 @@ if cfg.TRAIN_CONFIG['lstm']:
             lstm_mod.train(X_3d, y_3d, mask_3d, cfg.LSTM_PARAMS, cfg.LSTM_FEATURE_CONFIG)
             lf = cfg.LSTM_FEATURE_CONFIG
             _run_eval('lstm',
-                      f'{cfg.MODEL_ROOT}/lstm/{test_strategy}_test{lf["test_frac"]}_{val_strategy}_val{lf["val_frac"]}/lstm_best.pth',
+                      _model_path('lstm', lf, 'lstm_best.pth'),
                       test_strategy, lf)
 
 # --- LSTM (residual target) ---
@@ -202,7 +222,7 @@ if cfg.TRAIN_CONFIG['lstm_residual']:
             lstm_res_mod.train(X_3d, y_3d, mask_3d, cfg.LSTM_RESIDUAL_PARAMS, cfg.LSTM_FEATURE_CONFIG)
             lf = cfg.LSTM_FEATURE_CONFIG
             _run_eval('lstm_residual',
-                      f'{cfg.MODEL_ROOT}/lstm_residual/{test_strategy}_test{lf["test_frac"]}_{val_strategy}_val{lf["val_frac"]}/lstm_residual_best.pth',
+                      _model_path('lstm_residual', lf, 'lstm_residual_best.pth'),
                       test_strategy, lf)
 
 # --- MoE Transformer (residual target) ---
@@ -222,7 +242,7 @@ if cfg.TRAIN_CONFIG['moe_transformer_residual']:
                               cfg.MOE_TRANSFORMER_RESIDUAL_PARAMS, cfg.MOE_TRANSFORMER_RESIDUAL_FEATURE_CONFIG)
             mf = cfg.MOE_TRANSFORMER_RESIDUAL_FEATURE_CONFIG
             _run_eval('moe_transformer_residual',
-                      f'{cfg.MODEL_ROOT}/moe_transformer_residual/{test_strategy}_test{mf["test_frac"]}_{val_strategy}_val{mf["val_frac"]}/moe_transformer_residual_best.pth',
+                      _model_path('moe_transformer_residual', mf, 'moe_transformer_residual_best.pth'),
                       test_strategy, mf)
 
 # --- MSTNN (residual target) ---
@@ -241,7 +261,7 @@ if cfg.TRAIN_CONFIG['mstnn_residual']:
             mstnn_res_mod.train(X_3d, y_3d, mask_3d, cfg.MSTNN_RESIDUAL_PARAMS, cfg.MSTNN_FEATURE_CONFIG)
             mf = cfg.MSTNN_FEATURE_CONFIG
             _run_eval('mstnn_residual',
-                      f'{cfg.MODEL_ROOT}/mstnn_residual/{test_strategy}_test{mf["test_frac"]}_{val_strategy}_val{mf["val_frac"]}/mstnn_residual_best.pth',
+                      _model_path('mstnn_residual', mf, 'mstnn_residual_best.pth'),
                       test_strategy, mf)
 
 # --- MoE-MSTNN + MoE-LSTM (+ residuals) ---
@@ -263,5 +283,5 @@ for _key, _mod, _P, _FC, _mt in [
             _FC['val_strategy']   = val_strategy
             _mod.train(X_3d, y_3d, mask_3d, timestamps_3d, _P, _FC)
             _run_eval(_key,
-                      f'{cfg.MODEL_ROOT}/{_mt}/{test_strategy}_test{_FC["test_frac"]}_{val_strategy}_val{_FC["val_frac"]}/{_mt}_best.pth',
+                      _model_path(_mt, _FC, f'{_mt}_best.pth'),
                       test_strategy, _FC)

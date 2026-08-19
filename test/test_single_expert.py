@@ -25,7 +25,6 @@ Model   -> models/<dataset>/single_expert/<season>__<expert>/best.pth
 """
 
 import argparse
-import glob
 import os
 import sys
 
@@ -156,7 +155,7 @@ def main():
     _train(X[tr_i], hslice(tr_i), X[va_i], hslice(va_i), params, device, save_path)
 
     # --- Predict + inverse-transform to MW ---
-    y_scaler = joblib.load(glob.glob(os.path.join(cfg.MATRIX_DIR, 'y_scaler_*.pkl'))[0])
+    y_scaler = joblib.load(os.path.join(cfg.MATRIX_DIR, f'y_scaler_lb{cfg.TRANSFORMER_FEATURE_CONFIG["lookback_hours"]}_h{cfg.TRANSFORMER_FEATURE_CONFIG["latest_info_hour"]}{cfg.MATRIX_TAG}.pkl'))
 
     def inv(a):
         return y_scaler.inverse_transform(a.flatten().reshape(-1, 1)).reshape(a.shape)

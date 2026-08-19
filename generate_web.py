@@ -15,6 +15,7 @@ import glob
 import json
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -166,7 +167,10 @@ def build_payload():
                 z['metrics'][eid] = metrics(a, p)
 
     return {
-        'generated': datetime.now().strftime('%Y-%m-%d %H:%M'),
+        # Eastern, not the runner's clock: the CI box is UTC and a laptop is whatever, so a
+        # naive now() made the same stamp mean two different instants. Everything else here
+        # is already America/New_York, and so is PJM.
+        'generated': datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M %Z'),
         'meta': meta,
         'families': FAMILY_ORDER,
         'paletteLight': PALETTE_LIGHT,

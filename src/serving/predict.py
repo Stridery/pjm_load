@@ -17,39 +17,56 @@ import os
 import joblib
 import numpy as np
 
-from src.config import MODEL_ROOT, MATRIX_DIR, TRANSFORMER_FEATURE_CONFIG
+from src.config import (MODEL_ROOT, MATRIX_DIR, TRANSFORMER_FEATURE_CONFIG, MATRIX_TAG,
+                        matrix_tag_of)
 from src.model_evaluator import TREE_MODELS, SEQ_MODELS, TREE_MOD, SEQ_MOD, SEQ_PARAMS
 from src.serving.features import build_sequence_sample, build_tree_sample
 
 _ALL_MOD = {**TREE_MOD, **SEQ_MOD}
 
 
+def _weights_for(model_root, model):
+    """Weight files for `model` from runs trained on the CURRENTLY configured feature set.
+
+    Run dirs are filtered by their tag rather than globbed with '*', because retraining under
+    a new feature set now leaves the previous run dir in place beside the new one (see
+    src/models/_utils.run_tag). Globbing would pick up both — either raising "multiple weight
+    files" or, if only the stale one survived, loading weights whose input width no longer
+    matches the assembled sample.
+    """
+    out = []
+    for d in sorted(glob.glob(os.path.join(model_root, model, '*'))):
+        if not os.path.isdir(d) or matrix_tag_of(os.path.basename(d)) != MATRIX_TAG:
+            continue
+        out += glob.glob(os.path.join(d, f'{model}_*.pkl'))
+        out += glob.glob(os.path.join(d, f'{model}_best.pth'))
+    return out
+
+
 def _weight_path(model_root, model):
-    """The single saved-weight file for a model (each model has one run_tag dir)."""
-    hits = (glob.glob(os.path.join(model_root, model, '*', f'{model}_*.pkl'))
-            + glob.glob(os.path.join(model_root, model, '*', f'{model}_best.pth')))
+    """The single saved-weight file for a model (one run dir per feature set)."""
+    hits = _weights_for(model_root, model)
     if not hits:
-        raise FileNotFoundError(f"No weights for '{model}' under {model_root}/{model}/ — train it.")
+        raise FileNotFoundError(
+            f"No weights for '{model}' under {model_root}/{model}/ matching feature-set tag "
+            f"{MATRIX_TAG!r} — train it, or align CONGESTION_CONFIG['enabled'] with the "
+            f"models you have.")
     if len(hits) > 1:
-        raise RuntimeError(f"Multiple weight files for '{model}': {hits}. Keep one run_tag.")
+        raise RuntimeError(f"Multiple weight files for '{model}': {hits}. Keep one run dir "
+                           f"per feature set.")
     return hits[0]
 
 
 def available_models(model_root=None):
-    """The models that actually have weights on disk, in registry order."""
+    """The models that have weights for the configured feature set, in registry order."""
     model_root = model_root or MODEL_ROOT
-    out = []
-    for m in TREE_MODELS + SEQ_MODELS:
-        if glob.glob(os.path.join(model_root, m, '*', f'{m}_*.pkl')) or \
-           glob.glob(os.path.join(model_root, m, '*', f'{m}_best.pth')):
-            out.append(m)
-    return out
+    return [m for m in TREE_MODELS + SEQ_MODELS if _weights_for(model_root, m)]
 
 
 def _y_scaler(matrix_dir):
     lb = TRANSFORMER_FEATURE_CONFIG['lookback_hours']
     hh = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
-    hits = glob.glob(os.path.join(matrix_dir, f'y_scaler_lb{lb}_h{hh}.pkl'))
+    hits = glob.glob(os.path.join(matrix_dir, f'y_scaler_lb{lb}_h{hh}{MATRIX_TAG}.pkl'))
     if not hits:
         raise FileNotFoundError(f"No y_scaler in {matrix_dir} — train first.")
     return joblib.load(hits[0])

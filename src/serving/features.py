@@ -5,8 +5,8 @@ This is the training feature loop (src/feature_engine.build_timeseries_matrix) r
 day, with three deliberate differences and nothing else:
   1. no label — the target day has no metered load yet;
   2. scalers are LOADED, never fitted (a fit on 30 days would drift from training);
-  3. the thermal climatology + threshold are the persisted train-fitted constants, not
-     recomputed from the window (30 days cannot reproduce a 6-year climatology).
+  3. (there is no longer a third: the thermal block used to need train-fitted constants
+     shipped alongside the weights, and no longer does — see src/thermal_features.)
 Every actual feature — the 168 h lookback, the 3-week macro block, the thermal-static block,
 the 48 h forecast departures, the forecast-day calendar — is built by the SAME shared helpers
 the trainer calls, so the assembled vector is byte-identical to training. verify_against_matrix
@@ -20,14 +20,16 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from src.config import WEATHER_COLS, MATRIX_DIR, TRANSFORMER_FEATURE_CONFIG, TREE_FEATURE_CONFIG
-from src.feature_engine import _load_forecast, _forecast_for, FC_FEATURE_NAMES
+from src.config import (WEATHER_COLS, MATRIX_DIR, TRANSFORMER_FEATURE_CONFIG,
+                        TREE_FEATURE_CONFIG, MATRIX_TAG)
+from src.congestion_features import CONG_FEATURE_NAMES, compute_congestion_features
+from src.feature_engine import (_load_forecast, _load_congestion, _forecast_for,
+                                FC_FEATURE_NAMES)
 from src.macro_features import compute_macro_features, MACRO_WINDOW_HOURS, MACRO_FEATURE_NAMES
 from src.thermal_features import (
-    add_thermal_sequence_cols, build_heat_streak, compute_thermal_static,
+    add_thermal_sequence_cols, compute_thermal_static,
     THERMAL_SEQ_COLS, THERMAL_STATIC_NAMES,
 )
-from src.serving import thermal_refs
 
 
 def _load_scaler(matrix_dir, pattern):
@@ -35,19 +37,6 @@ def _load_scaler(matrix_dir, pattern):
     if not hits:
         raise FileNotFoundError(f"No scaler matching '{pattern}' in {matrix_dir} — train first.")
     return joblib.load(sorted(hits)[0])
-
-
-def _window_refs(df, ept_dates, unique_days, threshold):
-    """The frame-local thermal state (heat_streak, day_index, doy) for THIS window, using the
-    persisted threshold. build_thermal_references does this from the full history; here the
-    window is enough because the longest heat streak (~21 d) fits inside a 30-day window."""
-    temp = df['Temp_F'].values
-    doy = pd.to_datetime(df['Datetime_EPT']).dt.dayofyear.values
-    daily = pd.DataFrame({'t': temp, 'd': ept_dates}).groupby('d')['t'].mean()
-    daily_mean_temp = daily.reindex(unique_days).values
-    heat_streak = build_heat_streak(daily_mean_temp, threshold)
-    day_index = {d: k for k, d in enumerate(unique_days)}
-    return heat_streak, day_index, doy
 
 
 def build_sequence_sample(window_df, target_day, matrix_dir=None):
@@ -60,11 +49,8 @@ def build_sequence_sample(window_df, target_day, matrix_dir=None):
     lb = TRANSFORMER_FEATURE_CONFIG['lookback_hours']
     hh = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
 
-    seq_scaler    = _load_scaler(matrix_dir, f'scaler_ts_lb{lb}_h{hh}.pkl')
-    static_scaler = _load_scaler(matrix_dir, f'macro_scaler_lb{lb}_h{hh}.pkl')
-    refs = thermal_refs.load(matrix_dir)
-    climatology, threshold = refs['climatology'], refs['threshold']
-
+    seq_scaler    = _load_scaler(matrix_dir, f'scaler_ts_lb{lb}_h{hh}{MATRIX_TAG}.pkl')
+    static_scaler = _load_scaler(matrix_dir, f'macro_scaler_lb{lb}_h{hh}{MATRIX_TAG}.pkl')
     df = window_df.sort_index().copy()
     add_thermal_sequence_cols(df)                       # CDD_h/HDD_h/rolling — same as training
 
@@ -77,7 +63,6 @@ def build_sequence_sample(window_df, target_day, matrix_dir=None):
     est_raw  = df['Load_Estimated'].values
     temp_raw = df['Temp_F'].values
     cdd_raw  = df['CDD_h'].values
-    heat_streak, day_index, doy = _window_refs(df, ept_dates, unique_days, threshold)
 
     # Cutoff day: training forecasts unique_days[i+1] with the cutoff on unique_days[i] (the day
     # BEFORE the target) at latest_info_hour. So the cutoff is target-1 for hh<=9, target-2 above.
@@ -99,15 +84,24 @@ def build_sequence_sample(window_df, target_day, matrix_dir=None):
     if np.isnan(X_window).any():
         raise ValueError(f"NaN inside the {lb} h lookback for {target_day} — fix the input data.")
 
-    fc_raw = _forecast_for(_load_forecast(), target_day, temp_raw, ept_hours, cutoff_pos, lb, threshold)
+    fc_raw = _forecast_for(_load_forecast(), target_day, temp_raw, ept_hours, cutoff_pos, lb)
     if fc_raw is None:
         raise ValueError(f"No complete 48 h forecast for {target_day} — cannot forecast it.")
 
     macro_raw   = compute_macro_features(est_raw, ept_hours, cutoff_pos)
-    thermal_raw = compute_thermal_static(
-        temp_raw, cdd_raw, doy, cutoff_pos, day_index[ept_dates[cutoff_pos - 1]],
-        heat_streak, climatology)
-    static_raw = np.concatenate([macro_raw, thermal_raw, fc_raw]).astype('float32')
+    thermal_raw = compute_thermal_static(temp_raw, cdd_raw, cutoff_pos)
+    blocks = [macro_raw, thermal_raw, fc_raw]
+    cong_table = _load_congestion(hh)
+    if cong_table is not None:
+        cong_raw = compute_congestion_features(cong_table, target_day)
+        if cong_raw is None:
+            # Training drops such a day; serving must not silently substitute zeros, which
+            # would read as a completely unconstrained grid rather than as missing data.
+            raise ValueError(
+                f"No Day-Ahead marginal value for {target_day}'s blind-spot day — cannot "
+                f"forecast it. Re-run the congestion fetch (cleaned/congestion.csv).")
+        blocks.append(cong_raw)
+    static_raw = np.concatenate(blocks).astype('float32')
 
     # Forecast-day calendar, broadcast across the window (same order as training).
     tmrw_pos = np.where(ept_dates == target_day)[0]
@@ -132,10 +126,6 @@ def build_tree_sample(window_df, target_day, matrix_dir=None):
     matrix_dir = matrix_dir or MATRIX_DIR
     lb = TREE_FEATURE_CONFIG['lookback_hours']
     hh = TREE_FEATURE_CONFIG['latest_info_hour']
-    climatology = None
-    refs = thermal_refs.load(matrix_dir)
-    climatology, threshold = refs['climatology'], refs['threshold']
-
     df = window_df.sort_index().copy()
     add_thermal_sequence_cols(df)
 
@@ -146,7 +136,6 @@ def build_tree_sample(window_df, target_day, matrix_dir=None):
     feature_cols = ['Load_Estimated'] + WEATHER_COLS + THERMAL_SEQ_COLS
     data_array = df[feature_cols].values                 # raw, NOT scaled
     est_raw, temp_raw, cdd_raw = df['Load_Estimated'].values, df['Temp_F'].values, df['CDD_h'].values
-    heat_streak, day_index, doy = _window_refs(df, ept_dates, unique_days, threshold)
 
     k = np.where(unique_days == target_day)[0]
     if len(k) == 0:
@@ -162,7 +151,7 @@ def build_tree_sample(window_df, target_day, matrix_dir=None):
     past_window = data_array[cutoff_pos - lb:cutoff_pos]
     if np.isnan(past_window).any():
         raise ValueError(f"NaN inside the {lb} h lookback for {target_day}.")
-    fc_raw = _forecast_for(_load_forecast(), target_day, temp_raw, ept_hours, cutoff_pos, lb, threshold)
+    fc_raw = _forecast_for(_load_forecast(), target_day, temp_raw, ept_hours, cutoff_pos, lb)
     if fc_raw is None:
         raise ValueError(f"No complete 48 h forecast for {target_day}.")
 
@@ -181,13 +170,20 @@ def build_tree_sample(window_df, target_day, matrix_dir=None):
     macro_raw = compute_macro_features(est_raw, ept_hours, cutoff_pos)
     for nm, val in zip(MACRO_FEATURE_NAMES, macro_raw):
         f[nm] = float(val)
-    thermal_raw = compute_thermal_static(
-        temp_raw, cdd_raw, doy, cutoff_pos, day_index[ept_dates[cutoff_pos - 1]],
-        heat_streak, climatology)
+    thermal_raw = compute_thermal_static(temp_raw, cdd_raw, cutoff_pos)
     for nm, val in zip(THERMAL_STATIC_NAMES, thermal_raw):
         f[nm] = float(val)
     for nm, val in zip(FC_FEATURE_NAMES, fc_raw):
         f[nm] = float(val)
+    cong_table = _load_congestion(hh)
+    if cong_table is not None:
+        cong_raw = compute_congestion_features(cong_table, target_day)
+        if cong_raw is None:
+            raise ValueError(
+                f"No Day-Ahead marginal value for {target_day}'s blind-spot day — cannot "
+                f"forecast it. Re-run the congestion fetch (cleaned/congestion.csv).")
+        for nm, val in zip(CONG_FEATURE_NAMES, cong_raw):
+            f[nm] = float(val)
 
     return pd.DataFrame([f], index=pd.Index([target_day], name='timestamp'))
 
@@ -203,8 +199,9 @@ def verify_against_matrix(cleaned_path, matrix_dir=None, n_days=5, atol=1e-4):
     matrix_dir = matrix_dir or MATRIX_DIR
     lb = TRANSFORMER_FEATURE_CONFIG['lookback_hours']
     hh = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
-    X_train = np.load(os.path.join(matrix_dir, f'X_3d_lb{lb}_h{hh}.npy'))
-    ts_train = np.load(os.path.join(matrix_dir, f'timestamps_3d_lb{lb}_h{hh}.npy'), allow_pickle=True)
+    X_train = np.load(os.path.join(matrix_dir, f'X_3d_lb{lb}_h{hh}{MATRIX_TAG}.npy'))
+    ts_train = np.load(os.path.join(matrix_dir, f'timestamps_3d_lb{lb}_h{hh}{MATRIX_TAG}.npy'),
+                       allow_pickle=True)
 
     full = pd.read_csv(cleaned_path, index_col=0, parse_dates=True).sort_index()
     ept_full = pd.to_datetime(full['Datetime_EPT'])
@@ -231,7 +228,7 @@ def verify_against_matrix(cleaned_path, matrix_dir=None, n_days=5, atol=1e-4):
     # --- tree (2D) path: compare against the cached X_opt (minus is_target_valid) ---
     tlb = TREE_FEATURE_CONFIG['lookback_hours']
     thh = TREE_FEATURE_CONFIG['latest_info_hour']
-    xopt_path = os.path.join(matrix_dir, f'X_opt_lb{tlb}_h{thh}.csv')
+    xopt_path = os.path.join(matrix_dir, f'X_opt_lb{tlb}_h{thh}{MATRIX_TAG}.csv')
     if os.path.exists(xopt_path):
         X_opt = pd.read_csv(xopt_path, index_col=0)
         X_opt.index = pd.to_datetime(X_opt.index).date

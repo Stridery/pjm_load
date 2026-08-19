@@ -7,8 +7,8 @@ Two differences from the training crawler (run_pipeline):
     Load_Estimated + weather but no metered yet). Training drops those; serving's lookback
     reads Load_Estimated, so it needs them.
   - it only fetches the current + previous year. Serving needs ~40 days of history, not six
-    years; the 6-year climatology it also needs is already a persisted constant (thermal_refs),
-    not something rebuilt from data.
+    years, and every feature is now computed from that window alone — no train-fitted constant
+    has to travel with the weights.
 
 The forecast weather is the SAME source and format as training (open_meteo_forecast's
 historical-forecast archive, keyed by issue_date/lead_day), so the forecast-day features are
@@ -21,7 +21,8 @@ from datetime import date
 
 import pandas as pd
 
-from src.config import CRAWLER_CONFIG, LOAD_ESTIMATED_DIVISOR, FORECAST_PATH
+from src.config import (CRAWLER_CONFIG, LOAD_ESTIMATED_DIVISOR, FORECAST_PATH,
+                        CONGESTION_CONFIG)
 from src.data_crawler import open_meteo as om
 from src.data_crawler import open_meteo_forecast as omf
 from src.data_crawler.aligner import merge_and_align
@@ -90,6 +91,15 @@ def fetch_recent(zone, days=45, data_root='data'):
     # forecast.csv where _load_forecast (the feature layer) reads it.
     clean_forecast(forecast_dir, os.path.join(cleaned_dir, 'forecast.csv'))
     assert FORECAST_PATH.endswith(os.path.join(zone, 'cleaned', 'forecast.csv')) or zone not in FORECAST_PATH
+
+    # 5. Day-Ahead marginal value → congestion.csv, where _load_congestion reads it. The
+    # blind-spot day of the farthest target is the day this job runs on, whose DA cleared at
+    # ~13:30 EPT the day before — so a same-day refresh always has it. Re-stitching the whole
+    # table (not just the new year) keeps the trailing window continuous across a New Year.
+    if CONGESTION_CONFIG['enabled']:
+        from src.data_crawler.pjm_marginal_value import fetch_marginal_value, clean_marginal_value
+        fetch_marginal_value(years, raw_dir)
+        clean_marginal_value(raw_dir, os.path.join(cleaned_dir, 'congestion.csv'))
 
     cutoff = cleaned.index.max() - pd.Timedelta(days=days)
     return cleaned[cleaned.index > cutoff].copy(), _best_metered(raw_dir)

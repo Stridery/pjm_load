@@ -36,7 +36,59 @@ RESULT_ROOT = f'results/{DATASET}'
 MERGED_PATH      = f'data/{DATASET}/joined/merged_pjm_load_weather.csv'
 CLEANED_PATH     = f'data/{DATASET}/cleaned/cleaned_pjm_load_weather.csv'   # labelled rows -> training
 FORECAST_PATH    = f'data/{DATASET}/cleaned/forecast.csv'                   # archived weather forecasts
+CONGESTION_PATH  = f'data/{DATASET}/cleaned/congestion.csv'                 # hourly DA shadow prices
 MATRIX_DIR       = f'data/{DATASET}/matrix/'
+
+# --- Congestion (PJM Day-Ahead marginal value) ---
+# RTO-wide transmission-constraint shadow prices for the BLIND-SPOT DAY (the day between the
+# cutoff and the target day, which the 168 h lookback cannot see). Spliced into the STATIC
+# feature block at matrix-build time, exactly like the forecast weather above; the cleaned
+# load CSV doesn't carry it. See src/congestion_features.py for what the features are and
+# src/data_crawler/pjm_marginal_value.py for why Day-Ahead and why RTO-wide rather than
+# per-zone. Days with no Day-Ahead data at all are dropped from the matrix.
+CONGESTION_CONFIG = {
+    # 0 reverts every artifact to its pre-congestion shape — matrices, scalers, model run
+    # dirs and the serving lookup all key off MATRIX_TAG below, so the old feature set stays
+    # fully reproducible rather than being replaced. Verified bit-identical: building with
+    # PJM_CONGESTION=0 reproduces the pre-congestion matrix exactly.
+    #
+    # The flag is part of MATRIX_TAG rather than a silent switch because the static block's
+    # WIDTH depends on it: flipping it while a matrix cache sat on disk would otherwise feed
+    # a narrower sample to models trained on the wider one, with no error until the
+    # numbers came out wrong.
+    #
+    # Overridable per run, like PJM_DATASET, so an A/B needs no file edit (and cannot be left
+    # flipped by accident):
+    #     PJM_CONGESTION=0 python Model_Training.py
+    #     PJM_CONGESTION=1 python Model_Training.py
+    'enabled': int(os.environ.get('PJM_CONGESTION', 1)),
+
+    # The trailing-mean windows the departures are taken against live in
+    # src/congestion_features (W_SHORT / W_PRIMARY / W_LONG) rather than here: changing them
+    # changes what the features MEAN, so they belong with the definitions and the measurement
+    # that justifies them, not in a knob that looks tunable per run.
+}
+
+# Matrix-cache / scaler / model-run-dir tag. Every artifact whose CONTENT depends on the
+# static block's width carries it, so a cache or a set of weights built under one setting can
+# never be silently reused under another. Read identically by src/feature_engine,
+# src/models/_utils.run_tag and src/serving.
+MATRIX_TAG = '_cong' if CONGESTION_CONFIG['enabled'] else ''
+
+# The two tags this repo writes. Needed because '' is a suffix of everything: with the block
+# off, a plain endswith('') test would happily match a '_cong' directory and load weights that
+# expect the wider sample. Longest match wins.
+#
+# Feature-set changes are NOT versioned into the tag — obsolete artifacts are deleted instead,
+# which is why there is no '_cong2'/'_s2'. That keeps the naming honest, but it does mean a
+# change to the block's contents must be followed by wiping data/{zone}/matrix*: the builders
+# cache on filename alone, so a stale matrix under the same name would be silently reused.
+MATRIX_TAGS = ('', '_cong')
+
+
+def matrix_tag_of(name):
+    """The tag `name` (a matrix filename stem or a model run dir) was written under."""
+    return max((t for t in MATRIX_TAGS if name.endswith(t)), key=len)
 
 # --- Load_Estimated scale correction (per zone) ---
 # Most zones publish their OWN preliminary load, so Load_Estimated is already at zone scale
@@ -129,6 +181,20 @@ TRAIN_CONFIG = {
     'moe_lstm':            1,
     'moe_lstm_residual':   1,
 }
+
+# Per-run override: train ONLY these models, comma-separated, everything else skipped.
+#     PJM_TRAIN_ONLY=transformer_residual python Model_Training.py
+# For probing one change on one model without editing (and having to restore) the dict above
+# — the A/B of the congestion block being the case in point. Unknown names are rejected here
+# rather than silently training nothing, which is what a typo would otherwise look like.
+_TRAIN_ONLY = os.environ.get('PJM_TRAIN_ONLY', '').strip()
+if _TRAIN_ONLY:
+    _wanted = {s.strip() for s in _TRAIN_ONLY.split(',') if s.strip()}
+    _unknown = _wanted - set(TRAIN_CONFIG)
+    if _unknown:
+        raise ValueError(f"PJM_TRAIN_ONLY names unknown model(s): {sorted(_unknown)}. "
+                         f"Valid: {sorted(TRAIN_CONFIG)}")
+    TRAIN_CONFIG = {k: int(k in _wanted) for k in TRAIN_CONFIG}
 
 # ---------------------------------------------------------------------------
 # Regime / Mixture-of-Experts definition (used by MoE Transformer)
@@ -437,6 +503,151 @@ MOE_LSTM_RESIDUAL_PARAMS = {
     **MOE_LSTM_PARAMS,
     'baseline': _RESIDUAL_BASELINE,
 }
+
+# ---------------------------------------------------------------------------
+# Probabilistic baselines — Xie & Hong (2018), IEEE TSG 9(3):1680-1687
+# ---------------------------------------------------------------------------
+# Temperature scenarios fed to an MLR point model, scored with the pinball loss. Driven by
+# train_quantile.py; shares NOTHING with the point-model stack above except the cleaned CSV
+# (no matrix cache, no scalers, no src/models registry — see src/quantile/__init__.py).
+QUANTILE_CONFIG = {
+    # Which of the paper's three MLR specifications to run (1 = run, 0 = skip).
+    #
+    # Vanilla is the shipped baseline, and it is the only one of the three that can be
+    # claimed as a reproduction: it is the GEFCom2012 benchmark model, with a frozen
+    # published specification the paper notes was "later reproduced by other scholars".
+    #   hong2014 - the paper states its variable list "may change from year to year
+    #              depending on the validation dataset that is used for the model selection
+    #              process", so there is no specification to reproduce; ours is an invented
+    #              instantiation. It scores within 0.5% of Vanilla either way.
+    #   tcube    - is literally GSP + poly3(T), and no PJM zone has a state-product series,
+    #              so substituting the linear Trend replaces HALF the model (in Vanilla the
+    #              same substitution is one term among 285 columns).
+    # Both were run before being switched off and reproduce the same qualitative findings
+    # (optimum at the same n, same shifted-date gain, bootstrap no better than fixed-date);
+    # their results are kept under results/{zone}/quantile/ as evidence. Flip to 1 to re-run.
+    'models': {'tcube': 0, 'vanilla': 1, 'hong2014': 0},
+
+    # Tail split on HOURLY rows, snapped back to an EPT day boundary so the per-day plots
+    # have no partial day at either end. 0.16 matches the point models, so the probabilistic
+    # baselines are scored on the same test period.
+    'test_frac': 0.16,
+
+    # Length of the estimation window ending at the split, in years (None = everything
+    # before the split). 3 is the paper's fixed rolling-window length, and on DOM it also
+    # matters a lot: the models carry growth in ONE linear Trend term (we have no GSP index
+    # to stand in for the paper's macroeconomic driver), so a longer window averages the
+    # zone's accelerating data-centre growth and under-forecasts the recent peaks. Measured
+    # on dom: perfect-weather MAPE 3.28% at 3 y vs 3.68% on the full 4.66 y, and mean error
+    # at the top decile +836 MW vs +1095 MW.
+    'train_years': 3,
+
+    # Scenario pool: complete calendar years of observed temperature that end strictly
+    # BEFORE the test period starts (the paper keeps 1976-2005 clear of its 2006-2011 test
+    # years). None = use every year that qualifies.
+    #
+    # Temperature is read from data/{zone}/raw/weather_long/ when that exists (run
+    # fetch_scenario_weather.py; ERA5 reaches back to 1940), otherwise it falls back to the
+    # cleaned CSV, which caps the pool at k=4. The long store is what makes the paper's
+    # central results reachable at all: its findings are functions of k over 1..30, and four
+    # points cannot show a curve flattening at fifteen. Verified to be the same series as the
+    # cleaned CSV — 35,060 overlapping hours agree to within 1e-6. Note the pool spans a
+    # warming climate (+0.85 F/decade at Richmond, +0.76 at Baltimore), so its oldest profiles
+    # run ~2.5 F cool; the paper assigns past temperatures date-by-date with no such
+    # adjustment and this follows it.
+    'scenario_years': None,
+
+    # Which k the grid is computed on. The n=0 column (fixed-date) is swept over EVERY
+    # available k, which is cheap and reproduces the paper's Fig. 2/3; the full k x n grid is
+    # restricted to the paper's own Table I columns, because a 30 x 41 grid spends most of its
+    # time sorting ensembles of thousands of scenarios for cells nobody reports.
+    'k_grid_shifted': [1, 2, 3, 4, 5, 10, 20, 30],
+
+    # Shifted-date sweep. The paper's rule of thumb is n = ceil(30/k - 1) — 7 for k=4, 29
+    # for k=1 — but the point of the grid is not to hardcode it: sweep 0..n_max and read the
+    # optimum off the result (its Table III). 40 covers the full range of its Table I,
+    # including the k=1 rule-of-thumb cell, and the sweep is cheap (the cost is the scenario
+    # cube, which is built once).
+    'n_max': 40,
+
+    # Block bootstrap: m and l in the paper's notation.
+    'bootstrap_block_days': 9,
+    'bootstrap_scenarios': 100,
+
+    'random_state': 42,
+    'result_dir': f'{RESULT_ROOT}/quantile',
+}
+
+
+# ---------------------------------------------------------------------------
+# Probabilistic baseline 2 — Liu, Nowotarski, Hong & Weron (2017), IEEE TSG 8(2):730-737
+# ---------------------------------------------------------------------------
+# Sister point forecasts -> quantile regression averaging. Driven by train_qra.py. Parallel
+# to QUANTILE_CONFIG in every structural respect: same one input (the cleaned CSV), no matrix
+# cache, no src/models registration, invisible to serving.
+QRA_CONFIG = {
+    'test_frac': 0.16,      # same tail split, so both baselines score the same test period
+    'val_days': 365,        # validation year: selects the recency orders, m, and L
+
+    # Sisters: `sisters_per_window` recency orders per estimation window (2 y and 3 y) = 8,
+    # chosen off a (lag, dma) grid by validation MAE. See src/quantile/sisters.py for why the
+    # orders are selected directly rather than via [26]'s four calibration schemes.
+    'sisters_per_window': 4,
+    'max_lag': 3,
+    'max_dma': 3,
+
+
+    'm_grid': [2, 3, 4, 5, 6, 7, 8],       # how many sisters QRA averages over
+
+    # QRA calibration windows, in days. The paper sweeps 91/122/183/365; 365 CANNOT fit this
+    # record and is dropped rather than faked. A 365-day window in front of a 365-day
+    # validation year pushes the earliest sister forecast to 2023-08, whose own 3-year
+    # estimation window would start 2020-08 — four months before the data begins. Keeping the
+    # full validation year and capping L at 183 is the better of the two trims: a half-year
+    # validation would select m and L on a seasonally lopsided sample, then apply them across
+    # a full test year.
+    'L_grid': [91, 122, 183],
+
+    # Refit cadence, in days. The paper re-estimates everything daily; 1 reproduces that.
+    # The validation sweep runs 21 (m, L) combinations, so it gets a coarser cadence — the
+    # weights barely move when a 183-day window slides by one day, and this is model
+    # SELECTION, not the reported result.
+    'sister_refit_every': 1,
+    'qra_refit_every_val': 7,
+    'qra_refit_every_test': 1,
+
+    'result_dir': f'{RESULT_ROOT}/qra',
+}
+
+
+# ---------------------------------------------------------------------------
+# Probabilistic baseline 3 — Li, Wang & Zhang (2020), IEEE TSG 11(2):1679-1690
+# ---------------------------------------------------------------------------
+# Fifteen base density models -> a Gaussian mixture whose weights minimise the CRPS, solved
+# as a small quadratic program. Driven by train_density.py. Same isolation as the other two
+# baselines: one input (the cleaned CSV), no matrix cache, no src/models registration.
+DENSITY_CONFIG = {
+    'test_frac': 0.16,        # same tail split as the other two, so T4 is the shared test set
+
+    # T2 tunes/reports the base models, T3 optimises the fifteen weights. The paper's split is
+    # 10:1:1:1 on two years; here T4 is pinned to the shared test period instead and these two
+    # take a fixed number of days before it. T3 only has to pin down fifteen weights — the
+    # paper itself allows five weeks — so lengthening it would only starve T1.
+    't2_days': 56,
+    't3_days': 56,
+
+    # Which of base_models.SPECS to run; None = all fifteen, as published.
+    'models': None,
+
+    # The paper reports Q_new positive definite in every case but does not prove it, so the
+    # solver multi-starts and reports the certificate rather than assuming it.
+    'n_starts': 8,
+    'random_state': 0,
+
+    'n_workers': None,        # None = the SLURM allocation, capped at 8
+    'result_dir': f'{RESULT_ROOT}/density',
+}
+
 
 # --- Evaluation Config ---
 EVAL_CONFIG = {

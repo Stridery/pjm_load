@@ -21,8 +21,12 @@ MATRIX_DIR = f"data/{DATASET}/matrix/"
 RESULT_ROOT = f"results/{DATASET}"
 LOOKBACK = 168
 HORIZON = 0
-X_OPT_PATH = os.path.join(MATRIX_DIR, f"X_opt_lb{LOOKBACK}_h{HORIZON}.csv")
-Y_OPT_PATH = os.path.join(MATRIX_DIR, f"y_opt_lb{LOOKBACK}_h{HORIZON}.csv")
+# Same rule as config.MATRIX_TAG, spelled out from the env var so this script keeps working
+# without importing the training stack (the paths above do the same). Hardcoding the tag here
+# would silently point the script at the wrong matrix the moment the flag was flipped.
+MATRIX_TAG = "_cong" if int(os.environ.get("PJM_CONGESTION", 1)) else ""
+X_OPT_PATH = os.path.join(MATRIX_DIR, f"X_opt_lb{LOOKBACK}_h{HORIZON}{MATRIX_TAG}.csv")
+Y_OPT_PATH = os.path.join(MATRIX_DIR, f"y_opt_lb{LOOKBACK}_h{HORIZON}{MATRIX_TAG}.csv")
 
 
 def _load_opt():

@@ -11,25 +11,23 @@
 
 (B) STATIC — one value per sample, broadcast alongside the calendar/macro features.
     These are things a rolling sequence CANNOT express:
-      heatwave_day_count          : consecutive days (to cutoff) with daily mean temp
-                                    >= threshold. A discrete state ("day 3 of the heat
-                                    wave") — rolling CDD only gives a continuous amount.
       temp_max_prev_day           : daily EXTREME; rolling means/sums flatten the peak.
       cdd_prev_day                : previous day's total cooling demand (complements the peak).
       temp_max_3d                 : intensity ceiling of the recent heat wave.
       cdd_ratio_d1_d2             : >1 heating up, <1 cooling off — a DIRECTION that a
                                     cumulative amount cannot give.
       temp_ma_d1_minus_d3         : 3-day temperature trend slope.
-      temp_anomaly_vs_climatology : previous-24h mean temp minus the historical mean for
-                                    that calendar day (train-set day-of-year +/-7d window).
-                                    The same 30C is an extreme anomaly in May but normal in
-                                    August — absolute temperature cannot express this.
 
-The heat threshold and the climatology are fit on the TRAINING portion only.
+Everything here is computed from the sample's OWN recent hours. There are deliberately no
+train-fitted references any more: `heatwave_day_count` (a heat-wave threshold) and
+`temp_anomaly_vs_climatology` (a day-of-year climatology) were dropped because they cost
+0.000% and 0.011% of LightGBM-residual gain between them, while forcing a persisted
+thermal_refs.pkl, a manual post-training extraction step, and a serving failure mode — serving
+sees ~30 days and cannot rebuild a 6-year climatology, so the constants had to travel with the
+weights. Removing them makes this module a pure function of the window it is handed.
 """
 
 import numpy as np
-import pandas as pd
 
 BASE_TEMP_F = 65.0
 
@@ -42,13 +40,11 @@ THERMAL_SEQ_COLS = [
 ]
 
 THERMAL_STATIC_NAMES = [
-    'heatwave_day_count',
     'temp_max_prev_day',
     'cdd_prev_day',
     'temp_max_3d',
     'cdd_ratio_d1_d2',
     'temp_ma_d1_minus_d3',
-    'temp_anomaly_vs_climatology',
 ]
 
 
@@ -100,44 +96,8 @@ def add_thermal_sequence_cols(df):
 # (B) Static features — train-fitted references
 # ---------------------------------------------------------------------------
 
-def build_heat_threshold(daily_mean_temp, daily_months, train_day_mask, pct=75):
-    """Heat-wave threshold = P75 of TRAINING summer (Jun-Aug) daily mean temp."""
-    sel = train_day_mask & np.isin(daily_months, [6, 7, 8])
-    vals = daily_mean_temp[sel]
-    vals = vals[~np.isnan(vals)]
-    return float(np.percentile(vals, pct)) if len(vals) else 75.0
-
-
-def build_heat_streak(daily_mean_temp, threshold):
-    """streak[i] = consecutive days up to and including day i with mean temp >= threshold."""
-    streak = np.zeros(len(daily_mean_temp), dtype='float32')
-    run = 0
-    for i, v in enumerate(daily_mean_temp):
-        run = run + 1 if (not np.isnan(v) and v >= threshold) else 0
-        streak[i] = run
-    return streak
-
-
-def build_climatology(temp, doy, train_row_mask, half_window=7):
-    """clim[d] = mean temp over TRAINING rows within +/- half_window days of
-    day-of-year d (circular). Fit on training rows only — no test leakage."""
-    clim = np.full(367, np.nan)
-    t_tr, d_tr = temp[train_row_mask], doy[train_row_mask]
-    for d in range(1, 367):
-        diff = np.abs(d_tr - d)
-        diff = np.minimum(diff, 366 - diff)          # wrap around the year
-        sel = diff <= half_window
-        if sel.any():
-            clim[d] = t_tr[sel].mean()
-    gm = t_tr.mean() if len(t_tr) else 0.0
-    return np.where(np.isnan(clim), gm, clim)
-
-
-def compute_thermal_static(temp, cdd, doy, cutoff_pos, day_idx, heat_streak, climatology):
-    """The 7 static thermal features for one sample (needs >= 72h before cutoff).
-
-    day_idx : index (into heat_streak) of the last FULL day before the cutoff.
-    """
+def compute_thermal_static(temp, cdd, cutoff_pos):
+    """The 5 static thermal features for one sample (needs >= 72h before cutoff)."""
     c = cutoff_pos
     d1 = slice(c - 24, c)            # previous 24h
     d2 = slice(c - 48, c - 24)       # 48-24h before
@@ -147,40 +107,11 @@ def compute_thermal_static(temp, cdd, doy, cutoff_pos, day_idx, heat_streak, cli
     cdd_d2 = float(cdd[d2].sum())
     t_ma_d1 = float(temp[d1].mean())
     t_ma_d3 = float(temp[d3].mean())
-    clim_doy = int(doy[c - 12])      # middle of the previous-24h window
 
     return np.array([
-        float(heat_streak[day_idx]),                 # heatwave_day_count
         float(temp[d1].max()),                       # temp_max_prev_day
         cdd_d1,                                      # cdd_prev_day
         float(temp[c - 72:c].max()),                 # temp_max_3d
         cdd_d1 / (cdd_d2 + 1e-3),                    # cdd_ratio_d1_d2  (>1 = heating up)
         t_ma_d1 - t_ma_d3,                           # temp_ma_d1_minus_d3
-        t_ma_d1 - float(climatology[clim_doy]),      # temp_anomaly_vs_climatology
     ], dtype='float32')
-
-
-def build_thermal_references(df, ept_dates, unique_days, split_idx):
-    """Precompute the train-fitted references shared by every sample.
-
-    Returns (heat_threshold, heat_streak over unique_days, climatology[1..366],
-             day_index dict date->position).
-    """
-    temp = df['Temp_F'].values
-    doy = pd.to_datetime(df['Datetime_EPT']).dt.dayofyear.values
-
-    train_row_mask = np.zeros(len(df), dtype=bool)
-    train_row_mask[:split_idx] = True
-
-    daily = pd.DataFrame({'t': temp, 'd': ept_dates}).groupby('d')['t'].mean()
-    daily_mean_temp = daily.reindex(unique_days).values
-    daily_months = pd.to_datetime(pd.Series(unique_days)).dt.month.values
-    train_day_mask = (pd.DataFrame({'m': train_row_mask, 'd': ept_dates})
-                      .groupby('d')['m'].any().reindex(unique_days).values)
-
-    thr = build_heat_threshold(daily_mean_temp, daily_months, train_day_mask)
-    streak = build_heat_streak(daily_mean_temp, thr)
-    clim = build_climatology(temp, doy, train_row_mask)
-    day_index = {d: k for k, d in enumerate(unique_days)}
-    print(f"Thermal: heat-wave threshold = {thr:.1f} F (train summer daily-mean P75)")
-    return thr, streak, clim, day_index, doy

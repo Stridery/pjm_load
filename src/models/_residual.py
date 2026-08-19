@@ -113,7 +113,7 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
     """Return (train, predict, evaluate) for a residual sequence model."""
     from sklearn.preprocessing import StandardScaler
 
-    from src.config import MATRIX_DIR, EMBARGO_DAYS
+    from src.config import MATRIX_DIR, EMBARGO_DAYS, MATRIX_TAG
     from src.feature_engine import _split_indices, apply_embargo
     from src.models._eval_utils import EvalUtils
     from src.models._utils import _make_run_dir
@@ -124,8 +124,8 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
     hh = feature_cfg['latest_info_hour']
 
     def _matrix_scalers():
-        seq = _glob_scaler(MATRIX_DIR, f'scaler_ts_lb{lb}_h{hh}.pkl')
-        ysc = _glob_scaler(MATRIX_DIR, f'y_scaler_lb{lb}_h{hh}.pkl')
+        seq = _glob_scaler(MATRIX_DIR, f'scaler_ts_lb{lb}_h{hh}{MATRIX_TAG}.pkl')
+        ysc = _glob_scaler(MATRIX_DIR, f'y_scaler_lb{lb}_h{hh}{MATRIX_TAG}.pkl')
         return seq, ysc
 
     def _scalers(model_path):

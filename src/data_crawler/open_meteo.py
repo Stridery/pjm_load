@@ -67,6 +67,7 @@ def _fetch_archive_chunk(
     start_date: str,
     end_date: str,
     timezone: str,
+    variables: list[str] | None = None,
 ) -> pd.DataFrame:
     resp = requests.get(
         _ARCHIVE_URL,
@@ -75,7 +76,7 @@ def _fetch_archive_chunk(
             "longitude":          lon,
             "start_date":         start_date,
             "end_date":           end_date,
-            "hourly":             ",".join(_HOURLY_VARS),
+            "hourly":             ",".join(variables or _HOURLY_VARS),
             "timezone":           timezone,
             "wind_speed_unit":    "mph",
             "temperature_unit":   "fahrenheit",
@@ -128,3 +129,29 @@ def fetch_weather_year(
     df = _fetch_archive_chunk(lat, lon, start_date, end_date, timezone)
     logger.info("  → %d hourly rows fetched for %d", len(df), year)
     return df
+
+
+def fetch_temperature_year(
+    lat: float,
+    lon: float,
+    year: int,
+    timezone: str = "America/New_York",
+) -> pd.DataFrame:
+    """One calendar year of hourly TEMPERATURE only, for weather-scenario generation.
+
+    Separate from fetch_weather_year on purpose. Scenario generation (Xie & Hong 2018) needs
+    decades of temperature and nothing else, while the training pipeline needs eleven
+    variables over the few years the load record covers. Fetching one column instead of
+    eleven is ~10x less data for a 30-year pull, and keeping it out of raw/weather/ means the
+    training pipeline's per-year cache is not polluted with years it must never train on.
+
+    ERA5 on this endpoint reaches back to 1940 (verified: 1940-07 returns 168/168 hourly
+    values). Timestamps are naive local time in `timezone`, exactly as fetch_weather_year.
+    """
+    from datetime import date, timedelta
+
+    end = min(date(year, 12, 31), date.today() - timedelta(days=1))
+    df = _fetch_archive_chunk(lat, lon, f"{year}-01-01", str(end), timezone,
+                              variables=["temperature_2m"])
+    logger.info("  temperature %d: %d hourly rows", year, len(df))
+    return df[["Temp_F"]]

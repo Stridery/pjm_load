@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bundle the serving artifacts (model weights + scalers + thermal refs) and upload them as a
+# Bundle the serving artifacts (model weights + scalers) and upload them as a
 # GitHub Release asset, so the daily CI job can download them without the ~180 MB living in git
 # history. Run this ONCE after every retrain.
 #
@@ -13,7 +13,7 @@ TAG="serving-latest"
 BUNDLE="serving_bundle.tar.gz"
 
 # Everything the serving predict path loads, and nothing else (no raw data — serving fetches
-# that fresh; no training matrices — only the scalers + thermal_refs.pkl are needed).
+# that fresh; no training matrices — only the scalers are needed).
 tar -czf "$BUNDLE" \
     models/dom models/bge \
     data/dom/matrix/*.pkl data/bge/matrix/*.pkl

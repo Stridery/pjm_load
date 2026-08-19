@@ -4,7 +4,10 @@ name: Daily forecast
 # The job holds no GPU and trains nothing — it only runs the models' predict paths on CPU.
 on:
   schedule:
-    - cron: '0 9 * * *'      # 09:00 UTC daily (~4-5am US Eastern), after PJM posts the day's load.
+    # GitHub cron is UTC-only — there is no TZ knob — so 8am Eastern has to be written as the
+    # UTC hour. 12:00 UTC == 08:00 EDT. Under EST (Nov-Mar) the same line fires at 07:00 local;
+    # both are well after PJM posts the day's load, so the hour drifts but nothing breaks.
+    - cron: '0 12 * * *'
   workflow_dispatch: {}       # allow a manual run from the Actions tab.
 
 # The job commits web/ + docs/ back to the branch.

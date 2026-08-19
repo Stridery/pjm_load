@@ -66,11 +66,14 @@ FC_FEATURE_NAMES = [f'fc_dev_h{h}' for h in range(24)] + [
     # --- absolute anchors (see module docstring) ---
     'fc_d1_temp_max',
     'fc_d1_temp_peak',      # mean over PEAK_HOURS
-    'fc_heatwave_days',     # 0/1/2: forecast days at or above the train-fitted heat threshold
 ]
 
+# `fc_heatwave_days` (forecast days at or above a train-fitted heat threshold) used to sit here.
+# It was the last consumer of that threshold, and at 0.069% of LightGBM-residual gain it was
+# not worth keeping a persisted train-fitted constant alive for — see src/thermal_features.
+
 N_FC_FEATURES = len(FC_FEATURE_NAMES)
-assert N_FC_FEATURES == 32, N_FC_FEATURES
+assert N_FC_FEATURES == 31, N_FC_FEATURES
 
 
 def load_forecast_table(path):
@@ -131,13 +134,12 @@ def _hourly_reference(win_temp, win_hours):
     return ref
 
 
-def compute_forecast_features(fc_d0, fc_d1, win_temp, win_hours, heat_threshold):
-    """The 32 forecast features for one sample, in FC_FEATURE_NAMES order.
+def compute_forecast_features(fc_d0, fc_d1, win_temp, win_hours):
+    """The 31 forecast features for one sample, in FC_FEATURE_NAMES order.
 
     fc_d0, fc_d1   : (24,) forecast temperature (F) for day d and the target day d+1
     win_temp       : (lookback,) observed temperature over the sample's lookback window
     win_hours      : (lookback,) EPT clock hour of each window row
-    heat_threshold : train-fitted heat-wave threshold from thermal_features.build_thermal_references
     """
     ref = _hourly_reference(win_temp, win_hours)
     dev = fc_d1 - ref                                    # the headline: 24 hourly departures
@@ -156,9 +158,6 @@ def compute_forecast_features(fc_d0, fc_d1, win_temp, win_hours, heat_threshold)
     prev_max = float(np.max(win_temp[-24:]))
     d0_max, d1_max = float(fc_d0.max()), float(fc_d1.max())
 
-    heat_days = int(float(fc_d0.mean()) >= heat_threshold) + \
-                int(float(fc_d1.mean()) >= heat_threshold)
-
     return np.array([
         *dev,
         d1_cdd - win_cdd_daily,
@@ -168,5 +167,4 @@ def compute_forecast_features(fc_d0, fc_d1, win_temp, win_hours, heat_threshold)
         (d0_cdd + d1_cdd) - 2.0 * win_cdd_daily,
         d1_max,
         float(fc_d1[PEAK_HOURS].mean()),
-        float(heat_days),
     ], dtype='float32')
