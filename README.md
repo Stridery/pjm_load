@@ -39,22 +39,43 @@ is a system-load-level proxy the models already see through the 168 h lookback.
 
     PJM_DATASET=dom python run_crawler.py       # fetches marginal value along with everything else
 
-### Switching it off
+### Run configuration
 
-`PJM_CONGESTION=0` (or `CONGESTION_CONFIG['enabled'] = 0`) drops the block. It flips
-`MATRIX_TAG`, which every artifact whose content depends on the static block's width carries —
-matrices, the three scalers, and the model run dirs:
+Four variables, read by `src/config.py`. The command line and the sbatch use the SAME names —
+the only difference is that the sbatch accepts a space-separated LIST where a single process
+takes one value, and loops.
+
+| variable | meaning | python | sbatch | default |
+|---|---|---|---|---|
+| `PJM_DATASET` | zone | one | list | `dom bge` (sbatch) / `dom` (python) |
+| `PJM_CONGESTION` | congestion block on/off | `0` or `1` | list | `1` |
+| `PJM_TRAIN_ONLY` | which models | comma-separated names, or `residual` | same | all of `TRAIN_CONFIG` |
+| `PJM_CRAWL` | refresh data first | — (run `run_crawler.py`) | `0`/`1` | `1` |
+
+    # one process, one zone, one arm
+    PJM_DATASET=dom PJM_CONGESTION=0 PJM_TRAIN_ONLY=residual python Model_Training.py
+
+    # the same thing in the queue, plus a second zone and a second arm
+    sbatch --export="ALL,PJM_CRAWL=0,PJM_CONGESTION=1 0,PJM_TRAIN_ONLY=residual" Train_Model.sbatch
+
+Quote the WHOLE `--export` argument whenever a value contains a space: sbatch splits its
+argument on commas, and the shell would otherwise end the argument at the space.
+
+Passing a list to python raises rather than doing something surprising — `PJM_DATASET="dom bge"`
+would otherwise write to `data/dom bge/`, and `PJM_CONGESTION="1 0"` would fail inside `int()`
+with no hint of where the value came from.
+
+### Switching the congestion block off
+
+`PJM_CONGESTION=0` drops the block. It flips `MATRIX_TAG`, which every artifact whose content
+depends on the static block's width carries — matrices, the three scalers, and the model run
+dirs:
 
     data/dom/matrix/X_opt_lb168_h0.csv                    data/dom/matrix/X_opt_lb168_h0_cong.csv
     models/dom/xgboost/tail_test0.16/                     models/dom/xgboost/tail_test0.16_cong/
     results/dom/evaluation/xgboost/tail_test0.16/         .../tail_test0.16_cong/
 
-So the two arms coexist instead of overwriting each other, and an A/B is just two runs — no
-file edit, nothing left flipped by accident:
-
-    PJM_CONGESTION=0 python Model_Training.py
-    PJM_CONGESTION=1 python Model_Training.py
-
+So the two arms coexist instead of overwriting each other, and an A/B is just two runs.
 `src/serving/predict` selects run dirs by tag, so it loads the weights matching the current
 setting and refuses a mismatch rather than feeding a model the wrong number of features.
 
@@ -64,19 +85,11 @@ hand: the builders cache on filename alone, so a matrix left from the previous d
 would be silently reused. `run_crawler.py` does that wipe as its last step, so a crawl covers
 it; a bare edit-then-train does not.
 
-### Training a subset
-
-`PJM_TRAIN_ONLY` restricts a run to named models (comma-separated), overriding `TRAIN_CONFIG`
-without editing it. Unknown names raise rather than silently training nothing.
-
-    PJM_TRAIN_ONLY=lightgbm_residual python Model_Training.py
-    PJM_TRAIN_ONLY=xgboost,xgboost_residual python Model_Training.py
-
 ### Comparing across time
 
 `run_pipeline` wipes `data/{zone}/matrix*` after every crawl, and a crawl also extends the
 cleaned CSV — which moves the tail-0.16 test boundary. Metrics written under different cleaned
-CSVs are not comparable, so an A/B must run both arms against the SAME crawl (`CRAWL=0` on the
+CSVs are not comparable, so an A/B must run both arms against the SAME crawl (`PJM_CRAWL=0` on the
 second one, or no crawl at all). The durable record is the
 `results/{zone}/evaluation/**/**_metrics.txt` files themselves.
 

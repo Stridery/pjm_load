@@ -2,7 +2,16 @@
 import os
 
 # --- Dataset Selection (controls all data / model / result paths) ---
-DATASET = os.environ.get('PJM_DATASET', 'dom')   # override: PJM_DATASET=dom python ...
+# ONE zone per process: every path below is baked from it at import, so a process cannot
+# straddle two zones. Train_Model.sbatch accepts a space-separated LIST in the same variable
+# and loops, handing one zone to each child — hence the guard, which turns "I passed the
+# sbatch spelling to python" into a sentence instead of a mkdir called 'data/dom bge'.
+_DATASET = os.environ.get('PJM_DATASET', 'dom').strip()
+if len(_DATASET.split()) != 1:
+    raise ValueError(
+        f"PJM_DATASET={_DATASET!r} names {len(_DATASET.split())} zones. A single process runs "
+        f"exactly one zone; pass a list only to Train_Model.sbatch, which loops over it.")
+DATASET = _DATASET
 
 # --- Weather Features (per dataset) ---
 # dom columns match the output of data_crawler (Open-Meteo native variables).
@@ -46,6 +55,15 @@ MATRIX_DIR       = f'data/{DATASET}/matrix/'
 # load CSV doesn't carry it. See src/congestion_features.py for what the features are and
 # src/data_crawler/pjm_marginal_value.py for why Day-Ahead and why RTO-wide rather than
 # per-zone. Days with no Day-Ahead data at all are dropped from the matrix.
+# Parsed before the dict so the error names the variable rather than surfacing as an opaque
+# int() failure. Same shape as PJM_DATASET: one value per process, a list only to the sbatch.
+_CONG = os.environ.get('PJM_CONGESTION', '1').strip()
+if _CONG not in ('0', '1'):
+    raise ValueError(
+        f"PJM_CONGESTION={_CONG!r} is not 0 or 1. A single process runs one arm; pass a list "
+        f"(e.g. \"1 0\") only to Train_Model.sbatch, which loops over it.")
+_CONGESTION = int(_CONG)
+
 CONGESTION_CONFIG = {
     # 0 reverts every artifact to its pre-congestion shape — matrices, scalers, model run
     # dirs and the serving lookup all key off MATRIX_TAG below, so the old feature set stays
@@ -61,7 +79,7 @@ CONGESTION_CONFIG = {
     # flipped by accident):
     #     PJM_CONGESTION=0 python Model_Training.py
     #     PJM_CONGESTION=1 python Model_Training.py
-    'enabled': int(os.environ.get('PJM_CONGESTION', 1)),
+    'enabled': _CONGESTION,
 
     # The trailing-mean windows the departures are taken against live in
     # src/congestion_features (W_SHORT / W_PRIMARY / W_LONG) rather than here: changing them
@@ -184,16 +202,27 @@ TRAIN_CONFIG = {
 
 # Per-run override: train ONLY these models, comma-separated, everything else skipped.
 #     PJM_TRAIN_ONLY=transformer_residual python Model_Training.py
+#     PJM_TRAIN_ONLY=residual python Model_Training.py        # every *_residual model
 # For probing one change on one model without editing (and having to restore) the dict above
 # — the A/B of the congestion block being the case in point. Unknown names are rejected here
 # rather than silently training nothing, which is what a typo would otherwise look like.
 _TRAIN_ONLY = os.environ.get('PJM_TRAIN_ONLY', '').strip()
 if _TRAIN_ONLY:
-    _wanted = {s.strip() for s in _TRAIN_ONLY.split(',') if s.strip()}
-    _unknown = _wanted - set(TRAIN_CONFIG)
-    if _unknown:
-        raise ValueError(f"PJM_TRAIN_ONLY names unknown model(s): {sorted(_unknown)}. "
-                         f"Valid: {sorted(TRAIN_CONFIG)}")
+    if _TRAIN_ONLY == 'residual':
+        # Shorthand, resolved HERE rather than by whoever sets the variable. A caller that
+        # tried to expand it first would have to import this module to read TRAIN_CONFIG —
+        # and this module validates PJM_TRAIN_ONLY at import, so the expansion would die on
+        # the very word it was expanding. Deriving it from the registry also picks up models
+        # added later.
+        _wanted = {m for m in TRAIN_CONFIG if m.endswith('_residual')}
+    else:
+        _wanted = {s.strip() for s in _TRAIN_ONLY.split(',') if s.strip()}
+        _unknown = _wanted - set(TRAIN_CONFIG)
+        if _unknown:
+            raise ValueError(f"PJM_TRAIN_ONLY names unknown model(s): {sorted(_unknown)}. "
+                             f"Valid: {sorted(TRAIN_CONFIG)}, or the shorthand 'residual'.")
+    # Applies to BOTH branches — keeping this inside the else was what made
+    # PJM_TRAIN_ONLY=residual compute the right set and then silently train all sixteen.
     TRAIN_CONFIG = {k: int(k in _wanted) for k in TRAIN_CONFIG}
 
 # ---------------------------------------------------------------------------
