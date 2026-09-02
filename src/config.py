@@ -31,7 +31,11 @@ _WEATHER_COLS = {
 WEATHER_COLS = _WEATHER_COLS.get(DATASET, [])  # empty for 'joint'; joint uses _WEATHER_COLS per zone
 
 from src.thermal_features import THERMAL_SEQ_COLS   # per-hour thermal feats (go into the lookback)
-N_SEQ_FEATURES = 1 + len(WEATHER_COLS) + len(THERMAL_SEQ_COLS)   # Load + weather + thermal
+# Real-Time LMP channels join the lookback only when PJM_LMP is on, so the sequence width
+# follows the switch. Defined after LMP_CONFIG below would be circular — the count is taken
+# from the module rather than the config, and the config's switch is applied where the columns
+# are actually assembled (src/feature_engine).
+from src.lmp_features import LMP_SEQ_COLS       # per-hour price feats (go into the lookback)
 
 # --- Forecast Weather ---
 # Always on: the 48 h forecast issued the day before the cutoff (day d + the target day) is
@@ -46,6 +50,7 @@ MERGED_PATH      = f'data/{DATASET}/joined/merged_pjm_load_weather.csv'
 CLEANED_PATH     = f'data/{DATASET}/cleaned/cleaned_pjm_load_weather.csv'   # labelled rows -> training
 FORECAST_PATH    = f'data/{DATASET}/cleaned/forecast.csv'                   # archived weather forecasts
 CONGESTION_PATH  = f'data/{DATASET}/cleaned/congestion.csv'                 # hourly DA shadow prices
+LMP_PATH         = f'data/{DATASET}/cleaned/lmp_da.csv'                     # hourly DA zonal prices
 MATRIX_DIR       = f'data/{DATASET}/matrix/'
 
 # --- Congestion (PJM Day-Ahead marginal value) ---
@@ -87,11 +92,57 @@ CONGESTION_CONFIG = {
     # that justifies them, not in a knob that looks tunable per run.
 }
 
+# --- Zonal LMP (PJM Day-Ahead + Real-Time hourly prices) ---
+# Fetched by the crawler into data/{zone}/raw/lmp.csv. Off-switch mirrors PJM_CONGESTION:
+# turning it off also stops paying for the download.
+#
+# Not yet consumed by any feature block — the crawler produces the file and nothing reads it.
+# Wiring it into the lookback (RT) or the blind-spot static block (DA) changes the feature set,
+# which invalidates every cached matrix and every trained model, so it is a separate decision
+# from having the data on disk.
+# THREE settings, because the block has two halves that cost very differently:
+#
+#   0  off
+#   1  full      — the 3 Real-Time lookback channels (504 columns) AND the 10 Day-Ahead statics
+#   2  statics   — the 10 Day-Ahead statics only, no lookback channels
+#
+# 2 exists because a LightGBM gain breakdown on the '_cong_lmp' arm put the three RT channels
+# at 1.81% of total gain for 504 columns, while the ten statics took 25.35% — and the arm
+# still scored WORSE than '_cong' (3.541% vs 3.462%, peak 4.985% vs 4.768%). High training
+# gain with worse test error is the signature of a proxy the model over-trusts: price is a
+# DOWNSTREAM consequence of load, so it correlates hard in-sample while carrying supply-side
+# noise (outages, fuel, bidding) that has nothing to do with load. Setting 2 drops the half
+# that bought the least per column, so the two halves can be blamed separately.
+_LMP = os.environ.get('PJM_LMP', '1').strip()
+if _LMP not in ('0', '1', '2'):
+    raise ValueError(f"PJM_LMP={_LMP!r} is not 0, 1 or 2 (off / full / statics-only).")
+_LMP = int(_LMP)
+LMP_CONFIG = {
+    'enabled':    _LMP > 0,    # read cleaned/lmp_da.csv and splice the static block
+    'lookback':   _LMP == 1,   # additionally put the 3 RT price channels in the sequence
+    'normalised': _LMP == 2,   # use the drift-normalised static block (z-scores + shape)
+}
+
+# Per-timestep lookback width: Load_Estimated + weather + thermal, plus the three Real-Time
+# price channels when the LMP block is on. Defined HERE rather than beside the imports because
+# it depends on the switch above, and the sequence models' n_seq_features reads it.
+N_SEQ_FEATURES = (1 + len(WEATHER_COLS) + len(THERMAL_SEQ_COLS)
+                  + (len(LMP_SEQ_COLS) if LMP_CONFIG['lookback'] else 0))
+
 # Matrix-cache / scaler / model-run-dir tag. Every artifact whose CONTENT depends on the
-# static block's width carries it, so a cache or a set of weights built under one setting can
+# feature set's width carries it, so a cache or a set of weights built under one setting can
 # never be silently reused under another. Read identically by src/feature_engine,
 # src/models/_utils.run_tag and src/serving.
-MATRIX_TAG = '_cong' if CONGESTION_CONFIG['enabled'] else ''
+#
+# TWO INDEPENDENT SWITCHES, composed in a fixed order. Each run names both explicitly and
+# trains one arm; the four arms coexist on disk, so any A/B is just two runs:
+#
+#     PJM_CONGESTION=1 PJM_LMP=1   ->  '_cong_lmp'       everything
+#     PJM_CONGESTION=1 PJM_LMP=2   ->  '_cong_lmpstat'   price statics, no price lookback
+#     PJM_CONGESTION=1 PJM_LMP=0   ->  '_cong'           the pre-price feature set
+#     PJM_CONGESTION=0 PJM_LMP=0   ->  ''                the original feature set
+_LMP_TAG = {0: '', 1: '_lmp', 2: '_lmpstat'}[_LMP]
+MATRIX_TAG = ('_cong' if CONGESTION_CONFIG['enabled'] else '') + _LMP_TAG
 
 # The two tags this repo writes. Needed because '' is a suffix of everything: with the block
 # off, a plain endswith('') test would happily match a '_cong' directory and load weights that
@@ -101,7 +152,9 @@ MATRIX_TAG = '_cong' if CONGESTION_CONFIG['enabled'] else ''
 # which is why there is no '_cong2'/'_s2'. That keeps the naming honest, but it does mean a
 # change to the block's contents must be followed by wiping data/{zone}/matrix*: the builders
 # cache on filename alone, so a stale matrix under the same name would be silently reused.
-MATRIX_TAGS = ('', '_cong')
+# '_lmpstat' deliberately does NOT end in '_lmp', so longest-suffix resolution keeps the two
+# LMP settings apart instead of reading a statics-only run dir as a full one.
+MATRIX_TAGS = ('', '_cong', '_lmp', '_lmpstat', '_cong_lmp', '_cong_lmpstat')
 
 
 def matrix_tag_of(name):
@@ -678,6 +731,75 @@ DENSITY_CONFIG = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Probabilistic baseline 4 — Zhang, Quan & Srinivasan (2019), IEEE TSG 10(4):4425-4434
+# ---------------------------------------------------------------------------
+# One neural network trained on the summed pinball loss emits all 99 percentiles at once.
+# Driven by train_qrnn.py. Same isolation as the other three baselines: one input (the
+# cleaned CSV), no matrix cache, no src/models registration, invisible to serving.
+QRNN_CONFIG = {
+    'test_frac': 0.16,      # same tail split, so all four baselines score the same hours
+
+    # Validation year: early stopping and the choice between network configurations. The
+    # paper gives those two jobs to two separate stages and re-trains in between; see
+    # src/quantile/../qrnn/features.split_masks for why they are collapsed here.
+    'val_days': 365,
+
+    # Which of model.SPECS to run (1 = run, 0 = skip).
+    #
+    # The 500 pair plus the bQRNN control is the minimum set that supports the paper's
+    # central claim, and it is what runs by default. The 4000 pair exists only to test the
+    # SECONDARY claim about dropout — that it helps at 4000 neurons and hurts at 500 — and
+    # at 16.8M parameters it is ~20x the cost of the 500 pair. Flip both to 1 on a GPU node
+    # (Train_Model.sbatch's partition) to get that ablation; on CPU expect ~10 min per run.
+    'models': {'iQRNN-500': 1, 'iQRNN-500-ZD': 1, 'bQRNN-400': 1,
+               'iQRNN-4000': 0, 'iQRNN-4000-ZD': 0},
+
+    # Independent re-trainings per configuration. The paper runs 100 and reports mean and SD
+    # because its whole robustness argument is about SPREAD, not a single number: bQRNN's SD
+    # is 0.789 against iQRNN's 0.008. Five is enough to see that gap; raise it for a figure.
+    'n_runs': 5,
+
+    # --- feature selection (src/qrnn/features.py) ---------------------------------------
+    # Shortest observable load lag, and with it the ISSUE TIME. This is not a tuning knob:
+    # the two settings answer different questions and their scores are not interchangeable.
+    #   48  data through (D-1) 23:00, predict day D+1 — this repo's cutoff, the same one the
+    #       16 point models and the density baseline use. Every target hour of D+1 is then at
+    #       least 48 h from the last observation.
+    #   24  data through (D-1) 23:00, predict day D — matches src/quantile/qra.py's issue
+    #       time, which is a day nearer than everything else here. Use this, and say so, for
+    #       the strict head-to-head against QRA that the paper's headline claim is about.
+    # 48 is the default because it makes this baseline comparable with the larger set. The
+    # QRA row folded into test_scores.csv carries its own horizon label either way.
+    'load_lag_min': 48,
+
+    'n_features': 100,                                        # RFE target, as published
+    'manual_features': ['dayofweek', 'is_weekend', 'is_holiday'],   # the paper's add-backs
+    'rfe_step': 0.35,        # fraction dropped per round; 1-at-a-time is 1545 forest fits
+    'rfe_rows': 12000,       # row subsample for RFE only; the network sees every row
+    'rfe_trees': 40,
+    # 'absolute_error' is the paper's own choice (MAE = pinball at the 50th percentile, and
+    # cheaper than the quantile forest it stands in for). It is ~3x the cost of
+    # 'squared_error' here, which at these settings is ~5 min once and then cached.
+    'rfe_criterion': 'absolute_error',
+
+    # --- training (their Table II and Fig. 2) -------------------------------------------
+    'batch_size': 168,       # one week of hourly samples; the paper's stated reason is that
+                             # "the weekly pattern of electric load is considerably significant"
+    'max_epochs': 200,       # their Fig. 4 converges by ~150 with early stopping on
+    'lr': 1e-3,
+    'min_lr': 1e-5,          # their Table II
+    'lr_decay': 0.4,         # De
+    'lr_patience': 5,        # r — epochs without improvement before the rate is decayed
+    'stop_patience': 20,     # k — epochs without improvement before the run ends
+    'noise_sd': 0.3,         # SD of the Gaussian noise layers; their Fig. 9 optimum
+
+    'device': 'auto',        # 'auto' | 'cpu' | 'cuda'
+    'random_state': 42,
+    'result_dir': f'{RESULT_ROOT}/qrnn',
+}
+
+
 # --- Evaluation Config ---
 EVAL_CONFIG = {
     # Shared test split (all models use the same split)
@@ -774,5 +896,130 @@ JOINT_EVAL_CONFIG = {
         'model_type': 'transformer',
         'model_path': f'models/{JOINT_DATASET}/transformer/tail_test0.1_random_val0.1/transformer_best.pth',
         'date':       '2024-08-15',
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Foundation models (zero-shot, pre-trained elsewhere) — run_foundation.py
+# ---------------------------------------------------------------------------
+# A pre-trained univariate forecaster is handed the recent Load_Estimated history and asked
+# for the target day directly. Nothing is fitted on this data, so there is no train step and
+# no weights of ours to save.
+#
+# Isolated from src/models/ on the same terms as the three probabilistic baselines (see
+# src/foundation/__init__.py for the full reasoning): that package's registry is what
+# src/serving/predict.available_models() scans, and a model needing an optional ~1 GB
+# checkpoint would be picked up by the daily CI forecast job and break it.
+#
+# The RESULTS, however, are written into results/{zone}/evaluation/ alongside the 16 point
+# models, because comparing them is the entire point. Direct and residual land under separate
+# model names exactly like xgboost / xgboost_residual:
+#
+#   results/{zone}/evaluation/timesfm/tail_test0.16_cong_ctx512/
+#   results/{zone}/evaluation/timesfm_residual/tail_test0.16_cong_ctx512/
+FOUNDATION_CONFIG = {
+    # Which adapter to run. 'seasonal_naive' needs no dependencies and exists as a harness
+    # self-check: in direct mode it must reproduce the same-hour-last-week baseline that
+    # src/models/_residual.py leans on, which is a known number.
+    'model': 'timesfm',
+
+    # Context lengths to sweep, in hours. Each becomes its own run dir (_ctx{L}).
+    # 168 matches the point models' lookback; the longer ones are what a foundation model can
+    # actually use — one week cannot show it the annual cycle. Capped per adapter.
+    'context_hours': [144],     # six days: the point models' window minus metered's day of lag
+
+    # Which series the model is handed as context.
+    #   'estimated' — preliminary load. Current as of the real cutoff, but a PROXY for the
+    #                 target: dom carries a ~0.8% scale offset, bge a 3.3% SHAPE mismatch (its
+    #                 proxy is MIDATL/8.8, a regional aggregate).
+    #   'metered'   — the target series itself, so no proxy gap. But unverified metered trails
+    #                 preliminary by ~1 day (measured: exactly 24 h behind on both zones), so
+    #                 the cutoff moves back a day and the target day lands at forecast steps
+    #                 49-72 instead of 25-48. Fidelity bought with horizon.
+    #
+    # CAVEAT on 'metered': the backtest reads the cleaned CSV's Load column, which is VERIFIED
+    # metered. At forecast time only the UNVERIFIED value existed, and PJM revises it. No
+    # archived snapshots exist here, so that revision is unmeasurable and metered-context scores
+    # carry a small one-directional optimism.
+    'series': 'metered',        # 'estimated' | 'metered' — 3.0 forecasts metered directly
+
+    # WHEN a metered-context forecast can be issued. Metered trails preliminary by ~1 day, so
+    # one of two things has to give, and this says which. Ignored when series='estimated'.
+    #
+    #   'day_of'    the target day is kept at steps 25-48, so the metered window ends at
+    #               (d-2) 23:00 -- the SAME rows the preliminary window uses, only a different
+    #               column. Horizon stays 48 and there is no re-pairing to do. The cost is the
+    #               issue time: metered through (d-2) 23:00 only exists a day later than the
+    #               equivalent preliminary, so this forecast can first be produced at
+    #               d 00:00 -- the START OF THE TARGET DAY, not the day before.
+    #   'day_ahead' the issue time is kept at (d-1) 00:00, matching the 16 point models exactly.
+    #               The window then has to end at (d-3) 23:00 and the target moves to steps
+    #               49-72, so the horizon grows to 72. Fidelity bought with range.
+    #
+    # This is NOT a tuning knob: the two answer different questions and their scores are not
+    # interchangeable. 'day_of' is a day-of forecast issued at midnight; 'day_ahead' is the
+    # same task the 16 point models perform. The run tag, the name and metrics.txt all record
+    # which was used, so a scoreboard row cannot lose the distinction.
+    'metered_issue': 'day_ahead',   # keep the point models' issue time; see _covariates
+    'metered_lag_days': 1,          # measured publication lag; only used by 'day_ahead'
+
+    # Forecast steps requested from the model. 'auto' derives it from the data — how far each
+    # target day's final hour actually sits from the cutoff (48-49 for the preliminary series,
+    # 72-73 once metered's day of lag is added), plus slack. A hand-set number that came up
+    # short would silently drop days rather than fail, so 'auto' is the default.
+    # FIXED, not 'auto'. The covariate assembly fills the horizon from exactly three days —
+    # D-2 observed, D-1 and D from the 48 h forecast archive — so a horizon running past them
+    # would have nothing to put there.
+    #
+    # 73, not 72: those three days are normally 72 hours, but each November's fall-back day
+    # makes one of them 25 and the run needs 73. At 72 exactly 15 days over six years were
+    # dropped, all of them the three days around a fall-back — 3 of them in the test split. The
+    # extra step costs nothing: covariate rows are resolved by their own EPT date and hour, so
+    # a spring-forward day simply produces one step that lands past the target and is discarded
+    # with the rest of the horizon outside steps 49-72.
+    'horizon_steps': 73,
+
+    # 'direct'   : forecast Load_Estimated itself, then (optionally) correct to metered scale.
+    # 'residual' : forecast the deviation from the same-hour-last-week baseline, then add the
+    #              baseline back — the zero-shot analogue of src/models/*_residual.py. Its
+    #              floor is the naive baseline itself: a model that returns 0 reproduces it
+    #              exactly, so the gap to that baseline IS the model's contribution.
+    'modes': ['direct'],
+
+    # Load_Estimated -> metered scale correction, for DIRECT mode only (residual mode does not
+    # need it: the baseline it adds back is in the same Load_Estimated space, and the offset
+    # cancels). Measured on the full record:
+    #     dom  Est-as-Load MAPE 0.82% -> 0.22%   (a near-constant 1.0079 level offset)
+    #     bge                  3.30% -> 2.87%   (MIDATL/8.8 — a SHAPE mismatch, not a level)
+    # 'hourly_ratio' fits one median Est/Load ratio per EPT hour on the TRAIN split only and
+    # applies it unchanged to the test period — the same "fitted on train, frozen on test"
+    # arrangement the 16 point models get, rather than a trailing window that would reach into
+    # the test period for metered load that is weeks late in real time anyway.
+    # Both the corrected and uncorrected scores are always reported.
+    'est_to_metered': 'hourly_ratio',   # 'hourly_ratio' | 'none'
+
+    # Also evaluate the (unused-for-fitting) train split. Off by default: for a zero-shot model
+    # the train period carries no special meaning, and it is 5x the samples. Worth turning on
+    # once to read the seasonal bias off the train/test panels EvalUtils draws.
+    'eval_train': False,
+
+    'batch_size': 64,
+    'device': 'auto',          # 'auto' | 'cpu' | 'cuda'
+
+    # Where the results land — the SAME tree as the 16 point models, on purpose.
+    'result_root': f'{RESULT_ROOT}/evaluation',
+
+    'adapters': {
+        'timesfm': {
+            # TimesFM 3.0. The pip package is Apache-2.0 but THIS CHECKPOINT is under the
+            # TimesFM Non-Commercial License v1.0 (2.5 was Apache-2.0) — research only.
+            #   .venv/bin/pip install 'timesfm[torch]'
+            'checkpoint': 'google/timesfm-3.0-pytorch',
+            'covariates': True,       # pass past_only / past_future; False = univariate
+            'make_positive': True,    # load is strictly positive
+        },
+        'seasonal_naive': {
+            'period': 24 * 7,         # same hour, one week back
+        },
     },
 }

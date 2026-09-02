@@ -22,6 +22,22 @@ from src.serving.predict import forecast_day, available_models
 HORIZON_DAYS = 2      # forecast reaches this many days past the last complete day of data
 WINDOW_DAYS  = 8      # how many recent days to (re)forecast each run — self-seeds the store
 
+# Only the residual models are served. The direct ones lost to their residual twins on every
+# zone and every metric in the offline evaluation, so carrying them cost a column each in the
+# store and a line each on the chart to show a strictly worse forecast.
+#
+# What replaced them is the congestion A/B: the SAME eight models trained with and without the
+# Day-Ahead congestion block. The store therefore still holds sixteen prediction columns, but
+# they are now eight models x two feature sets rather than sixteen models x one — which is the
+# comparison actually worth looking at every day, since the congestion block's measured gain
+# (MAE -1.7%, peak MAPE -3.2% on dom) is small enough that it deserves watching in production
+# rather than being taken on a single offline run.
+#
+# One process serves ONE arm: MATRIX_TAG is baked from PJM_CONGESTION at config import, and
+# src/serving/predict refuses weights whose tag disagrees. So the daily job invokes this twice
+# per zone, and table.update merges the two column sets (a run only ever writes its own).
+ARM_SUFFIX = {'_cong': 'cong', '': 'nocong'}
+
 
 def _complete_days(df):
     """EPT dates that have a row reaching hour 23 (a full day; DST-safe — see the DST fix)."""
@@ -60,8 +76,18 @@ def _day_hours(df, target_day):
 
 
 def run_zone(zone, keep_days=10):
+    import src.config as cfg
+    arm = ARM_SUFFIX.get(cfg.MATRIX_TAG)
+    if arm is None:
+        raise SystemExit(f"No column suffix for MATRIX_TAG {cfg.MATRIX_TAG!r} — add one to "
+                         f"ARM_SUFFIX, or the two arms would overwrite each other in the store.")
     frame, metered = fetch_recent(zone)   # metered = best-available (incl. unverified), for scoring
-    models = available_models()
+    # Residual only — see ARM_SUFFIX above for why the direct models are no longer served.
+    models = [m for m in available_models() if m.endswith('_residual')]
+    if not models:
+        raise SystemExit(f"No residual-model weights for arm {arm!r} under models/{zone}/. "
+                         f"Train them, or drop this arm from the daily job.")
+    print(f"  arm {arm} ({cfg.MATRIX_TAG!r}): {len(models)} residual model(s)")
 
     complete = _complete_days(frame)
     if not complete:
@@ -84,7 +110,7 @@ def run_zone(zone, keep_days=10):
                  'metered': (float(metered[utc]) if utc in metered.index
                              and pd.notna(metered[utc]) else np.nan)}
             for m, p in preds.items():
-                r[f'{m}_pred'] = round(float(p[h]), 1)
+                r[f'{m}_{arm}_pred'] = round(float(p[h]), 1)
             rows.append(r)
 
     fresh = pd.DataFrame(rows).set_index('datetime_utc').sort_index()
@@ -92,10 +118,11 @@ def run_zone(zone, keep_days=10):
 
 
 def main(keep_days=10):
-    # One zone per process: config (MATRIX_DIR / MODEL_ROOT / FORECAST_PATH) is fixed from
-    # PJM_DATASET at import, so the workflow invokes this once per zone with the env set.
+    # One zone AND one arm per process: config (MATRIX_DIR / MODEL_ROOT / FORECAST_PATH /
+    # MATRIX_TAG) is fixed from PJM_DATASET and PJM_CONGESTION at import, so the workflow
+    # invokes this once per (zone, arm) with both set.
     import src.config as cfg
-    print(f"\n=== serving run: {cfg.DATASET} ===")
+    print(f"\n=== serving run: {cfg.DATASET} | congestion={cfg.CONGESTION_CONFIG['enabled']} ===")
     run_zone(cfg.DATASET, keep_days=keep_days)
 
 

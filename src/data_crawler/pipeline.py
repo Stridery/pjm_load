@@ -74,6 +74,11 @@ def _years_from_files(files: list[str]) -> list[int]:
     return sorted(years)
 
 
+def _cached_years(directory: str, pattern: str) -> set[int]:
+    """Years already on disk for one source. Used to auto-fill gaps, not just refresh."""
+    return set(_years_from_files(glob.glob(os.path.join(directory, pattern))))
+
+
 # ---------------------------------------------------------------------------
 # CSV loaders
 # ---------------------------------------------------------------------------
@@ -232,11 +237,24 @@ def run_pipeline(
     # the whole config range instead.
     from src.config import UPDATE_YEARS
     from src.data_crawler.pjm_load import fetch_load
-    if skip_existing:
-        met_years = pre_years = UPDATE_YEARS
-    else:
-        full = list(range(start_year or cfg["start_year"], (end_year or cfg["end_year"]) + 1))
-        met_years = pre_years = full
+
+    full_range = set(range(start_year or cfg["start_year"], (end_year or cfg["end_year"]) + 1))
+    # What every source force-refreshes regardless of what is cached. Kept separate from the
+    # per-source year sets below: those add each source's OWN missing years, and folding that
+    # back into the shared set would make one source's gap trigger a full re-download of the
+    # other three.
+    refresh_years = set(UPDATE_YEARS) if skip_existing else set(full_range)
+
+    # A missing year is fetched even when it is not in UPDATE_YEARS. Without this the two load
+    # sources were the only ones that did NOT self-heal: load_metered/load_preliminary read
+    # every file in their directory and concatenate, so a shard that was never fetched (or got
+    # deleted) simply left a hole in the merged frame — no error, just a year of missing load
+    # that every downstream matrix and model would silently inherit.
+    met_years = sorted(refresh_years | (full_range - _cached_years(metered_dir, "hrl_load_metered_*.csv")))
+    pre_years = sorted(refresh_years | (full_range - _cached_years(preliminary_dir, "hrl_load_prelim*.csv")))
+    if set(met_years) - refresh_years or set(pre_years) - refresh_years:
+        logger.info("Load: back-filling missing year(s)  metered=%s  preliminary=%s",
+                    sorted(set(met_years) - refresh_years), sorted(set(pre_years) - refresh_years))
     fetch_load(zone, met_years, pre_years, raw_dir)
 
     # Step 0b – Day-Ahead marginal value (transmission shadow prices) → raw/marginal_price/.
@@ -249,10 +267,34 @@ def run_pipeline(
                 for p in glob.glob(os.path.join(raw_dir, 'marginal_price',
                                                 'da_marginal_value_*.csv'))}
         # A listed year is force-refreshed; an unlisted year that was never cached is still
-        # fetched, so the stitched table stays complete (same rule as the load sources).
-        # met_years is already the full range when skip_existing is False.
-        want = sorted(set(met_years) | (set(range(cfg["start_year"], cfg["end_year"] + 1)) - have))
+        # fetched, so the stitched table stays complete (same rule as every other source).
+        want = sorted(refresh_years | (full_range - have))
         fetch_marginal_value(want, raw_dir)
+
+    # Step 0c – Zonal hourly LMP (Day-Ahead + Real-Time) → data/{zone}/raw/lmp.csv.
+    #
+    # Three things make this step look unlike its neighbours, all of them forced by the feed:
+    #
+    #  - the shards are fetched to a SHARED data/lmp/, not to raw/: one request set carries all
+    #    23 zonal nodes (the pnode_id filter the UI suggests is rejected outright on archived
+    #    data), so a per-zone download would be the same ~230 MB twice.
+    #  - EVERY configured zone is refiltered here, not just this run's zone. The shards are
+    #    zone-independent and already paid for; leaving the other zone's file stale would mean
+    #    its price history silently stopped at its own last crawl.
+    #  - the shards are deleted afterwards, so the per-zone raw/lmp.csv is the durable store.
+    #    That is why the year set is derived from THAT file rather than from cached shards, and
+    #    why clean_lmp merges rather than overwrites: a routine crawl fetches only UPDATE_YEARS
+    #    and must not truncate the rest of the history.
+    from src.config import LMP_CONFIG
+    if LMP_CONFIG['enabled']:
+        from src.data_crawler.pjm_lmp import ZONE_LMP_NAME, build_lmp
+        have = set()
+        lmp_path = os.path.join(raw_dir, "lmp.csv")
+        if skip_existing and os.path.exists(lmp_path):
+            idx = pd.read_csv(lmp_path, usecols=[0]).iloc[:, 0]
+            have = set(pd.to_datetime(idx, utc=True, format='mixed').dt.year)
+        want = sorted(refresh_years | (full_range - have))
+        build_lmp(sorted(ZONE_LMP_NAME), want, data_root)
 
     # Step 1 & 2 – Load and concat PJM CSVs
     logger.info("=== Step 1: Loading metered load from %s ===", metered_dir)
@@ -344,6 +386,31 @@ def run_pipeline(
     )
 
     # Step 5 – Save joined CSV
+    # Real-Time LMP joins the hourly frame here, alongside the weather columns, because it is a
+    # LOOKBACK channel: realised during the operating day, so it can never describe the target
+    # day, only the 168 h behind the cutoff. Left join — the price table is not allowed to add
+    # or remove load hours, only to annotate them.
+    #
+    # Gaps are left as NaN and reported, never filled. A price has no "nothing happened" value
+    # the way a shadow price does (build_congestion_table can legitimately zero-fill an hour
+    # with no binding constraint); zero is a real and very unusual price, and forward-filling
+    # would invent a settled market that never cleared. The only gap this actually produces is
+    # the trailing tail of hours RT has not settled yet, which sits well past any training
+    # sample's lookback.
+    if LMP_CONFIG['enabled']:
+        from src.data_crawler.pjm_lmp import RT_CHANNELS, load_rt_channels
+        lmp_path = os.path.join(raw_dir, "lmp.csv")
+        if not os.path.exists(lmp_path):
+            raise FileNotFoundError(
+                f"{lmp_path} is missing — Step 0c should have written it. Re-run the crawler, "
+                f"or set PJM_LMP=0 to build without the price channels.")
+        rt = load_rt_channels(lmp_path)
+        merged = merged.join(rt, how="left")
+        gaps = {c: int(merged[c].isna().sum()) for c in RT_CHANNELS.values()}
+        logger.info("RT LMP joined: %d/%d hours present (%s)",
+                    len(merged) - max(gaps.values()), len(merged),
+                    ", ".join(f"{c}: {n} missing" for c, n in gaps.items()))
+
     merged.to_csv(joined_path)
     logger.info(
         "=== Joined CSV saved → %s  (%d rows × %d cols) ===",
@@ -377,6 +444,15 @@ def run_pipeline(
     if CONGESTION_CONFIG['enabled']:
         from src.data_crawler.pjm_marginal_value import clean_marginal_value
         clean_marginal_value(raw_dir, os.path.join(cleaned_dir, "congestion.csv"))
+
+    # Step 6d – Day-Ahead LMP on its own per-day index, same treatment and same reason as the
+    # congestion table: it is read per DAY by a static block (the blind-spot day's prices),
+    # not per hour by the sequence, so folding it into the load frame would change the cleaned
+    # CSV that every existing model trained on.
+    if LMP_CONFIG['enabled']:
+        from src.data_crawler.pjm_lmp import write_da_table
+        write_da_table(os.path.join(raw_dir, "lmp.csv"),
+                       os.path.join(cleaned_dir, "lmp_da.csv"))
 
     # Step 7 – Write the training view: labelled rows only (metered present), Load kept.
     #

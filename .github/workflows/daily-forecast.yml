@@ -46,8 +46,17 @@ jobs:
 
       - name: Forecast + refresh site
         run: |
-          PJM_DATASET=dom python -m src.serving.run
-          PJM_DATASET=bge python -m src.serving.run
+          # Once per (zone, congestion arm). MATRIX_TAG is baked from PJM_CONGESTION at config
+          # import and src/serving/predict refuses weights whose tag disagrees, so one process
+          # serves exactly one arm; table.update merges the two column sets (each run writes
+          # only its own {model}_{arm}_pred columns). The store carries the same sixteen
+          # prediction columns it always did — eight residual models x two feature sets, rather
+          # than the old sixteen models x one. All four runs are CPU-only inference.
+          for zone in dom bge; do
+            for cong in 1 0; do
+              PJM_DATASET=$zone PJM_CONGESTION=$cong python -m src.serving.run
+            done
+          done
           python generate_web.py
 
       - name: Commit the updated store + site

@@ -1,0 +1,421 @@
+\documentclass[10pt,journal,compsoc]{IEEEtran}
+
+% --- 基础宏包引用 ---
+\usepackage[utf8]{inputenc}   % 原文写作 \usepackage[utf8]{utf8}，utf8 不是宏包名，会编译失败
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{cite}
+\usepackage{microtype}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+% --- 自动生成与管理 BibTeX 参考文献文件 ---
+\usepackage{filecontents}
+\begin{filecontents*}{\jobname.bib}
+@article{xie2018temperature,
+  title={Temperature scenario generation for probabilistic load forecasting},
+  author={Xie, Jingrui and Hong, Tao},
+  journal={IEEE Transactions on Smart Grid},
+  volume={9}, number={3}, pages={1680--1687}, year={2018}, publisher={IEEE}
+}
+
+@article{liu2017probabilistic,
+  title={Probabilistic load forecasting via quantile regression averaging on sister forecasts},
+  author={Liu, Bidong and Nowotarski, Jakub and Hong, Tao and Weron, Rafa{\l}},
+  journal={IEEE Transactions on Smart Grid},
+  volume={8}, number={2}, pages={730--737}, year={2017}, publisher={IEEE}
+}
+
+@phdthesis{hong2010short,
+  title={Short term electric load forecasting},
+  author={Hong, Tao},
+  year={2010}, school={North Carolina State University}
+}
+
+@article{hong2016probabilistic,
+  title={Probabilistic electric load forecasting: A tutorial review},
+  author={Hong, Tao and Fan, Shu},
+  journal={International Journal of Forecasting},
+  volume={32}, number={3}, pages={914--938}, year={2016}, publisher={Elsevier}
+}
+
+@article{li2020combining,
+  title={Combining probability density forecasts for power electrical loads},
+  author={Li, Tianyu and Wang, Yi and Zhang, Ning},
+  journal={IEEE Transactions on Smart Grid},
+  volume={11}, number={2}, pages={1679--1690}, year={2020}, publisher={IEEE}
+}
+
+@article{zhang2019improved,
+  title={An improved quantile regression neural network for probabilistic load forecasting},
+  author={Zhang, Wenjie and Quan, Hao and Srinivasan, Dipti},
+  journal={IEEE Transactions on Smart Grid},
+  volume={10}, number={4}, pages={4425--4434}, year={2019}, publisher={IEEE}
+}
+
+@article{cannon2011quantile,
+  title={Quantile regression neural networks: Implementation in {R} and application to
+         precipitation downscaling},
+  author={Cannon, Alex J.},
+  journal={Computers \& Geosciences},
+  volume={37}, number={9}, pages={1277--1284}, year={2011}, publisher={Elsevier}
+}
+
+@article{koenker1978regression,
+  title={Regression quantiles},
+  author={Koenker, Roger and Bassett, Gilbert},
+  journal={Econometrica},
+  volume={46}, number={1}, pages={33--50}, year={1978}
+}
+
+@article{yang2020bayesian,
+  title={Bayesian deep learning-based probabilistic load forecasting in smart grids},
+  author={Yang, Yandong and Li, Wei and Gulliver, T. Aaron and Li, Shufang},
+  journal={IEEE Transactions on Industrial Informatics},
+  volume={16}, number={7}, pages={4703--4713}, year={2020}, publisher={IEEE}
+}
+
+@article{brusaferri2022probabilistic,
+  title={Probabilistic electric load forecasting through {B}ayesian mixture density networks},
+  author={Brusaferri, Alessandro and Matteucci, Matteo and Spinelli, Stefano and Vitali, Andrea},
+  journal={Applied Energy},
+  volume={309}, pages={118341}, year={2022}, publisher={Elsevier}
+}
+
+@article{faustine2022fpseq2q,
+  title={{FPSeq2Q}: Fully parameterized sequence to quantile regression for net-load
+         forecasting with uncertainty estimates},
+  author={Faustine, Anthony and Pereira, Lucas},
+  journal={IEEE Transactions on Smart Grid},
+  volume={13}, number={3}, pages={2440--2451}, year={2022}, publisher={IEEE}
+}
+
+@article{li2023probabilistic,
+  title={Probabilistic forecasting method for mid-term hourly load time series based on an
+         improved temporal fusion transformer model},
+  author={Li, Dan and Tan, Ya and Zhang, Yuanhang and Miao, Shuwei and He, Shuai},
+  journal={International Journal of Electrical Power \& Energy Systems},
+  volume={146}, pages={108743}, year={2023}, publisher={Elsevier}
+}
+
+@article{lim2021temporal,
+  title={Temporal fusion transformers for interpretable multi-horizon time series forecasting},
+  author={Lim, Bryan and Ar{\i}k, Sercan {\"O}. and Loeff, Nicolas and Pfister, Tomas},
+  journal={International Journal of Forecasting},
+  volume={37}, number={4}, pages={1748--1764}, year={2021}, publisher={Elsevier}
+}
+
+@article{wang2019combining,
+  title={Combining probabilistic load forecasts},
+  author={Wang, Yi and Zhang, Ning and Tan, Yuxiao and Hong, Tao and Kirschen, Daniel S.
+          and Kang, Chongqing},
+  journal={IEEE Transactions on Smart Grid},
+  volume={10}, number={4}, pages={3664--3674}, year={2019}, publisher={IEEE}
+}
+
+@article{hong2016gefcom,
+  title={Probabilistic energy forecasting: {G}lobal energy forecasting competition 2014
+         and beyond},
+  author={Hong, Tao and Pinson, Pierre and Fan, Shu and Zareipour, Hamidreza and
+          Troccoli, Alberto and Hyndman, Rob J.},
+  journal={International Journal of Forecasting},
+  volume={32}, number={3}, pages={896--913}, year={2016}, publisher={Elsevier}
+}
+
+@article{gneiting2007strictly,
+  title={Strictly proper scoring rules, prediction, and estimation},
+  author={Gneiting, Tilmann and Raftery, Adrian E.},
+  journal={Journal of the American Statistical Association},
+  volume={102}, number={477}, pages={359--378}, year={2007}
+}
+
+@article{winkler1972decision,
+  title={A decision-theoretic approach to interval estimation},
+  author={Winkler, Robert L.},
+  journal={Journal of the American Statistical Association},
+  volume={67}, number={337}, pages={187--191}, year={1972}
+}
+
+@article{nowotarski2018recent,
+  title={Recent advances in electricity price forecasting: A review of probabilistic
+         forecasting},
+  author={Nowotarski, Jakub and Weron, Rafa{\l}},
+  journal={Renewable and Sustainable Energy Reviews},
+  volume={81}, pages={1548--1568}, year={2018}, publisher={Elsevier}
+}
+
+@article{baringhaus2004new,
+  title={On a new multivariate two-sample test},
+  author={Baringhaus, Ludwig and Franz, Carsten},
+  journal={Journal of Multivariate Analysis},
+  volume={88}, number={1}, pages={190--206}, year={2004}, publisher={Elsevier}
+}
+\end{filecontents*}
+
+\begin{document}
+
+\title{Probabilistic Electric Load Forecasting Under Limited Historical Samples}
+\author{Author Name}
+
+\maketitle
+
+\section{Related Work}
+
+\subsection{Probabilistic Electric Load Forecasting Baselines}
+Hong and Fan \cite{hong2016probabilistic} organize probabilistic electric load forecasting
+(PLF) methodologies into three sources of uncertainty: simulating the predictors, using a
+probabilistic model directly, and converting or combining point forecasts. Four methods are
+reviewed below, one representing each of the principal paradigms that have developed within
+this taxonomy: temperature scenario generation, quantile regression averaging over a family
+of point forecasts, combination of predictive densities, and direct estimation of the
+conditional quantile function by a neural network.
+
+Throughout, let $y_t$ denote the realized load at time $t$ and $\hat{y}_{t,q}$ the forecast of
+its $q$-th quantile.
+
+\subsubsection{Temperature Scenario-Based Probabilistic Forecasting}
+Scenario-based methods quantify load uncertainty by propagating meteorological variability
+through a deterministic forecasting engine. Xie and Hong \cite{xie2018temperature} evaluate
+three practical strategies for generating temperature scenarios. The \emph{fixed-date} method
+assigns the temperature profile of a past year to the target calendar date by date, producing
+$k$ scenarios from $k$ years of history. The \emph{shifted-date} method extends this by
+additionally sliding each historical profile forward and backward by $1,\dots,n$ days,
+yielding $(2n+1)k$ scenarios; because each scenario remains an observed temperature
+trajectory that has only been relabelled, the autocorrelation structure of the original
+series is retained. The \emph{block bootstrap} method cuts each historical year into $m$-day
+blocks and draws each block of the target calendar independently from any of the $k$ years.
+The study reports the shifted-date method to give the lowest quantile score, with the
+bootstrap not improving on fixed-date, and offers the rule of thumb
+$n = \lceil 30/k \rceil - 1$ for selecting the shift range.
+
+Each scenario is passed through a deterministic multiple linear regression model---Tao's
+Vanilla benchmark \cite{hong2010short}, the Hong-2014 model, or a reduced T-cube
+specification---and the resulting ensemble of point forecasts is converted to percentiles by
+the empirical distribution function with averaging. For $N$ non-missing forecasts sorted
+ascending as $x_1,\dots,x_N$, with $p = q/100$, $i = \lfloor Np \rfloor$ and $g = Np - i$,
+\begin{equation}
+\hat{y}_{t,q} =
+\begin{cases}
+\tfrac{1}{2}\left(x_i + x_{i+1}\right), & g = 0,\\[2pt]
+x_{i+1}, & g > 0 .
+\end{cases}
+\end{equation}
+The evaluation uses thirty years of historical temperature (1976--2005) held strictly prior
+to the 2006--2011 test years, so that no scenario is constructed from weather observed within
+the evaluation period.
+
+\subsubsection{Quantile Regression Averaging on Sister Forecasts}
+Approaching PLF from a forecast combination perspective, Liu et al.
+\cite{liu2017probabilistic} apply quantile regression averaging (QRA) to a set of
+\emph{sister point forecasts}. Sister forecasts are produced by a single model family whose
+members differ only in the outcome of variable selection, so that their forecasts are highly
+correlated and their disagreement is treated as the carrier of information about uncertainty.
+The family is Tao's Vanilla benchmark augmented with a recency effect,
+\begin{equation}
+y_t = \text{Vanilla}(t) + \sum_{d=1}^{D} f\!\left(\tilde{T}_{t,d}\right)
+                        + \sum_{j=1}^{J} f\!\left(T_{t-j}\right),
+\end{equation}
+where $f(\cdot)$ is the same month- and hour-interacted cubic polynomial applied to the base
+temperature term, $T_{t-j}$ is the temperature $j$ hours earlier, and $\tilde{T}_{t,d}$ is the
+mean temperature over the $d$-th preceding 24-hour block. Eight sisters are obtained as the
+product of two estimation window lengths (two and three years) and four calibration schemes
+for model selection, each scheme yielding its own recency order $(D,J)$.
+
+In the second stage, the $m$ sisters with the lowest mean absolute error over a rolling
+calibration window of $L$ days are selected, and a linear quantile regression
+\cite{koenker1978regression} of the actual load on those sister forecasts is estimated
+separately for each quantile level:
+\begin{equation}
+\hat{\beta}_q = \arg\min_{\beta}
+  \sum_{t \in \mathcal{L}} \rho_q\!\left(y_t - \mathbf{x}_t^{\top}\beta\right),
+\qquad
+\rho_q(u) =
+\begin{cases}
+q\,u, & u \ge 0,\\
+(q-1)\,u, & u < 0 ,
+\end{cases}
+\end{equation}
+with $\mathbf{x}_t$ collecting an intercept and the selected sister forecasts. Estimation is
+carried out in logarithmic space and repeated at every forecast origin, so the combination
+weights are re-derived daily and a constant width in log space corresponds to a proportional
+width in megawatts. The study evaluates QRA against three benchmarks constructed from the
+same sister family---denoted Direct, Ind and BI---on the GEFCom2014 load track, reporting the
+pinball loss and the Winkler score of the 50\% and 90\% prediction intervals.
+
+\subsubsection{Combination of Probability Density Forecasts}
+A third paradigm combines full predictive densities rather than point forecasts. Li et al.
+\cite{li2020combining} assemble fifteen base learners in three families of five: Gaussian
+process regressions, quantile regression neural networks, and quantile regression gradient
+boosting machines. Diversity within each family is induced by a different random subsample
+for the Gaussian processes, by two architectures crossed with different feature subsets for
+the neural networks, and by different tree hyperparameters for the boosting machines. The
+predictors are fifteen generic inputs---eleven lagged load observations together with hour of
+day, day of week, month of year, and a weekend indicator---with no weather variables.
+
+The Gaussian process family emits a Gaussian predictive density directly. The other two emit
+deciles, which are converted to a Gaussian by noting that if the quantiles originate from
+$\mathcal{N}(\mu,\sigma^2)$ then $y_q = \mu + p_q\sigma$ with $p_q = \Phi^{-1}(q)$, so that an
+ordinary least squares fit of $y_q$ on $p_q$ recovers the mean as the intercept and the
+standard deviation as the slope. The combined forecast is the Gaussian mixture
+$F = \sum_i w_i F_i$, and the weights are chosen to minimize the continuous ranked probability
+score (CRPS) \cite{gneiting2007strictly} over a calibration period.
+
+The contribution that makes this tractable is that the CRPS of a Gaussian mixture is
+available in closed form. Applying the identity of Baringhaus and Franz
+\cite{baringhaus2004new},
+\begin{equation}
+\mathrm{CRPS}(F, y) = \mathbb{E}\left|Y - y\right|
+                    - \tfrac{1}{2}\,\mathbb{E}\left|Y - Y'\right|,
+\end{equation}
+with $Y, Y'$ independent draws from $F$, and using the fact that a difference of Gaussian
+mixtures is again a Gaussian mixture, the score becomes quadratic in the weights,
+\begin{equation}
+\mathrm{CRPS}(F, y) = \sum_i \sum_k \alpha_{i,k}\, w_i w_k + \sum_i \beta_i w_i ,
+\end{equation}
+where $\alpha_{i,k} = -\tfrac{1}{2}\mathbb{E}|Y_i - Y'_k|$ and
+$\beta_i = \mathbb{E}|Y_i - y|$, both expectations of the absolute value of a normal variate
+and therefore expressible in elementary functions. Determining the weights is consequently a
+quadratic program on the simplex,
+\begin{equation}
+\min_{\mathbf{w}} \; \mathbf{w}^{\top}\mathbf{Q}\mathbf{w} + \mathbf{c}^{\top}\mathbf{w}
+\quad \text{s.t.} \quad \mathbf{1}^{\top}\mathbf{w} = 1, \;\; \mathbf{w} \ge 0,
+\end{equation}
+rather than a simulation. Because the weights are constrained to be non-negative, a component
+receiving zero weight is removed from the mixture, so model selection and weighting are
+performed in a single solve. The diagonal entries of $\mathbf{Q}$ satisfy
+$\alpha_{i,i} = -\sigma_i/\sqrt{\pi} < 0$; the authors address the resulting indefiniteness by
+eliminating the equality constraint and report the reduced matrix to be positive definite in
+all of the cases they examine. The data are partitioned into four consecutive periods for
+base model training, base model selection, weight optimization, and testing, and the
+CRPS-guided weights are compared against weights obtained by minimizing the MAPE of the
+mixture mean and against a simple average. A related combination framework operating on
+quantile rather than density forecasts is developed in \cite{wang2019combining}.
+
+\subsubsection{Quantile Regression Neural Networks}
+The fourth paradigm estimates the conditional quantile function directly. The quantile
+regression neural network (QRNN) of Cannon \cite{cannon2011quantile} replaces the squared
+error objective of a feedforward network with the pinball loss. Setting the width of the
+output layer equal to the cardinality of the target quantile set $\mathcal{Q}$ and summing the
+loss across it allows a single network to produce all quantiles in one forward pass:
+\begin{equation}
+\mathcal{L} = \frac{1}{|\mathcal{Q}|\,T}
+  \sum_{q \in \mathcal{Q}} \sum_{t=1}^{T}
+  \max\!\left\{\left(\tfrac{q}{100}-1\right)\left(y_t - \hat{y}_{t,q}\right),\;
+               \tfrac{q}{100}\left(y_t - \hat{y}_{t,q}\right)\right\}.
+\end{equation}
+
+Zhang et al. \cite{zhang2019improved} propose an improved variant (iQRNN) in which the
+training scheme of the canonical implementation is replaced by established deep learning
+practice. Mini-batch training is used with a batch of $24 \times 7$ samples, chosen so that
+each update spans a full weekly cycle; dropout and additive Gaussian noise layers of standard
+deviation $0.3$ follow each of two hidden layers with parametric rectified linear activation;
+training is terminated once the validation quantile score has not improved for $k$ epochs; and
+the learning rate is multiplied by a decay factor $D_e$ whenever it has not improved for
+$r < k$ epochs, subject to a floor. Feature selection is performed by recursive feature
+elimination, in which random forests trained under the mean absolute error criterion rank
+1760 candidate predictors---calendar and holiday indicators, load lags from one day to five
+weeks, and temperature from the current time to five weeks earlier---and the least important
+are pruned recursively until 100 remain, to which weekday and holiday indicators are added
+manually, giving 103 inputs per sample.
+
+The study evaluates the proposal on the GEFCom2014 load track \cite{hong2016gefcom} against
+QRA \cite{liu2017probabilistic}, quantile regression forests in three implementations, and
+gradient boosting regression trees in two, and against a baseline QRNN that retains the
+parametric rectified linear activation and batch training but none of the four additions.
+Each network configuration is trained one hundred times independently and reported as a mean
+and standard deviation. The authors additionally report sensitivity analyses over network
+width in the range 200--800 units per layer and over the Gaussian noise standard deviation in
+the range $0$--$0.4$, and report training times of a few minutes for iQRNN against 85 hours
+for the composite QRNN available in the reference \texttt{qrnn} R package.
+
+\subsection{Deep Learning Approaches to Probabilistic Load Forecasting}
+A substantial body of more recent work applies modern deep architectures to PLF. One line
+addresses \emph{epistemic} uncertainty---arising from finite training data---separately from
+the \emph{aleatoric} uncertainty inherent in the load process. Yang et al.
+\cite{yang2020bayesian} cluster smart meter customers by their normalized weekly load
+profiles, pool the profiles within each cluster, and train a multi-task Bayesian recurrent
+network in which long short-term memory layers are shared across clusters while the output
+layer is task-specific; predictive moments are obtained from repeated stochastic forward
+passes under Monte Carlo dropout, with an additive term for inherent data noise estimated on a
+separate validation set. Brusaferri et al. \cite{brusaferri2022probabilistic} replace the
+deterministic output layer with a mixture density layer of spherical Gaussian kernels, whose
+mixing coefficients, means and variances are all functions of the inputs, and place a
+mean-field variational posterior over the network weights; deep ensembles are combined with
+the variational approximation to cover several modes of that posterior, and the two
+uncertainty components are separated through the differential entropy of the predictive
+distribution and its mutual information with the weights.
+
+A parallel line adapts attention-based sequence architectures. The temporal fusion
+transformer \cite{lim2021temporal} couples variable selection networks, static covariate
+encoders, and interpretable multi-head attention with a quantile output layer for
+multi-horizon forecasting. Li et al. \cite{li2023probabilistic} adapt it to mid-term hourly
+load forecasting by reconstructing the univariate hourly series into a panel of day-to-day
+series indexed by hour of day, substituting gated recurrent units for the long short-term
+memory layers, and augmenting the quantile loss with penalty terms for quantile crossing and
+for prediction interval width. Faustine and Pereira \cite{faustine2022fpseq2q} parameterize
+the quantile fractions themselves in addition to the quantile values, using one network to
+propose the fractions through a cumulative softmax and a second, with a cosine embedding of
+those fractions, to produce the corresponding values, trained jointly under a Huber quantile
+loss together with a Wasserstein term.
+
+\subsection{Evaluation of Probabilistic Forecasts}
+Evaluation in this literature is based on strictly proper scoring rules
+\cite{gneiting2007strictly}. The quantile score, the pinball loss averaged over the target
+quantile set and the forecast horizon, is the metric adopted by GEFCom2014
+\cite{hong2016gefcom} and is reported by all four of the methods above. It is commonly
+accompanied by the Winkler interval score \cite{winkler1972decision}, which for a central
+$(1-\alpha)\times 100\%$ prediction interval with bounds $L_t$ and $U_t$ and width
+$\Delta_t = U_t - L_t$ is
+\begin{equation}
+\mathrm{WS}_t =
+\begin{cases}
+\Delta_t, & L_t \le y_t \le U_t,\\
+\Delta_t + 2(L_t - y_t)/\alpha, & y_t < L_t,\\
+\Delta_t + 2(y_t - U_t)/\alpha, & y_t > U_t,
+\end{cases}
+\end{equation}
+so that width is charged at every step while the penalty for a miss is scaled by $1/\alpha$.
+The CRPS \cite{gneiting2007strictly} summarizes the whole predictive distribution and is the
+headline metric of the density combination literature; it coincides with twice the integral
+of the pinball loss over the quantile level, which allows it to be evaluated from a quantile
+function as well as from a density. Empirical coverage against the nominal level is widely
+reported as a calibration diagnostic \cite{nowotarski2018recent}, and the ITFT study
+\cite{li2023probabilistic} additionally defines a constraint score measuring the extent to
+which adjacent predicted quantiles violate monotonicity.
+
+\subsection{Summary}
+Table~\ref{tab:baselines} summarizes the four baseline methods along the dimensions that
+distinguish them: the source from which uncertainty is derived, the predictors entering the
+model, whether parameters are re-estimated at each forecast origin, and the form of the
+emitted forecast.
+
+% TODO: 本节之后接你的研究问题/贡献。上表只做客观归纳，未作评价。
+
+\begin{table}[!t]
+\caption{Summary of the four probabilistic load forecasting baselines.}
+\label{tab:baselines}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Method & Uncertainty source & Predictors & Re-estimation & Output \\
+\midrule
+Scenario \cite{xie2018temperature} & Input weather ensemble & Calendar, temperature
+  & Static  & Empirical percentiles \\
+QRA \cite{liu2017probabilistic}    & Sister disagreement    & Calendar, temperature
+  & Rolling & Quantiles \\
+Density \cite{li2020combining}     & Component densities    & Load lags, calendar
+  & Static  & Gaussian mixture \\
+iQRNN \cite{zhang2019improved}     & Pinball objective      & Load lags, temperature, calendar
+  & Static  & Quantiles \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% --- 参考文献渲染 ---
+\bibliographystyle{IEEEtran}
+\bibliography{\jobname}
+
+\end{document}

@@ -28,34 +28,40 @@ OUT = os.path.join('docs', 'index.html')
 WEB_GLOB = 'web/*.csv'   # the committed serving store, one wide table per zone
 
 # Hardcoded model registry — the taxonomy is spelled out, not parsed from names, so it is
-# eyeballable and one edit adds a model. Per model:
-#   hue   : colour slot 0-7. A base model and its residual twin share one hue, told apart by a
-#           dashed line (16 models, 8 hues — the palette has no 16 CVD-safe colours).
-#   klass : the big class — 'direct' vs 'residual' (the two top-level groups in the scoreboard).
-#   family: the architecture bucket for the Family filter — 5 buckets (xgboost, lightgbm,
-#           transformer, lstm, mstnn). MoE folds into its base architecture (moe_transformer →
-#           transformer, moe_mstnn → mstnn), so it is COARSER than hue on purpose: a filter
-#           grouping, while hue still tells moe_transformer from transformer on the chart.
-#   label : display name; base and residual share it because `klass` already separates them.
-# Dict order is the default legend/table order (each family's base then its residual).
-MODELS = {
-    'xgboost':                  {'hue': 0, 'klass': 'direct',   'family': 'xgboost',     'label': 'XGBoost'},
-    'xgboost_residual':         {'hue': 0, 'klass': 'residual', 'family': 'xgboost',     'label': 'XGBoost'},
-    'lightgbm':                 {'hue': 1, 'klass': 'direct',   'family': 'lightgbm',    'label': 'LightGBM'},
-    'lightgbm_residual':        {'hue': 1, 'klass': 'residual', 'family': 'lightgbm',    'label': 'LightGBM'},
-    'transformer':              {'hue': 2, 'klass': 'direct',   'family': 'transformer', 'label': 'Transformer'},
-    'transformer_residual':     {'hue': 2, 'klass': 'residual', 'family': 'transformer', 'label': 'Transformer'},
-    'lstm':                     {'hue': 3, 'klass': 'direct',   'family': 'lstm',        'label': 'LSTM'},
-    'lstm_residual':            {'hue': 3, 'klass': 'residual', 'family': 'lstm',        'label': 'LSTM'},
-    'mstnn':                    {'hue': 4, 'klass': 'direct',   'family': 'mstnn',       'label': 'MSTNN'},
-    'mstnn_residual':           {'hue': 4, 'klass': 'residual', 'family': 'mstnn',       'label': 'MSTNN'},
-    'moe_transformer':          {'hue': 5, 'klass': 'direct',   'family': 'transformer', 'label': 'MoE-Transformer'},
-    'moe_transformer_residual': {'hue': 5, 'klass': 'residual', 'family': 'transformer', 'label': 'MoE-Transformer'},
-    'moe_mstnn':                {'hue': 6, 'klass': 'direct',   'family': 'mstnn',       'label': 'MoE-MSTNN'},
-    'moe_mstnn_residual':       {'hue': 6, 'klass': 'residual', 'family': 'mstnn',       'label': 'MoE-MSTNN'},
-    'moe_lstm':                 {'hue': 7, 'klass': 'direct',   'family': 'lstm',        'label': 'MoE-LSTM'},
-    'moe_lstm_residual':        {'hue': 7, 'klass': 'residual', 'family': 'lstm',        'label': 'MoE-LSTM'},
-}
+# eyeballable and one edit adds a model. Per entity:
+#   hue   : colour slot 0-7. The two congestion arms of one model share a hue and are told
+#           apart by a dashed line, so colour still reads as "which model".
+#   klass : the feature set — 'cong' (with the Day-Ahead congestion block) vs 'nocong'
+#           (without). The two top-level groups in the scoreboard.
+#   family: the architecture bucket for the Family filter — 5 buckets. MoE folds into its base
+#           architecture (moe_transformer → transformer), so it is COARSER than hue on purpose:
+#           a filter grouping, while hue still tells moe_transformer from transformer.
+#   label : display name; both arms share it because `klass` already separates them.
+#
+# ONLY RESIDUAL MODELS. The direct (non-residual) variants lost to their residual twins on every
+# zone and every metric offline, so a column each in the store and a line each on the chart
+# bought a strictly worse forecast. The sixteen slots they freed now hold the congestion A/B —
+# the same eight models with and without the block — which is the comparison worth watching
+# daily, since its measured gain (dom: MAE −1.7%, peak MAPE −3.2%) is small enough to deserve
+# production evidence rather than one offline run. See src/serving/run.py ARM_SUFFIX.
+#
+# Entity ids match the store's column stems: {model}_{arm}_pred → {model}_{arm}.
+MODELS = {}
+for _hue, (_m, _fam, _label) in enumerate([
+    ('xgboost_residual',         'xgboost',     'XGBoost'),
+    ('lightgbm_residual',        'lightgbm',    'LightGBM'),
+    ('transformer_residual',     'transformer', 'Transformer'),
+    ('lstm_residual',            'lstm',        'LSTM'),
+    ('mstnn_residual',           'mstnn',       'MSTNN'),
+    ('moe_transformer_residual', 'transformer', 'MoE-Transformer'),
+    ('moe_mstnn_residual',       'mstnn',       'MoE-MSTNN'),
+    ('moe_lstm_residual',        'lstm',        'MoE-LSTM'),
+]):
+    # cong first in each pair: it is the deployed arm, and dict order is the default legend
+    # and table order.
+    for _arm in ('cong', 'nocong'):
+        MODELS[f'{_m}_{_arm}'] = {'hue': _hue, 'klass': _arm, 'family': _fam, 'label': _label}
+
 # The 5 Family-filter buckets, in reading order, with display labels.
 FAMILY_ORDER = [('xgboost', 'XGBoost'), ('lightgbm', 'LightGBM'), ('transformer', 'Transformer'),
                 ('lstm', 'LSTM'), ('mstnn', 'MSTNN')]
@@ -322,7 +328,8 @@ td .dir { color:var(--muted); font-size:11px; }
 <div class="wrap">
   <header>
     <h1>PJM Zonal Load Forecast</h1>
-    <p>Day-ahead 24-hour forecasts &middot; generated __GENERATED__</p>
+    <p>Day-ahead 24-hour forecasts &middot; eight residual models, each with and without the
+       day-ahead congestion features &middot; generated __GENERATED__</p>
   </header>
 
   <div class="tabs" role="tablist">
@@ -367,6 +374,13 @@ td .dir { color:var(--muted); font-size:11px; }
       <p id="r-metrics-sub"></p>
       <div class="chips" id="r-chips"></div>
       <div class="table-scroll"><div id="r-metrics-table"></div></div>
+      <p class="note">
+        <b>With congestion</b> &mdash; the model also sees eight features built from PJM's
+        day-ahead transmission-constraint shadow prices for the blind-spot day, the day between
+        the forecast cutoff and the target day that the 168-hour lookback cannot see.
+        <b>Without</b> is the same model, same split, same everything else, trained without that
+        block. Same colour = same model; dashed and hollow = without.
+      </p>
       <p class="note">
         Tick a model to show it below; click a column to sort. <b>ME</b> mean error &mdash; the
         constant part of the bias (over / under). <b>BRS</b> binned residual slope &mdash; error
@@ -419,20 +433,21 @@ const ACTUAL = '__actual__';
 const isDark = () => matchMedia('(prefers-color-scheme: dark)').matches;
 // Everything about an entity comes from DATA.meta[eid], written by the hardcoded MODELS
 // registry — never parsed from the id string here.
-//   colour = family hue (a base and its residual share it; sixteen models, eight hues).
-//   dashed = residual class (the second visual channel).
+//   colour = which model (the two congestion arms share it; eight models, eight hues).
+//   dashed = the no-congestion arm (the second visual channel).
 const M = eid => DATA.meta[eid];
 const colourOf = eid => (isDark() ? DATA.paletteDark : DATA.paletteLight)[M(eid).hue % 8];
-const isResidual = eid => M(eid).klass === 'residual';
-// Display name: family label. The big class (direct/residual) is carried by the swatch shape and
-// the dash, so it is not repeated.
+// Dashed / hollow = the ablation arm (no congestion block). Solid = the deployed arm.
+const isNoCong = eid => M(eid).klass === 'nocong';
+// Display name: model label. The feature set (with/without congestion) is carried by the swatch
+// shape and the dash, so it is not repeated.
 const nameOf = eid => M(eid).label;
-// Swatch: filled square for a direct model, hollow ring for a residual — the same distinction
-// the dashed line makes on the chart, so legend and plot read as one scheme.
+// Swatch: filled square for the congestion arm, hollow ring for the ablation — the same
+// distinction the dashed line makes on the chart, so legend and plot read as one scheme.
 const swatch = (colour, residual) => residual
   ? `<span class="swatch" style="background:transparent;box-shadow:inset 0 0 0 2px ${colour}"></span>`
   : `<span class="swatch" style="background:${colour}"></span>`;
-const swatchOf = eid => swatch(colourOf(eid), isResidual(eid));
+const swatchOf = eid => swatch(colourOf(eid), isNoCong(eid));
 const ink = () => getComputedStyle(document.body).getPropertyValue('--ink').trim();
 const pretty = m => m.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 /* en-US, not the viewer's locale: a German browser groups 15,425 as "15.425" and an Indian one
@@ -442,13 +457,15 @@ const num = v => Math.round(v).toLocaleString('en-US');
 const fmt = v => v == null ? '—' : num(v);
 
 /* ---------- filters ----------
-   A filter narrows which ENTITIES are eligible to appear at all, along two axes: the big class
-   (direct / residual) and the architecture family. It is separate from the on/off selection,
+   A filter narrows which ENTITIES are eligible to appear at all, along two axes: the feature
+   set (with / without the congestion block) and the architecture family. It is separate from the on/off selection,
    which only dims among the eligible. */
-const CLASSES = [['direct', 'Direct'], ['residual', 'Residual']];
+const CLASSES = [['cong', 'With congestion'], ['nocong', 'Without']];
 const FAM_KEYS = DATA.families.map(([k]) => k);   // the 5 architecture buckets, in reading order
 const newFilter = () => ({
-  types: new Set(['direct', 'residual']),
+  // Derived from CLASSES, never re-typed: a hardcoded copy that drifted from the registry's
+  // klass values would match nothing and open the page blank.
+  types: new Set(CLASSES.map(([v]) => v)),
   fams:  new Set(FAM_KEYS),            // all architectures on by default
 });
 const eligible = (zone, filt) => DATA.zones[zone].entities.filter(
@@ -589,7 +606,7 @@ function makeChart(svg, tip, { zero = false, onEmph = null } = {}) {
         p.push(`<polyline class="series" points="${pts}" stroke="var(--surface)" ` +
                `stroke-width="${w + 4}" opacity=".92"/>`);
       }
-      // Residual models are dashed — same hue as their base model, told apart by line style.
+      // The no-congestion arm is dashed — same hue as its congestion twin, told apart by style.
       p.push(`<polyline class="series" points="${pts}" stroke="${s.colour}" ` +
              `opacity="${opacity(s)}" stroke-width="${s.faint ? 1.5 : w}"` +
              `${s.dash ? ' stroke-dasharray="5 3.5"' : ''}/>`);
@@ -706,7 +723,7 @@ function dSeries() {
     const v = z.series[D.date][e];
     if (!v) continue;
     out.push({ key: e, name: nameOf(e), values: v, colour: colourOf(e),
-               width: 2, faint: D.off.has(e), dash: isResidual(e) });
+               width: 2, faint: D.off.has(e), dash: isNoCong(e) });
   }
   return out;
 }
@@ -764,7 +781,7 @@ const SCORE_COLS = [
 // sort by value, and ME/BRS by magnitude — nearest zero is least biased.
 const sortKey = (r, key) =>
   key === 'model'   ? r.ord
-  : key === 'klass' ? (r.klass === 'direct' ? 0 : 1)
+  : key === 'klass' ? (r.klass === 'cong' ? 0 : 1)
   : (key === 'me' || key === 'brs') ? Math.abs(r[key])
   : r[key];
 const rEmph = e => { R.emph = e; markEmph(); };   // hovering a chart line also lights its rows
@@ -780,7 +797,7 @@ function rLoadSeries() {
     const v = z.series[R.date][e];
     if (!v) continue;
     out.push({ key: e, name: nameOf(e), values: v, colour: colourOf(e),
-               width: 2, faint: R.off.has(e), dash: isResidual(e) });
+               width: 2, faint: R.off.has(e), dash: isNoCong(e) });
   }
   return out;
 }
@@ -793,7 +810,7 @@ function rErrSeries() {
     const p = z.series[R.date][e];
     if (!p) continue;
     out.push({ key: e, name: nameOf(e), colour: colourOf(e), width: 2, faint: R.off.has(e),
-               dash: isResidual(e), values: p.map((v, i) => a[i] == null ? null : v - a[i]) });
+               dash: isNoCong(e), values: p.map((v, i) => a[i] == null ? null : v - a[i]) });
   }
   return out;
 }

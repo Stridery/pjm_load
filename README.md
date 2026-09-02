@@ -106,3 +106,119 @@ Reads ONE input, data/{zone}/cleaned/cleaned_pjm_load_weather.csv, and writes to
 results/{zone}/quantile/. It shares nothing else with the point-model stack: no matrix
 cache, no scalers, and deliberately not registered in src/models (see src/quantile/__init__).
 Tuning lives in QUANTILE_CONFIG in src/config.py.
+
+## Foundation models (zero-shot) — `run_foundation.py`
+
+A pre-trained univariate forecaster (TimesFM 2.5 today) is handed the recent `Load_Estimated`
+history and asked for the target day. **Nothing is trained**, so there is no weights file, no
+matrix cache and no train step — the run reads the cleaned CSV, calls the model, and evaluates.
+
+    .venv/bin/pip install 'timesfm[torch]'          # optional; nothing else needs it
+    export HF_HOME=/path/with/room                  # ~1 GB checkpoint, keep it off $HOME
+    PJM_DATASET=dom python run_foundation.py                          # config defaults
+    PJM_DATASET=dom python run_foundation.py --context 512 --mode residual
+    PJM_DATASET=dom python run_foundation.py --model zero --mode residual   # harness self-check
+    PJM_DATASET=dom python run_foundation.py --scoreboard             # re-read results only
+    python run_foundation.py --list
+
+Tuning lives in `FOUNDATION_CONFIG` in `src/config.py`; every flag above is a per-run override
+of the same field. ~1 min per (mode, context) for a 310-day test year on CPU.
+
+### Why it is a separate pipeline but not separate results
+
+Not registered in `src/models`, for the reason `src/quantile` and `src/density` are not: that
+registry is what `src/serving/predict.available_models()` scans, and the daily CI forecast job
+loads everything it finds. A model needing an optional package and a 1 GB checkpoint the runner
+does not have would break the daily forecast the moment it was registered. `Model_Training.py`,
+`model_evaluator`, `serving`, `generate_web` and `Train_Model.sbatch` are all untouched.
+
+The RESULTS are not separate — comparing them is the point. They land in the same tree as the
+16 point models, with direct and residual as separate model names exactly like
+`xgboost` / `xgboost_residual`, and the context length in the run tag:
+
+    results/{zone}/evaluation/timesfm/tail_test0.16_cong_ctx512/
+    results/{zone}/evaluation/timesfm_residual/tail_test0.16_cong_ctx512/
+    results/{zone}/evaluation/_scoreboard.{csv,png}      # every model in one table
+
+`_scoreboard` is a scan of every `*_metrics.txt` under `evaluation/`, so the point models need
+no re-run to appear in it.
+
+### The two things that make the comparison valid
+
+**The day set.** Test days and truth come from `y_opt_*.csv`, not from a fresh split of the
+cleaned CSV. The matrix builder drops days with no complete 48 h forecast (and, with the block
+on, no Day-Ahead congestion); re-splitting the CSV would score a larger, different set of days
+and report a better or worse number for reasons unrelated to the model. A run prints
+`test N/310` and warns loudly if it is short.
+
+**The 24 h blind spot.** The cutoff is the target day's PREVIOUS midnight and the lookback ends
+there, so the context stops at (target − 2 d) 23:00 and the target day starts at forecast step
+**25**, not step 1. The horizon is therefore 48–49, never 24. A model asked for 24 steps
+forecasts the blind-spot day and scores it against the target day's actuals.
+
+### Modes
+
+| mode | series in | output |
+|---|---|---|
+| `direct` | `Load_Estimated` | forecast, then an optional Est→metered scale correction |
+| `residual` | `Load_Estimated` − same-hour-last-week baseline | forecast + the baseline added back |
+
+`residual` mirrors `src/models/*_residual.py`, and its floor is known: a model returning 0
+reproduces the naive baseline exactly, so the gap to that baseline IS the model's contribution.
+`--model zero --mode residual` runs precisely that and must reproduce dom 7.70% / bge 10.09%;
+it is the harness's end-to-end self-check, and `test/test_foundation_context.py` asserts it.
+
+`direct` mode's output is in `Load_Estimated` space while the target is metered load.
+`est_to_metered='hourly_ratio'` fits 24 median Est/Load ratios on the TRAIN split alone and
+freezes them over the test period — the same "fitted on train, frozen at inference" arrangement
+the point models get. Both corrected and uncorrected scores are always reported. Residual mode
+needs none of it: the baseline it adds back is in the same space, so the offset cancels.
+
+### Context series: `estimated` vs `metered`
+
+Preliminary load is current as of the cutoff but is a PROXY for the target: on dom it carries a
+~0.8% scale offset, on bge a 3.3% *shape* mismatch (its proxy is MIDATL/8.8, a regional
+aggregate whose diurnal shape is not bge's — no rescaling removes that). Metered load has no
+proxy gap because it IS the target, but unverified metered trails preliminary by ~1 day
+(measured: exactly 24 h behind on both zones; VERIFIED metered trails 7 d on dom and 48 d on
+bge and is useless in real time).
+
+Something has to give, and `metered_issue` says which:
+
+| | window ends | target at | horizon | first issuable |
+|---|---|---|---|---|
+| `estimated` | (d−2) 23:00 | steps 25–48 | 48 | (d−1) 00:00 |
+| `metered` + `day_of` | (d−2) 23:00 | steps 25–48 | 48 | **d 00:00** |
+| `metered` + `day_ahead` | (d−3) 23:00 | steps 49–72 | 72 | (d−1) 00:00 |
+
+`day_of` keeps the horizon and reads the SAME window rows as the preliminary run — only a
+different column, so there is no re-pairing and nothing to rebuild. What it gives up is the
+issue time: metered through (d−2) 23:00 does not exist until a day after the equivalent
+preliminary does, so the forecast can first be produced at the START of the target day.
+
+`day_ahead` keeps the point models' issue time and pays with a 72-step horizon instead.
+
+**These are different questions and their scores are not interchangeable.** `day_of` is a
+day-of forecast issued at midnight; only `day_ahead` performs the same task as the 16 point
+models. The run tag (`_met` / `_met_da`), the artifact name (`*_MET_*` / `*_METDA_*`) and an
+`issue time:` line in `metrics.txt` all record which was used, so a scoreboard row cannot lose
+the distinction — but the scoreboard itself does not know it, so read the tag.
+
+The horizon cost of `day_ahead` is visible before any model runs: the same naive baseline scores
+7.70% on preliminary, 7.63% on metered `day_of`, and 8.06% on metered `day_ahead` (dom).
+
+`horizon_steps: 'auto'` derives the horizon from the data rather than taking a number, so a
+lagged series cannot silently drop days for want of steps. Baseline lags shift with it
+(48…192 h → 72…216 h under `day_ahead`), which is what keeps the baseline from being built out
+of values PJM had not published yet; `test/test_foundation_context.py` asserts that.
+
+**Caveat.** The backtest reads the cleaned CSV's `Load`, which is VERIFIED metered. At forecast
+time only the UNVERIFIED value existed, and PJM revises it. No archived snapshots exist here, so
+that revision is unmeasurable and every `series='metered'` score carries a small,
+one-directional optimism.
+
+### Adding another model
+
+One file exposing `NAME` and `forecast(contexts (N,L), horizon, params) -> (N,horizon)`, plus a
+line in `src/foundation/registry.py`. The adapter never sees the frame, the split, the baseline
+or the evaluation.

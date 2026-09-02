@@ -7,7 +7,11 @@ from sklearn.preprocessing import StandardScaler
 import joblib
 from src.config import (
     TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG, WEATHER_COLS, EMBARGO_DAYS,
-    FORECAST_PATH, CONGESTION_PATH, CONGESTION_CONFIG, MATRIX_TAG,
+    FORECAST_PATH, CONGESTION_PATH, CONGESTION_CONFIG, LMP_PATH, LMP_CONFIG, MATRIX_TAG,
+)
+from src.lmp_features import (
+    LMP_SEQ_COLS, active_feature_names, add_lmp_sequence_cols, build_lmp_table,
+    compute_lmp_features,
 )
 from src.congestion_features import (
     CONG_FEATURE_NAMES, assert_available, build_congestion_table,
@@ -58,6 +62,28 @@ def _load_congestion(latest_info_hour):
         print(f"Congestion: {len(_CONG_CACHE[key])} day(s) of DA marginal value "
               f"from {CONGESTION_PATH}")
     return _CONG_CACHE[key]
+
+
+_LMP_CACHE = {}
+
+
+def _load_lmp(latest_info_hour):
+    """The per-day Day-Ahead price table, or None when the LMP block is switched off.
+
+    Same role and same memoisation as _load_congestion: opened once so every sample (and the
+    serving mirror) reads the same file, keyed on mtime so the daily fetch rewriting it
+    mid-process cannot serve a stale table. The availability check is congestion's — both
+    blocks read day d's Day-Ahead result, so the cutoff constraint is identical.
+    """
+    if not LMP_CONFIG['enabled']:
+        return None
+    assert_available(latest_info_hour)
+    key = (LMP_PATH, os.path.getmtime(LMP_PATH))
+    if key not in _LMP_CACHE:
+        _LMP_CACHE.clear()
+        _LMP_CACHE[key] = build_lmp_table(LMP_PATH)
+        print(f"LMP: {len(_LMP_CACHE[key])} day(s) of Day-Ahead price from {LMP_PATH}")
+    return _LMP_CACHE[key]
 
 
 def _forecast_for(fc_table, target_day, temp_raw, ept_hours, cutoff_pos, lookback_hours):
@@ -130,13 +156,14 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     df_final = pd.read_csv(cleaned_path, index_col=0, parse_dates=True)
     df_final = df_final.sort_index()
     add_thermal_sequence_cols(df_final)
+    seq_lmp = add_lmp_sequence_cols(df_final) if LMP_CONFIG['lookback'] else []
 
     ept_dt    = pd.to_datetime(df_final['Datetime_EPT'])
     ept_dates = ept_dt.dt.date.values
     ept_hours = ept_dt.dt.hour.values
 
     weather_cols = WEATHER_COLS
-    feature_cols = ['Load_Estimated'] + weather_cols + THERMAL_SEQ_COLS
+    feature_cols = ['Load_Estimated'] + weather_cols + THERMAL_SEQ_COLS + seq_lmp
     data_array   = df_final[feature_cols].values
     load_raw     = df_final['Load'].values             # metered load — TARGET only
     est_raw      = df_final['Load_Estimated'].values   # preliminary load — macro features
@@ -148,7 +175,8 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     unique_days = np.unique(ept_dates)
     fc_table = _load_forecast()
     cong_table = _load_congestion(latest_info_hour)
-    n_no_fc = n_no_cong = 0
+    lmp_table = _load_lmp(latest_info_hour)
+    n_no_fc = n_no_cong = n_no_lmp = 0
     X_list, y_list = [], []
 
     for i in tqdm(range(len(unique_days) - 1), desc="Building 2D Samples"):
@@ -190,6 +218,16 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
                 n_no_cong += 1
                 continue
 
+        # Same rule again for price: the Day-Ahead market clears every hour of every day, so a
+        # day the table cannot serve is a fetch gap, not a day without prices. Zero-filling
+        # would read as "electricity was free", which is a real and extraordinary state.
+        lmp_raw = None
+        if lmp_table is not None:
+            lmp_raw = compute_lmp_features(lmp_table, tomorrow)
+            if lmp_raw is None:
+                n_no_lmp += 1
+                continue
+
         tmrw_valid = 1 if valid_raw[tmrw_pos].all() else 0
         past_window = data_array[cutoff_pos - lookback_hours : cutoff_pos]
 
@@ -223,6 +261,9 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
         if cong_raw is not None:
             for nm, val in zip(CONG_FEATURE_NAMES, cong_raw):
                 f[nm] = float(val)
+        if lmp_raw is not None:
+            for nm, val in zip(active_feature_names(), lmp_raw):
+                f[nm] = float(val)
         f['is_target_valid'] = tmrw_valid
 
         y_dict = {'timestamp': tomorrow}
@@ -236,6 +277,9 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
               f"(archive starts 2021-03, with holes)")
     if n_no_cong:
         print(f"Congestion: {n_no_cong} day(s) skipped — no DA marginal value for the "
+              f"blind-spot day")
+    if n_no_lmp:
+        print(f"LMP: {n_no_lmp} day(s) skipped — no complete Day-Ahead price day for the "
               f"blind-spot day")
     X_opt = pd.DataFrame(X_list).set_index('timestamp')
     y_opt = pd.DataFrame(y_list).set_index('timestamp')
@@ -271,12 +315,13 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     df = pd.read_csv(cleaned_path, index_col=0, parse_dates=True)
     df = df.sort_index()
     add_thermal_sequence_cols(df)          # per-hour CDD/HDD, rolling CDD/temp, heat index, wet bulb
+    seq_lmp = add_lmp_sequence_cols(df) if LMP_CONFIG['lookback'] else []
 
     # Lookback (per-timestep) features: only continuous physical signals that change
     # every hour. Calendar/cyclic features are NOT put in the window — hour-of-day is
     # implicit in the 24-dim output (and the expert routing), and month/day-of-week
     # belong to the FORECAST day, so they are appended below as broadcast constants.
-    feature_cols = ['Load_Estimated'] + WEATHER_COLS + THERMAL_SEQ_COLS
+    feature_cols = ['Load_Estimated'] + WEATHER_COLS + THERMAL_SEQ_COLS + seq_lmp
     split_idx = int(len(df) * (1 - TRANSFORMER_FEATURE_CONFIG['test_frac']))
 
     scaler = StandardScaler()
@@ -309,7 +354,8 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     temp_raw = df['Temp_F'].values
     fc_table = _load_forecast()
     cong_table = _load_congestion(latest_info_hour)
-    n_no_fc = n_no_cong = 0
+    lmp_table = _load_lmp(latest_info_hour)
+    n_no_fc = n_no_cong = n_no_lmp = 0
 
     X_list, static_list, y_list, valid_mask_list, timestamps_list = [], [], [], [], []
 
@@ -350,6 +396,16 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
                 n_no_cong += 1
                 continue
 
+        # Same rule again for price: the Day-Ahead market clears every hour of every day, so a
+        # day the table cannot serve is a fetch gap, not a day without prices. Zero-filling
+        # would read as "electricity was free", which is a real and extraordinary state.
+        lmp_raw = None
+        if lmp_table is not None:
+            lmp_raw = compute_lmp_features(lmp_table, tomorrow)
+            if lmp_raw is None:
+                n_no_lmp += 1
+                continue
+
         is_seq_valid = bool(is_valid_array[tmrw_pos].all())
         X_window     = data_array[cutoff_pos - lookback_hours : cutoff_pos]
 
@@ -360,6 +416,8 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
         blocks = [macro_raw, thermal_raw, fc_raw]
         if cong_raw is not None:
             blocks.append(cong_raw)
+        if lmp_raw is not None:
+            blocks.append(lmp_raw)
         static_raw = np.concatenate(blocks)
 
         # Forecast-day (tomorrow) calendar features, broadcast across the window.
@@ -388,6 +446,9 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
               f"(archive starts 2021-03, with holes)")
     if n_no_cong:
         print(f"Congestion: {n_no_cong} day(s) skipped — no DA marginal value for the "
+              f"blind-spot day")
+    if n_no_lmp:
+        print(f"LMP: {n_no_lmp} day(s) skipped — no complete Day-Ahead price day for the "
               f"blind-spot day")
 
     X_3d = np.array(X_list, dtype='float32')                    # (N, 168, seq+calendar)

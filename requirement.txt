@@ -20,3 +20,9 @@ ipython>=8.10.0
 joblib>=1.2.0
 
 matplotlib>=3.7.0
+# === Foundation models (OPTIONAL — run_foundation.py only) ===
+# Not imported by Model_Training.py, the evaluator or the serving path, so the daily CI job
+# does not need it. The package version does NOT track the model version: `timesfm` 2.0.x
+# serves the TimesFM 2.5 checkpoint.
+#   .venv/bin/pip install 'timesfm[torch]'
+# timesfm[torch]>=2.0.2
