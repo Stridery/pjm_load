@@ -8,7 +8,13 @@ import joblib
 from src.config import (
     TREE_FEATURE_CONFIG, TRANSFORMER_FEATURE_CONFIG, WEATHER_COLS, EMBARGO_DAYS,
     FORECAST_PATH, CONGESTION_PATH, CONGESTION_CONFIG, LMP_PATH, LMP_CONFIG, MATRIX_TAG,
+    TARGET_COL, TARGET_TAG, TARGET_SPEC, N_SEQ_FEATURES, DATASET,
+    SERIES_COL, TARGET_LAG_DAYS,
 )
+
+# Whether a day whose target has a hole is dropped outright. False for load, which
+# keeps its unlabelled trailing days as the serving prediction set.
+_DROP_INCOMPLETE = TARGET_SPEC['drop_incomplete_target']
 from src.lmp_features import (
     LMP_SEQ_COLS, active_feature_names, add_lmp_sequence_cols, build_lmp_table,
     compute_lmp_features,
@@ -27,6 +33,31 @@ from src.forecast_features import (
 )
 
 
+def _expected_widths(lookback_hours):
+    """(3-D channel count, 2-D column count) the CURRENT config should produce.
+
+    Used to reject a cached matrix built under a different feature set. MATRIX_TAG records the
+    two static switches but NOT the sequence width, so a change like making the Real-Time price
+    channels unconditional leaves the tag alone while the tensor gets three channels wider. The
+    builders cache on filename, so without this check the old file is loaded and every model
+    slices x[:, :, :N_SEQ] out of a tensor whose channels no longer mean what the slice assumes
+    -- calendar columns read as price channels, with no error anywhere.
+    """
+    n_seq = N_SEQ_FEATURES
+    n_static = (len(MACRO_FEATURE_NAMES) + len(THERMAL_STATIC_NAMES) + len(FC_FEATURE_NAMES)
+                + (len(CONG_FEATURE_NAMES) if CONGESTION_CONFIG['enabled'] else 0)
+                + (len(active_feature_names()) if LMP_CONFIG['enabled'] else 0))
+    return n_seq + 6 + n_static, lookback_hours * n_seq + 6 + n_static + 1
+
+
+def _reject_stale(path, got, want, kind):
+    raise SystemExit(
+        f"{path}\n  holds {got} {kind} but the current feature set needs {want}. That file was "
+        f"built under a different configuration and MATRIX_TAG cannot tell them apart, so it "
+        f"must be rebuilt:\n      rm data/{DATASET}/matrix/*\n  Every model trained on the old "
+        f"width also has to be retrained -- its first layer expects the old shape.")
+
+
 def _load_forecast():
     """The forecast lookup table (always loaded — forecast weather is the only feature set).
 
@@ -36,6 +67,14 @@ def _load_forecast():
     table = load_forecast_table(FORECAST_PATH)
     print(f"Forecast weather: {len(table)} complete issue date(s) from {FORECAST_PATH}")
     return table
+
+
+_MATRIX_CACHE = {}
+
+
+def _matrix_key(*paths):
+    """Cache key: every artifact's path AND mtime, so a rebuilt matrix is never served stale."""
+    return tuple((p, os.path.getmtime(p)) for p in paths)
 
 
 _CONG_CACHE = {}
@@ -101,6 +140,40 @@ def _forecast_for(fc_table, target_day, temp_raw, ept_hours, cutoff_pos, lookbac
         fc[0], fc[1], temp_raw[lo:cutoff_pos], ept_hours[lo:cutoff_pos])
 
 
+def _cutoff_row(ept_dates, ept_hours, today, latest_info_hour):
+    """Row index of this sample's cutoff, or -1.
+
+    The cutoff is `today` at latest_info_hour (or the previous day when that hour is late),
+    then stepped back TARGET_LAG_DAYS whole days. The step exists for load_met, whose context
+    series is METERED load: PJM publishes it about a day after the preliminary series, so a
+    window that ended where the preliminary one does would be reading values that did not
+    exist at forecast time. Stepping whole DAYS rather than 24 rows keeps it right across DST,
+    where a day is not 24 rows. TARGET_LAG_DAYS is 0 for every other target, so this is the
+    existing behaviour unchanged.
+    """
+    cut_day = today if latest_info_hour <= 9 else None
+    if cut_day is None:
+        return -2                     # caller handles the (unused) late-hour branch itself
+    if TARGET_LAG_DAYS:
+        cut_day = (pd.Timestamp(cut_day) - pd.Timedelta(days=TARGET_LAG_DAYS)).date()
+    rows = np.where((ept_dates == cut_day) & (ept_hours == latest_info_hour))[0]
+    return int(rows[0]) if len(rows) else -1
+
+
+def _target_validity(df):
+    """Per-row training validity for the CURRENT target.
+
+    For load this is the cleaned CSV's own `is_valid` -- a 3-sigma rule on load by
+    (month, hour), combined with label availability. For any other target that column
+    is about the wrong series: on price it drops 29 days holding 20.6% of the top-1%
+    price hours, which is a spike filter, not a denoiser. Those targets fall back to
+    the only condition that is always right -- the label exists.
+    """
+    if TARGET_SPEC['mask_outliers']:
+        return df['is_valid'].values
+    return df[TARGET_COL].notna().values.astype(int)
+
+
 def _normalize_to_24h(load_vals, ept_hour_vals):
     """
     Normalize a DST transition day's load to exactly 24 EPT-hour slots.
@@ -140,17 +213,28 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     if latest_info_hour is None:
         latest_info_hour = TREE_FEATURE_CONFIG['latest_info_hour']
 
-    x_path = os.path.join(matrix_dir, f'X_opt_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}.csv')
-    y_path = os.path.join(matrix_dir, f'y_opt_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}.csv')
+    x_path = os.path.join(matrix_dir, f'X_opt_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}{TARGET_TAG}.csv')
+    y_path = os.path.join(matrix_dir, f'y_opt_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}{TARGET_TAG}.csv')
 
     # Cache-load: a run touches the builders many times (each model block + each evaluator),
     # so building once and reusing keeps a run fast. Freshness is handled UPSTREAM — the
     # crawler wipes data/{zone}/matrix* after a re-crawl (run_pipeline clear_matrix), so a
     # cached matrix here only ever reflects the current cleaned CSV.
     if os.path.exists(x_path) and os.path.exists(y_path):
+        # Memoised on (path, mtime). Model_Training calls this once per model block and the
+        # evaluator once more per model, ~34 times a run; the file is 82 MB of CSV and pandas
+        # re-parses 4265 columns every time. Keying on mtime keeps a rebuild from being masked.
+        key = ('2d',) + _matrix_key(x_path, y_path)
+        if key in _MATRIX_CACHE:
+            return _MATRIX_CACHE[key]
         print("=== Loading Pre-built 2D Matrix ===")
-        return pd.read_csv(x_path, index_col=0, parse_dates=True), \
-               pd.read_csv(y_path, index_col=0, parse_dates=True)
+        X_cached = pd.read_csv(x_path, index_col=0, parse_dates=True)
+        _, want_p = _expected_widths(lookback_hours)
+        if X_cached.shape[1] != want_p:
+            _reject_stale(x_path, X_cached.shape[1], want_p, 'columns')
+        out = (X_cached, pd.read_csv(y_path, index_col=0, parse_dates=True))
+        _MATRIX_CACHE.clear(); _MATRIX_CACHE[key] = out
+        return out
 
     print("=== Constructing 2D Matrix from Cleaned Data ===")
     df_final = pd.read_csv(cleaned_path, index_col=0, parse_dates=True)
@@ -163,13 +247,13 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     ept_hours = ept_dt.dt.hour.values
 
     weather_cols = WEATHER_COLS
-    feature_cols = ['Load_Estimated'] + weather_cols + THERMAL_SEQ_COLS + seq_lmp
+    feature_cols = [SERIES_COL] + weather_cols + THERMAL_SEQ_COLS + seq_lmp
     data_array   = df_final[feature_cols].values
-    load_raw     = df_final['Load'].values             # metered load — TARGET only
-    est_raw      = df_final['Load_Estimated'].values   # preliminary load — macro features
+    load_raw     = df_final[TARGET_COL].values         # the CURRENT target (PJM_TARGET)
+    est_raw      = df_final[SERIES_COL].values         # macro features, same series as channel 0
     temp_raw     = df_final['Temp_F'].values
     cdd_raw      = df_final['CDD_h'].values
-    valid_raw    = df_final['is_valid'].values
+    valid_raw    = _target_validity(df_final)
 
     min_history = max(lookback_hours, MACRO_WINDOW_HOURS)   # lookback + 3-week macro
     unique_days = np.unique(ept_dates)
@@ -182,21 +266,23 @@ def build_or_load_matrix(cleaned_path, matrix_dir, lookback_hours=None, latest_i
     for i in tqdm(range(len(unique_days) - 1), desc="Building 2D Samples"):
         today, tomorrow = unique_days[i], unique_days[i + 1]
 
-        if latest_info_hour <= 9:
-            cutoff_date, cutoff_hour = today, latest_info_hour
-        else:
+        if latest_info_hour > 9:
             if i == 0:
                 continue
-            cutoff_date, cutoff_hour = unique_days[i - 1], latest_info_hour
-
-        cutoff_rows = np.where((ept_dates == cutoff_date) & (ept_hours == cutoff_hour))[0]
-        if len(cutoff_rows) == 0 or cutoff_rows[0] < min_history:
+            cutoff_date = (pd.Timestamp(unique_days[i - 1])
+                           - pd.Timedelta(days=TARGET_LAG_DAYS)).date()
+            rows = np.where((ept_dates == cutoff_date) & (ept_hours == latest_info_hour))[0]
+            cutoff_pos = int(rows[0]) if len(rows) else -1
+        else:
+            cutoff_pos = _cutoff_row(ept_dates, ept_hours, today, latest_info_hour)
+        if cutoff_pos < 0 or cutoff_pos < min_history:
             continue
-        cutoff_pos = cutoff_rows[0]
 
         tmrw_pos  = np.where(ept_dates == tomorrow)[0]
         y_tomorrow = _normalize_to_24h(load_raw[tmrw_pos], ept_hours[tmrw_pos])
         if y_tomorrow is None:
+            continue
+        if _DROP_INCOMPLETE and not np.isfinite(y_tomorrow).all():
             continue
 
         # A day with no complete forecast is not forecastable, so it is dropped from the matrix
@@ -295,21 +381,31 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     if latest_info_hour is None:
         latest_info_hour = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
 
-    x_path         = os.path.join(matrix_dir, f'X_3d_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}.npy')
-    y_path         = os.path.join(matrix_dir, f'y_3d_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}.npy')
-    mask_path      = os.path.join(matrix_dir, f'mask_3d_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}.npy')
-    timestamp_path = os.path.join(matrix_dir, f'timestamps_3d_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}.npy')
-    scaler_path       = os.path.join(matrix_dir, f'scaler_ts_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}.pkl')
-    y_scaler_path     = os.path.join(matrix_dir, f'y_scaler_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}.pkl')
-    macro_scaler_path = os.path.join(matrix_dir, f'macro_scaler_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}.pkl')
+    x_path         = os.path.join(matrix_dir, f'X_3d_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}{TARGET_TAG}.npy')
+    y_path         = os.path.join(matrix_dir, f'y_3d_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}{TARGET_TAG}.npy')
+    mask_path      = os.path.join(matrix_dir, f'mask_3d_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}{TARGET_TAG}.npy')
+    timestamp_path = os.path.join(matrix_dir, f'timestamps_3d_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}{TARGET_TAG}.npy')
+    scaler_path       = os.path.join(matrix_dir, f'scaler_ts_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}{TARGET_TAG}.pkl')
+    y_scaler_path     = os.path.join(matrix_dir, f'y_scaler_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}{TARGET_TAG}.pkl')
+    macro_scaler_path = os.path.join(matrix_dir, f'macro_scaler_lb{lookback_hours}_h{latest_info_hour}{MATRIX_TAG}{TARGET_TAG}.pkl')
     os.makedirs(matrix_dir, exist_ok=True)
 
     # Cache-load: a run touches this many times (each model block + each evaluator), so build
     # once and reuse. Freshness is handled UPSTREAM — the crawler wipes data/{zone}/matrix*
     # after a re-crawl, so a cached matrix here only reflects the current cleaned CSV.
     if all(os.path.exists(p) for p in [x_path, y_path, mask_path, timestamp_path]):
+        key = ('3d',) + _matrix_key(x_path, y_path, mask_path, timestamp_path)
+        if key in _MATRIX_CACHE:
+            return _MATRIX_CACHE[key]
         print(f"=== Loading 3D Matrix (lb={lookback_hours}, h={latest_info_hour}) ===")
-        return np.load(x_path), np.load(y_path), np.load(mask_path), np.load(timestamp_path, allow_pickle=True)
+        X_cached = np.load(x_path)
+        want_c, _ = _expected_widths(lookback_hours)
+        if X_cached.shape[2] != want_c:
+            _reject_stale(x_path, X_cached.shape[2], want_c, 'channels')
+        out = (X_cached, np.load(y_path), np.load(mask_path),
+               np.load(timestamp_path, allow_pickle=True))
+        _MATRIX_CACHE.clear(); _MATRIX_CACHE[key] = out
+        return out
 
     print(f"=== Constructing 3D Matrix (lb={lookback_hours}, h={latest_info_hour}) ===")
     df = pd.read_csv(cleaned_path, index_col=0, parse_dates=True)
@@ -321,7 +417,7 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     # every hour. Calendar/cyclic features are NOT put in the window — hour-of-day is
     # implicit in the 24-dim output (and the expert routing), and month/day-of-week
     # belong to the FORECAST day, so they are appended below as broadcast constants.
-    feature_cols = ['Load_Estimated'] + WEATHER_COLS + THERMAL_SEQ_COLS + seq_lmp
+    feature_cols = [SERIES_COL] + WEATHER_COLS + THERMAL_SEQ_COLS + seq_lmp
     split_idx = int(len(df) * (1 - TRANSFORMER_FEATURE_CONFIG['test_frac']))
 
     scaler = StandardScaler()
@@ -331,8 +427,8 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     joblib.dump(scaler, scaler_path)
 
     y_scaler = StandardScaler()
-    y_scaler.fit(df.iloc[:split_idx][['Load']])
-    load_scaled = y_scaler.transform(df[['Load']])[:, 0]
+    y_scaler.fit(df.iloc[:split_idx][[TARGET_COL]])
+    load_scaled = y_scaler.transform(df[[TARGET_COL]])[:, 0]
     joblib.dump(y_scaler, y_scaler_path)
 
     ept_dt    = pd.to_datetime(df['Datetime_EPT'])
@@ -340,11 +436,11 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     ept_hours = ept_dt.dt.hour.values
 
     data_array    = df_scaled[feature_cols].values
-    load_array    = load_scaled                    # metered load — TARGET only
+    load_array    = load_scaled                    # the CURRENT target, standardized
     # Macro features use the PRELIMINARY (estimated) load: the metered series lags ~2
     # weeks and is not available for these windows at forecast time.
-    est_raw       = df['Load_Estimated'].values
-    is_valid_array = df['is_valid'].values
+    est_raw       = df[SERIES_COL].values
+    is_valid_array = _target_validity(df)
     unique_days   = np.unique(ept_dates)
 
     # Enough history for both the lookback window and the 3-week macro features.
@@ -362,21 +458,23 @@ def build_timeseries_matrix(cleaned_path, matrix_dir, lookback_hours=None, lates
     for i in tqdm(range(len(unique_days) - 1), desc="Building 3D Samples"):
         today, tomorrow = unique_days[i], unique_days[i + 1]
 
-        if latest_info_hour <= 9:
-            cutoff_date, cutoff_hour = today, latest_info_hour
-        else:
+        if latest_info_hour > 9:
             if i == 0:
                 continue
-            cutoff_date, cutoff_hour = unique_days[i - 1], latest_info_hour
-
-        cutoff_rows = np.where((ept_dates == cutoff_date) & (ept_hours == cutoff_hour))[0]
-        if len(cutoff_rows) == 0 or cutoff_rows[0] < min_history:
+            cutoff_date = (pd.Timestamp(unique_days[i - 1])
+                           - pd.Timedelta(days=TARGET_LAG_DAYS)).date()
+            rows = np.where((ept_dates == cutoff_date) & (ept_hours == latest_info_hour))[0]
+            cutoff_pos = int(rows[0]) if len(rows) else -1
+        else:
+            cutoff_pos = _cutoff_row(ept_dates, ept_hours, today, latest_info_hour)
+        if cutoff_pos < 0 or cutoff_pos < min_history:
             continue
-        cutoff_pos = cutoff_rows[0]
 
         tmrw_pos = np.where(ept_dates == tomorrow)[0]
         y_window = _normalize_to_24h(load_array[tmrw_pos], ept_hours[tmrw_pos])
         if y_window is None:
+            continue
+        if _DROP_INCOMPLETE and not np.isfinite(y_window).all():
             continue
 
         # Same rule as the 2D builder: no complete forecast, no sample. Zero-filling would

@@ -1,5 +1,5 @@
 import os
-from src.config import DATASET, MATRIX_TAG
+from src.config import DATASET, MATRIX_TAG, TARGET_TAG
 
 
 def run_tag(cfg):
@@ -19,11 +19,18 @@ def run_tag(cfg):
 
 
 def _make_run_dir(base, model_type, cfg, dataset=None):
-    """Directory a run writes into: {base}/{dataset}/{model_type}/{run tag}.
+    """Directory a run writes into: {base}/{dataset}{target}/{model_type}/{run tag}.
 
     Defaults to the configured DATASET; an explicit `dataset` still wins — that is how the
     joint models reach models/joint_dom_bge/.
+
+    TARGET_TAG is appended for the same reason MATRIX_TAG is in run_tag(): a run under a
+    different PJM_TARGET is a different model of a different series, and without the tag a
+    price run silently OVERWRITES the load weights of the same architecture. It must be
+    added here and not only in cfg.MODEL_ROOT, because this is the path the trainers
+    actually save to while the evaluator resolves cfg.MODEL_ROOT — the two disagreeing is
+    how the clobber goes unnoticed.
     """
-    path = os.path.join(base, dataset or DATASET, model_type, run_tag(cfg))
+    path = os.path.join(base, (dataset or DATASET) + TARGET_TAG, model_type, run_tag(cfg))
     os.makedirs(path, exist_ok=True)
     return path

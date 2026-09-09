@@ -58,12 +58,19 @@ def baseline_from_windows(win, mode='hourly'):
 
 
 def tree_baseline(X_opt, mode='hourly', lookback=168):
-    """Baseline for the 2D matrix — the lookback window is sitting right there in columns."""
-    cols = [f'load_estimated_h{k}' for k in range(lookback)]
+    """Baseline for the 2D matrix — the lookback window is sitting right there in columns.
+
+    The column stem follows PJM_TARGET's own load channel: `load_estimated_h*` for the
+    preliminary-load classes, `load_h*` for load_met, whose sequence carries METERED load.
+    Hard-coding the preliminary stem here would raise a KeyError on load_met rather than
+    silently misread, but naming it from config keeps the two in step by construction.
+    """
+    from src.config import SERIES_COL
+    cols = [f'{SERIES_COL.lower()}_h{k}' for k in range(lookback)]
     missing = [c for c in cols if c not in X_opt.columns]
     if missing:
         raise KeyError(
-            f"2D matrix is missing {len(missing)} load_estimated_h* column(s) "
+            f"2D matrix is missing {len(missing)} {SERIES_COL.lower()}_h* column(s) "
             f"(first: {missing[0]}). The residual model reads the preliminary-load window "
             f"straight out of the features; without it there is no baseline."
         )
@@ -113,7 +120,8 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
     """Return (train, predict, evaluate) for a residual sequence model."""
     from sklearn.preprocessing import StandardScaler
 
-    from src.config import MATRIX_DIR, EMBARGO_DAYS, MATRIX_TAG
+    from src.config import (MATRIX_DIR, EMBARGO_DAYS, MATRIX_TAG, TARGET_TAG,
+                            TARGET, TARGET_SPEC)
     from src.feature_engine import _split_indices, apply_embargo
     from src.models._eval_utils import EvalUtils
     from src.models._utils import _make_run_dir
@@ -124,8 +132,8 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
     hh = feature_cfg['latest_info_hour']
 
     def _matrix_scalers():
-        seq = _glob_scaler(MATRIX_DIR, f'scaler_ts_lb{lb}_h{hh}{MATRIX_TAG}.pkl')
-        ysc = _glob_scaler(MATRIX_DIR, f'y_scaler_lb{lb}_h{hh}{MATRIX_TAG}.pkl')
+        seq = _glob_scaler(MATRIX_DIR, f'scaler_ts_lb{lb}_h{hh}{MATRIX_TAG}{TARGET_TAG}.pkl')
+        ysc = _glob_scaler(MATRIX_DIR, f'y_scaler_lb{lb}_h{hh}{MATRIX_TAG}{TARGET_TAG}.pkl')
         return seq, ysc
 
     def _scalers(model_path):
@@ -143,6 +151,19 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
         return _make_run_dir('models', model_type, feature_cfg, dataset)
 
     def _train(X_3d, y_3d, mask_3d, timestamps_3d, params, dataset):
+        # Refuse rather than produce plausible noise. The baseline below is a
+        # same-hour-last-week mean of Load_Estimated, in MW. Subtract it from a price
+        # target and the arithmetic still cancels at inference -- nothing raises -- but
+        # measured on dom the price signal is 0.14% of the residual's variance
+        # (baseline std 2637 MW against a price std of 99 $/MWh), so the network spends
+        # its whole capacity rebuilding the baseline it is about to add back.
+        if not TARGET_SPEC['residual_ok']:
+            raise ValueError(
+                f"{name} is a residual model and PJM_TARGET={TARGET!r} does not support one: "
+                f"the baseline is built from Load_Estimated (MW) and the target is "
+                f"{TARGET_SPEC['column']} ({TARGET_SPEC['unit']}). Train the direct models "
+                f"instead (PJM_TRAIN_ONLY without the *_residual names), or give this target "
+                f"its own baseline before enabling residual_ok in TARGET_SPECS.")
         params = {**(params or params_default)}
         mode = params.pop('baseline', 'hourly')
         N, H = y_3d.shape

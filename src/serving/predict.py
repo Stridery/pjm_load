@@ -17,7 +17,7 @@ import os
 import joblib
 import numpy as np
 
-from src.config import (MODEL_ROOT, MATRIX_DIR, TRANSFORMER_FEATURE_CONFIG, MATRIX_TAG,
+from src.config import (MODEL_ROOT, MATRIX_DIR, TRANSFORMER_FEATURE_CONFIG, MATRIX_TAG, TARGET_TAG,
                         matrix_tag_of)
 from src.model_evaluator import TREE_MODELS, SEQ_MODELS, TREE_MOD, SEQ_MOD, SEQ_PARAMS
 from src.serving.features import build_sequence_sample, build_tree_sample
@@ -66,7 +66,7 @@ def available_models(model_root=None):
 def _y_scaler(matrix_dir):
     lb = TRANSFORMER_FEATURE_CONFIG['lookback_hours']
     hh = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
-    hits = glob.glob(os.path.join(matrix_dir, f'y_scaler_lb{lb}_h{hh}{MATRIX_TAG}.pkl'))
+    hits = glob.glob(os.path.join(matrix_dir, f'y_scaler_lb{lb}_h{hh}{MATRIX_TAG}{TARGET_TAG}.pkl'))
     if not hits:
         raise FileNotFoundError(f"No y_scaler in {matrix_dir} — train first.")
     return joblib.load(hits[0])

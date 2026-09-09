@@ -92,8 +92,12 @@ def forecast(contexts, horizon, params, past_only=None, past_future=None):
         past_only_covariates=past_only,
         past_future_covariates=past_future,
         return_quantiles=False,
-        # Load is strictly positive. Unlike 2.5's infer_is_positive this never applies to a
-        # signed residual series, because 3.0 always forecasts metered load directly.
-        make_positive=bool(params.get('make_positive', True)),
+        # Load is strictly positive, so clamping helps in DIRECT mode. In RESIDUAL mode the
+        # series is a signed deviation that is negative about half the time, and clamping it
+        # would delete every downward correction the model makes — the same trap 2.5's
+        # infer_is_positive had. _bench sets series_is_positive per mode; the adapter's own
+        # config default only applies when nothing said otherwise.
+        make_positive=bool(params.get('series_is_positive',
+                                      params.get('make_positive', True))),
     )
     return _as_array(out, n, horizon)

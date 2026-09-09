@@ -64,18 +64,30 @@ FUTURE_WEATHER = 'Temp_F'
 # past_only: observations that stop at the context end. The price channels are switched by
 # PJM_LMP, exactly like the point models' price block, so the run tag already distinguishes
 # the two arms and an A/B is two runs.
-PAST_ONLY_LOAD = ['Load_Estimated']
+# The load channel follows PJM_TARGET. For load and rt_price that is preliminary load; for
+# load_met it is metered load, which is also the CONTEXT series and is therefore removed again
+# by the `exclude` argument -- leaving that class with exactly one load series, the one being
+# forecast, exactly as the point models now see it.
+def _past_only_load():
+    from src.config import SERIES_COL
+    return [SERIES_COL]
 PAST_ONLY_PRICE = ['LMP_RT_Total', 'LMP_RT_Energy', 'LMP_RT_Cong']
 # Prices are signed-log'd for the same reason the lookback channels are (median 36, max 4392,
 # 22% of congestion hours negative); load is left in MW, which the model normalises itself.
 PAST_ONLY_LOG = set(PAST_ONLY_PRICE)
 
 
-def past_only_columns(include_prices):
+def past_only_columns(include_prices, exclude=()):
     """Observed channels for the context window: load, optionally prices, then the weather
-    variables the forecast archive cannot carry into the horizon."""
+    variables the forecast archive cannot carry into the horizon.
+
+    `exclude` drops whichever column is already the CONTEXT series. With a price target the
+    context is LMP_RT_Total, and leaving it here too would hand the model the same series twice
+    -- harmless arithmetically, but it misreports the channel count and wastes a covariate slot.
+    """
     obs_weather = [c for c in WEATHER_COLS if c != FUTURE_WEATHER]
-    return PAST_ONLY_LOAD + (PAST_ONLY_PRICE if include_prices else []) + obs_weather
+    cols = _past_only_load() + (PAST_ONLY_PRICE if include_prices else []) + obs_weather
+    return [c for c in cols if c not in set(exclude)]
 
 CALENDAR_CHANNELS = ['hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
                      'month_sin', 'month_cos', 'is_weekend', 'is_holiday']
@@ -116,7 +128,8 @@ def load_forecast_hourly(path):
 
 
 def build(frame, ept_dates, ept_hours, cutoff_pos, target_days, fc_hourly,
-          include_prices=True, context_hours=CONTEXT_HOURS, horizon=HORIZON_STEPS):
+          include_prices=True, context_hours=CONTEXT_HOURS, horizon=HORIZON_STEPS,
+          exclude=()):
     """(past_only, past_future) for a batch of samples, or (None, None) rows where unusable.
 
     Returns two lists aligned with `target_days`; an entry is None when that day's 48 h weather
@@ -124,7 +137,7 @@ def build(frame, ept_dates, ept_hours, cutoff_pos, target_days, fc_hourly,
     models — the caller drops it rather than filling anything in.
     """
     temp = frame[FUTURE_WEATHER].to_numpy(dtype='float32')               # (T,)
-    po_cols = past_only_columns(include_prices)
+    po_cols = past_only_columns(include_prices, exclude)
     missing = [c for c in po_cols if c not in frame.columns]
     if missing:
         raise KeyError(f"The cleaned frame has no {missing}. Re-run the crawler with PJM_LMP=1, "
@@ -180,6 +193,6 @@ def build(frame, ept_dates, ept_hours, cutoff_pos, target_days, fc_hourly,
     return past_only, past_future
 
 
-def channel_names(include_prices=True):
-    return {'past_only': past_only_columns(include_prices),
+def channel_names(include_prices=True, exclude=()):
+    return {'past_only': past_only_columns(include_prices, exclude),
             'past_future': [FUTURE_WEATHER] + CALENDAR_CHANNELS}

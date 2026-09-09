@@ -84,7 +84,14 @@ def train_sequence(model_cls, model_type_name, save_name,
         for bx, by in loader:
             bx, by = bx.to(device), by.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(bx), by)
+            out = model(bx)
+            loss = criterion(out, by)
+            # Optional model-supplied auxiliary term. Only GARCHFormer uses it today:
+            # its variance head is trained by an L1 consistency loss against the squared
+            # residual, which the shared criterion cannot express. A model without the
+            # hook is unaffected, so this costs the other five nets nothing.
+            if hasattr(model, 'aux_loss'):
+                loss = loss + model.aux_loss(out, by)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()

@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import (WEATHER_COLS, MATRIX_DIR, TRANSFORMER_FEATURE_CONFIG,
-                        TREE_FEATURE_CONFIG, MATRIX_TAG)
+                        TREE_FEATURE_CONFIG, MATRIX_TAG, TARGET_TAG)
 from src.congestion_features import CONG_FEATURE_NAMES, compute_congestion_features
 from src.feature_engine import (_load_forecast, _load_congestion, _forecast_for,
                                 FC_FEATURE_NAMES)
@@ -49,8 +49,8 @@ def build_sequence_sample(window_df, target_day, matrix_dir=None):
     lb = TRANSFORMER_FEATURE_CONFIG['lookback_hours']
     hh = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
 
-    seq_scaler    = _load_scaler(matrix_dir, f'scaler_ts_lb{lb}_h{hh}{MATRIX_TAG}.pkl')
-    static_scaler = _load_scaler(matrix_dir, f'macro_scaler_lb{lb}_h{hh}{MATRIX_TAG}.pkl')
+    seq_scaler    = _load_scaler(matrix_dir, f'scaler_ts_lb{lb}_h{hh}{MATRIX_TAG}{TARGET_TAG}.pkl')
+    static_scaler = _load_scaler(matrix_dir, f'macro_scaler_lb{lb}_h{hh}{MATRIX_TAG}{TARGET_TAG}.pkl')
     df = window_df.sort_index().copy()
     add_thermal_sequence_cols(df)                       # CDD_h/HDD_h/rolling — same as training
 
@@ -199,8 +199,8 @@ def verify_against_matrix(cleaned_path, matrix_dir=None, n_days=5, atol=1e-4):
     matrix_dir = matrix_dir or MATRIX_DIR
     lb = TRANSFORMER_FEATURE_CONFIG['lookback_hours']
     hh = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
-    X_train = np.load(os.path.join(matrix_dir, f'X_3d_lb{lb}_h{hh}{MATRIX_TAG}.npy'))
-    ts_train = np.load(os.path.join(matrix_dir, f'timestamps_3d_lb{lb}_h{hh}{MATRIX_TAG}.npy'),
+    X_train = np.load(os.path.join(matrix_dir, f'X_3d_lb{lb}_h{hh}{MATRIX_TAG}{TARGET_TAG}.npy'))
+    ts_train = np.load(os.path.join(matrix_dir, f'timestamps_3d_lb{lb}_h{hh}{MATRIX_TAG}{TARGET_TAG}.npy'),
                        allow_pickle=True)
 
     full = pd.read_csv(cleaned_path, index_col=0, parse_dates=True).sort_index()
@@ -228,7 +228,7 @@ def verify_against_matrix(cleaned_path, matrix_dir=None, n_days=5, atol=1e-4):
     # --- tree (2D) path: compare against the cached X_opt (minus is_target_valid) ---
     tlb = TREE_FEATURE_CONFIG['lookback_hours']
     thh = TREE_FEATURE_CONFIG['latest_info_hour']
-    xopt_path = os.path.join(matrix_dir, f'X_opt_lb{tlb}_h{thh}{MATRIX_TAG}.csv')
+    xopt_path = os.path.join(matrix_dir, f'X_opt_lb{tlb}_h{thh}{MATRIX_TAG}{TARGET_TAG}.csv')
     if os.path.exists(xopt_path):
         X_opt = pd.read_csv(xopt_path, index_col=0)
         X_opt.index = pd.to_datetime(X_opt.index).date

@@ -38,7 +38,17 @@ MODES = ('direct', 'residual')
 # only the UNVERIFIED value would have existed, and PJM revises it. That revision is not
 # recoverable from this data (no archived snapshots), so metered-context scores carry an
 # unmeasured optimism. It is expected to be small, but it is not zero and it is one-directional.
-SERIES = {'estimated': 'Load_Estimated', 'metered': 'Load'}
+#   'rt_price'  — the Real-Time zonal price. Realised hour by hour during the operating day,
+#                 so at the cutoff it is available through exactly the same last hour as
+#                 preliminary load: extra_lag is 0 and the geometry is the 48-step one, NOT
+#                 metered's 72-step one. Only reachable with PJM_TARGET=rt_price, where the
+#                 truth matrix is price too; pairing a price context with a load target would
+#                 be a category error, so the two are checked against each other below.
+SERIES = {'estimated': 'Load_Estimated', 'metered': 'Load', 'rt_price': 'LMP_RT_Total'}
+
+# Which context series belongs to which PJM_TARGET. A run is refused rather than allowed to
+# forecast one series and score it against another.
+SERIES_TARGET = {'estimated': 'load', 'metered': 'load', 'rt_price': 'rt_price'}
 
 
 def _score(y_true, y_pred):
@@ -74,7 +84,7 @@ def run_tag(feature_cfg, context_hours, series='estimated', issue='day_of'):
 
 def _load_truth(feature_cfg):
     lb, hh = feature_cfg['lookback_hours'], feature_cfg['latest_info_hour']
-    path = os.path.join(cfg.MATRIX_DIR, f'y_opt_lb{lb}_h{hh}{cfg.MATRIX_TAG}.csv')
+    path = os.path.join(cfg.MATRIX_DIR, f'y_opt_lb{lb}_h{hh}{cfg.MATRIX_TAG}{cfg.TARGET_TAG}.csv')
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"No target matrix at {path}. It carries the day list this benchmark must score to "
@@ -108,6 +118,12 @@ def run_one(adapter_name, mode, context_hours, fcfg=None, feature_cfg=None, seri
     series = series or fcfg.get('series', 'estimated')
     if series not in SERIES:
         raise ValueError(f"series must be one of {sorted(SERIES)}, got {series!r}")
+    if SERIES_TARGET[series] != cfg.TARGET:
+        raise ValueError(
+            f"series={series!r} forecasts {SERIES[series]}, but PJM_TARGET={cfg.TARGET!r} scores "
+            f"{cfg.TARGET_COL}. The truth comes from the y matrix, so this would compare a "
+            f"forecast of one series against another. Use "
+            f"PJM_TARGET={SERIES_TARGET[series]} for series={series!r}.")
     # Metered trails preliminary by ~1 day, and 'metered_issue' says which way that is paid for:
     # 'day_of' keeps the horizon at 48 and gives up the day-ahead issue time (the forecast can
     # first be made at the START of the target day); 'day_ahead' keeps the issue time and pays
@@ -205,7 +221,8 @@ def run_one(adapter_name, mode, context_hours, fcfg=None, feature_cfg=None, seri
             g = np.where(need_kept == h)[0]
             gpo, gpf = COV.build(df, ept_dates, ept_hours, cutoff[kept][g], target_days[kept][g],
                                  fc_hourly, include_prices=bool(params.get('include_prices', True)),
-                                 context_hours=context_hours, horizon=int(h))
+                                 context_hours=context_hours, horizon=int(h),
+                                 exclude=(SERIES[series],))
             for j, i in enumerate(g):
                 po[i], pf[i] = gpo[j], gpf[j]
         have = np.array([x is not None for x in pf])
@@ -218,7 +235,8 @@ def run_one(adapter_name, mode, context_hours, fcfg=None, feature_cfg=None, seri
             po = [x for x, k in zip(po, have) if k]
             pf = [x for x, k in zip(pf, have) if k]
         past_only, past_future = po, pf
-        names = COV.channel_names(bool(params.get('include_prices', True)))
+        names = COV.channel_names(bool(params.get('include_prices', True)),
+                                  exclude=(SERIES[series],))
         print(f"  covariates: past_only {len(names['past_only'])}x{context_hours}, "
               f"past_future {len(names['past_future'])}x{context_hours + horizon}"
               f"  (prices {'on' if params.get('include_prices', True) else 'off'})")
@@ -260,7 +278,7 @@ def run_one(adapter_name, mode, context_hours, fcfg=None, feature_cfg=None, seri
         print("\n=== model vs the baseline it leans on (test) ===")
         print(_fmt('naive baseline alone', _score(y_true[is_test], baseline_24[is_test])))
         print(_fmt('residual + baseline', _score(y_true[is_test], pred[is_test])))
-        print(f"  mean |predicted residual| = {np.abs(raw[is_test]).mean():.1f} MW  "
+        print(f"  mean |predicted residual| = {np.abs(raw[is_test]).mean():.1f} {cfg.TARGET_UNIT}  "
               f"(0 would reproduce the baseline exactly)")
     else:
         uncorrected = pred.copy()
@@ -313,7 +331,7 @@ def run_one(adapter_name, mode, context_hours, fcfg=None, feature_cfg=None, seri
             f.write("\nreference points on the same test days:\n")
             for tag, arr in extra:
                 s = _score(y_true[is_test], arr[is_test])
-                f.write(f"  {tag:28s} MAPE {s['MAPE']:6.3f} %   MAE {s['MAE']:8.2f} MW\n")
+                f.write(f"  {tag:28s} MAPE {s['MAPE']:6.3f} %   MAE {s['MAE']:8.2f} {cfg.TARGET_UNIT}\n")
 
     manifest = {'zone': cfg.DATASET, 'adapter': adapter_name, 'mode': mode,
                 'series': series, 'metered_issue': issue if series == 'metered' else None,

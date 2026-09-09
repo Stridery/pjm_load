@@ -4,6 +4,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_percentage_error, mean_absolute_error, mean_squared_error
 
+from src.config import TARGET_UNIT, TARGET_SPEC
+
 
 # ---------------------------------------------------------------------------
 # DST helpers
@@ -370,7 +372,7 @@ class EvalUtils:
         rmse = np.sqrt(mean_squared_error(flat_true, flat_pred))
         me   = float(np.mean(flat_pred - flat_true))
         bias_dir = 'over' if me > 0 else 'under'
-        print(f"Global -> MAPE: {mape:.2f}% | MAE: {mae:.2f} | RMSE: {rmse:.2f} | ME: {me:+.2f} MW ({bias_dir})")
+        print(f"Global -> MAPE: {mape:.2f}% | MAE: {mae:.2f} | RMSE: {rmse:.2f} | ME: {me:+.2f} {TARGET_UNIT} ({bias_dir})")
 
         # Binned Residual Slope: OLS on (bin mean true load, bin mean residual)
         # Positive → over-predict at high load; Negative → under-predict at high load
@@ -381,7 +383,7 @@ class EvalUtils:
         bin_resid   = pd.Series(residuals).groupby(bin_labels).mean().values
         brs = np.polyfit(bin_centers, bin_resid, 1)[0]   # MW per MW
         brs_dir = 'over↑ at peak' if brs > 0 else 'under↓ at peak'
-        print(f"         BRS:  {brs:+.4f} MW/MW ({brs_dir}, near 0 = unbiased across load range)")
+        print(f"         BRS:  {brs:+.4f} {TARGET_UNIT}/{TARGET_UNIT} ({brs_dir}, near 0 = unbiased across range)")
 
         hourly_mape = [
             mean_absolute_percentage_error(y_true_np[:, h], y_pred_np[:, h]) * 100
@@ -402,19 +404,35 @@ class EvalUtils:
         peak_thr  = np.quantile(flat_true, 0.9)
         peak_mask = flat_true >= peak_thr
         peak_mape = mean_absolute_percentage_error(flat_true[peak_mask], flat_pred[peak_mask]) * 100
+
+        # Unit and peak label follow PJM_TARGET, so a price run's metrics.txt says $/MWh and
+        # "top 10% price hours" rather than silently claiming megawatts.
+        U    = TARGET_UNIT
+        plab = TARGET_SPEC['peak_label']
+        # wMAPE = sum|e| / sum|y|. Reported for targets whose per-observation MAPE is
+        # dominated by small denominators -- price sits at skew 14.7 / kurtosis 398, where a
+        # handful of near-zero hours move MAPE more than the whole rest of the year.
+        wmape      = np.abs(flat_true - flat_pred).sum() / np.abs(flat_true).sum() * 100
+        peak_wmape = (np.abs(flat_true[peak_mask] - flat_pred[peak_mask]).sum()
+                      / np.abs(flat_true[peak_mask]).sum() * 100)
+
         txt_path = os.path.join(result_dir, f'{model_name}_metrics.txt')
         with open(txt_path, 'w') as f:
             f.write(f"{model_name} — evaluation metrics\n")
             f.write(f"generated:    {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}\n")
             f.write(f"result_dir:   {result_dir}\n")
+            f.write(f"target:       {TARGET_SPEC['column']} ({U})\n")
             f.write(f"test samples: {len(flat_true)} ({detailed_df['date'].nunique()} days)"
                     f"{'' if full else f', hours={hcols}'}\n\n")
             f.write(f"MAPE:      {mape:8.3f} %\n")
-            f.write(f"MAE:       {mae:8.2f} MW\n")
-            f.write(f"RMSE:      {rmse:8.2f} MW\n")
-            f.write(f"ME (bias): {me:+8.2f} MW ({bias_dir}-prediction)\n")
-            f.write(f"BRS:       {brs:+8.4f} MW/MW ({brs_dir})\n")
-            f.write(f"Peak MAPE (top 10% load hours): {peak_mape:.3f} %\n")
+            f.write(f"MAE:       {mae:8.2f} {U}\n")
+            f.write(f"RMSE:      {rmse:8.2f} {U}\n")
+            f.write(f"ME (bias): {me:+8.2f} {U} ({bias_dir}-prediction)\n")
+            f.write(f"BRS:       {brs:+8.4f} {U}/{U} ({brs_dir})\n")
+            f.write(f"Peak MAPE (top 10% {plab} hours): {peak_mape:.3f} %\n")
+            if TARGET_SPEC['report_wmape']:
+                f.write(f"wMAPE:     {wmape:8.3f} %\n")
+                f.write(f"Peak wMAPE (top 10% {plab} hours): {peak_wmape:.3f} %\n")
             f.write(f"Worst day: {daily_mape.index[0]} ({daily_mape.iloc[0]:.2f}%)\n")
             f.write(f"Best day:  {daily_mape.index[-1]} ({daily_mape.iloc[-1]:.2f}%)\n")
         print(f"Metrics summary saved to: {txt_path}")

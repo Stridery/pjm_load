@@ -20,9 +20,23 @@ from src.models import moe_mstnn as moe_mstnn_mod
 from src.models import moe_mstnn_residual as moe_mstnn_res_mod
 from src.models import moe_lstm as moe_lstm_mod
 from src.models import moe_lstm_residual as moe_lstm_res_mod
+from src.models import archformer as archformer_mod
+from src.models import archformer_residual as archformer_res_mod
 
 TEST_STRATEGIES = ['tail']
 VAL_STRATEGIES  = ['tail']
+
+# Residual models lean on a Load_Estimated baseline, so they are meaningful only for a load
+# target. Rather than let a price run abort halfway through on the guard in
+# src/models/_residual.py, drop them from TRAIN_CONFIG up front and say so once.
+if not cfg.TARGET_SPEC['residual_ok']:
+    _skipped = [m for m, on in cfg.TRAIN_CONFIG.items() if on and m.endswith('_residual')]
+    if _skipped:
+        print(f"PJM_TARGET={cfg.TARGET!r}: skipping {len(_skipped)} residual model(s) — "
+              f"their baseline is Load_Estimated in MW, the target is "
+              f"{cfg.TARGET_COL} in {cfg.TARGET_UNIT}. ({', '.join(_skipped)})")
+    cfg.TRAIN_CONFIG = {m: (0 if m.endswith('_residual') else on)
+                        for m, on in cfg.TRAIN_CONFIG.items()}
 
 
 def _model_path(model_type, feature_cfg, filename):
@@ -185,6 +199,32 @@ if cfg.TRAIN_CONFIG['mstnn']:
             mf = cfg.MSTNN_FEATURE_CONFIG
             _run_eval('mstnn',
                       _model_path('mstnn', mf, 'mstnn_best.pth'),
+                      test_strategy, mf)
+
+# --- GARCHFormer / ARCHFormer3 (+ residual) ---
+# Same shape as the MSTNN block. Both variants are driven from one matrix build,
+# because the two runs differ only in their target.
+for _name, _mod, _params in [
+    ('archformer',          archformer_mod,     cfg.ARCHFORMER_PARAMS),
+    ('archformer_residual', archformer_res_mod, cfg.ARCHFORMER_RESIDUAL_PARAMS),
+]:
+    if not cfg.TRAIN_CONFIG[_name]:
+        continue
+    X_3d, y_3d, mask_3d, timestamps_3d = build_timeseries_matrix(cfg.CLEANED_PATH, cfg.MATRIX_DIR)
+
+    for test_strategy in TEST_STRATEGIES:
+        for val_strategy in VAL_STRATEGIES:
+            print(f"\n{'='*60}")
+            print(f"{_name.upper()} | test split: {test_strategy} | val split: {val_strategy}")
+            print(f"{'='*60}")
+
+            cfg.ARCHFORMER_FEATURE_CONFIG['split_strategy'] = test_strategy
+            cfg.ARCHFORMER_FEATURE_CONFIG['val_strategy']   = val_strategy
+
+            _mod.train(X_3d, y_3d, mask_3d, _params, cfg.ARCHFORMER_FEATURE_CONFIG)
+            mf = cfg.ARCHFORMER_FEATURE_CONFIG
+            _run_eval(_name,
+                      _model_path(_name, mf, f'{_name}_best.pth'),
                       test_strategy, mf)
 
 # --- LSTM ---

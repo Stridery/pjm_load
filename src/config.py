@@ -42,8 +42,105 @@ from src.lmp_features import LMP_SEQ_COLS       # per-hour price feats (go into 
 # spliced into the STATIC feature block at matrix-build time (see src/forecast_features.py).
 # The cleaned CSVs don't carry it — it lives on its own index in cleaned/forecast.csv and is
 # joined by EPT date. Days without a complete forecast are dropped from the matrix.
-MODEL_ROOT  = f'models/{DATASET}'
-RESULT_ROOT = f'results/{DATASET}'
+
+# --- Forecast target (PJM_TARGET) ---
+# WHICH SERIES the models regress on. The feature side is untouched by this switch: the
+# same X matrix, the same 168 h lookback, the same static blocks. Only y moves.
+#
+#   load      metered zonal load, MW              -- the original task, the default
+#   rt_price  Real-Time zonal LMP, $/MWh          -- same cutoff, same target day
+#
+# The two are NOT variants of one task and their artifacts must not mix, so every target
+# other than `load` carries TARGET_TAG through the matrix filenames, the model root and
+# the result root. `load` keeps the empty tag so nothing already on disk moves.
+#
+# Three things differ besides the column, and all three are silent failures if ignored:
+#
+#   mask_outliers  the cleaned CSV's `is_valid` is a 3-sigma rule on LOAD by (month, hour).
+#                  It drops 29 days on dom -- 1.4% of hours, but 20.6% of the top-1% PRICE
+#                  hours, a 15x enrichment. For load those days are noise; for price the
+#                  spikes are the signal, so price does not inherit that mask and validity
+#                  becomes "the target hour exists".
+#   residual_ok    the residual models subtract a same-hour-last-week baseline built from
+#                  Load_Estimated. Against a price target that baseline is ~14,000 MW while
+#                  the target is ~59 $/MWh: the subtraction cancels arithmetically at
+#                  inference, so nothing raises, but price is then 0.14% of the residual's
+#                  variance and the network spends its capacity rebuilding the load baseline
+#                  it is about to add back. Measured, not argued. Residual models are refused
+#                  for such targets rather than left to produce plausible noise.
+#   peak_metric    MAPE is meaningful on load (naive baseline 7.7%) and much less so on a
+#                  series with skew 14.7 and kurtosis 398 (naive baseline 53%). Price adds
+#                  wMAPE (sum|e| / sum|y|), which is what the price literature reports.
+_TARGET = os.environ.get('PJM_TARGET', 'load').strip()
+
+TARGET_SPECS = {
+    'load': {
+        'column': 'Load', 'unit': 'MW', 'tag': '',
+        # Which column is the sequence's load channel, and how many DAYS the lookback window
+        # is pulled back from the standard cutoff.
+        'series_col': 'Load_Estimated', 'lag_days': 0,
+        'mask_outliers': True, 'residual_ok': True,
+        'peak_label': 'load', 'report_wmape': False,
+        # Metered load trails ~7 d, so the newest days carry Load_Estimated but no label.
+        # data_processor calls those rows "the prediction set" and the matrix deliberately
+        # KEEPS them, excluded from training by the mask, so the serving path has a row to
+        # predict. Dropping them would silently move the tail-0.16 boundary.
+        'drop_incomplete_target': False,
+    },
+    'rt_price': {
+        'column': 'LMP_RT_Total', 'unit': '$/MWh', 'tag': '_rtprice',
+        'series_col': 'Load_Estimated', 'lag_days': 0,
+        'mask_outliers': False, 'residual_ok': False,
+        'peak_label': 'price', 'report_wmape': True,
+        # RT price is realised within the operating day, so there is no unlabelled tail to
+        # preserve. A hole is a fetch gap, and a NaN target would reach the metrics.
+        'drop_incomplete_target': True,
+    },
+    'load_met': {
+        # Metered load forecast from METERED history, on TimesFM's information geometry.
+        #
+        # Why it is a separate class and not an arm of 'load': the 16 point models read
+        # PRELIMINARY load, which is current as of the cutoff, while the TimesFM runs read
+        # METERED load, which PJM publishes about a day later. Comparing the two has always
+        # meant comparing models that saw the record at different moments. This class removes
+        # that difference by giving the point models the foundation model's constraint:
+        #
+        #     issue time            (T-1) 00:00      UNCHANGED -- same as every other class
+        #     metered load through  (T-3) 23:00      one day staler than preliminary
+        #     lookback window       (T-9) 00:00 .. (T-3) 23:00      168 h, shifted back a day
+        #     target                day T, 24 hours
+        #
+        # Only the WINDOW moves. The issue time does not, so everything keyed off the target
+        # day rather than the cutoff is untouched and cannot leak:
+        #   * the 31 fc_* features still come from the forecast issued on T-2, which exists
+        #     hours before a (T-1) 00:00 issue time (its latest run is ~18:00 EPT on T-2);
+        #   * congestion and the Day-Ahead price statics still describe day T-1, whose market
+        #     cleared ~13:30 on T-2.
+        # What the shift does cost is one day of observed weather in the window, and the macro
+        # and thermal-static blocks with it -- those are computed at the cutoff. That is the
+        # same cost TimesFM pays: its past_only covariates end where its context does.
+        #
+        # Load_Estimated is dropped entirely, here and from the foundation covariates, so the
+        # class has exactly one load series and it is the one being forecast.
+        'column': 'Load', 'unit': 'MW', 'tag': '_met',
+        'series_col': 'Load', 'lag_days': 1,
+        'mask_outliers': True, 'residual_ok': True,
+        'peak_label': 'load', 'report_wmape': False,
+        'drop_incomplete_target': False,
+    },
+}
+if _TARGET not in TARGET_SPECS:
+    raise ValueError(f"PJM_TARGET={_TARGET!r} is not one of {sorted(TARGET_SPECS)}.")
+TARGET      = _TARGET
+TARGET_SPEC = TARGET_SPECS[_TARGET]
+TARGET_COL  = TARGET_SPEC['column']
+TARGET_UNIT = TARGET_SPEC['unit']
+TARGET_TAG  = TARGET_SPEC['tag']
+SERIES_COL  = TARGET_SPEC['series_col']   # the sequence's load channel
+TARGET_LAG_DAYS = int(TARGET_SPEC['lag_days'])  # days the lookback window steps back
+
+MODEL_ROOT  = f'models/{DATASET}{TARGET_TAG}'
+RESULT_ROOT = f'results/{DATASET}{TARGET_TAG}'
 
 # --- File Paths ---
 MERGED_PATH      = f'data/{DATASET}/joined/merged_pjm_load_weather.csv'
@@ -96,31 +193,27 @@ CONGESTION_CONFIG = {
 # Fetched by the crawler into data/{zone}/raw/lmp.csv. Off-switch mirrors PJM_CONGESTION:
 # turning it off also stops paying for the download.
 #
-# Not yet consumed by any feature block — the crawler produces the file and nothing reads it.
-# Wiring it into the lookback (RT) or the blind-spot static block (DA) changes the feature set,
-# which invalidates every cached matrix and every trained model, so it is a separate decision
-# from having the data on disk.
-# THREE settings, because the block has two halves that cost very differently:
+# TWO settings. The block is all-or-nothing:
 #
-#   0  off
-#   1  full      — the 3 Real-Time lookback channels (504 columns) AND the 10 Day-Ahead statics
-#   2  statics   — the 10 Day-Ahead statics only, no lookback channels
+#   0  off      — no Real-Time lookback channels, no Day-Ahead statics
+#   1  on       — the 3 Real-Time lookback channels (504 columns) AND the 10 Day-Ahead statics
 #
-# 2 exists because a LightGBM gain breakdown on the '_cong_lmp' arm put the three RT channels
-# at 1.81% of total gain for 504 columns, while the ten statics took 25.35% — and the arm
-# still scored WORSE than '_cong' (3.541% vs 3.462%, peak 4.985% vs 4.768%). High training
-# gain with worse test error is the signature of a proxy the model over-trusts: price is a
-# DOWNSTREAM consequence of load, so it correlates hard in-sample while carrying supply-side
-# noise (outages, fuel, bidding) that has nothing to do with load. Setting 2 drops the half
-# that bought the least per column, so the two halves can be blamed separately.
+# There used to be a third, `2` (the Day-Ahead statics WITHOUT the Real-Time lookback, on a
+# drift-normalised static block), to blame the two halves separately. A LightGBM gain breakdown
+# put the three RT channels at 1.81% of total gain for their 504 columns, so the split was not
+# worth a permanent third arm — and for a PRICE target those channels are the target series' own
+# history, which is not something to switch off. The setting is REMOVED and the RT channels ride
+# with the rest of the block.
 _LMP = os.environ.get('PJM_LMP', '1').strip()
-if _LMP not in ('0', '1', '2'):
-    raise ValueError(f"PJM_LMP={_LMP!r} is not 0, 1 or 2 (off / full / statics-only).")
+if _LMP not in ('0', '1'):
+    raise ValueError(
+        f"PJM_LMP={_LMP!r} is not 0 or 1 (block off / on). Setting 2 — Day-Ahead statics "
+        f"without the Real-Time lookback channels — has been removed; the Real-Time channels "
+        f"now always come with the block.")
 _LMP = int(_LMP)
 LMP_CONFIG = {
-    'enabled':    _LMP > 0,    # read cleaned/lmp_da.csv and splice the static block
-    'lookback':   _LMP == 1,   # additionally put the 3 RT price channels in the sequence
-    'normalised': _LMP == 2,   # use the drift-normalised static block (z-scores + shape)
+    'enabled':  _LMP == 1,   # read cleaned/lmp_da.csv and splice the Day-Ahead static block
+    'lookback': _LMP == 1,   # and put the 3 Real-Time price channels in the sequence
 }
 
 # Per-timestep lookback width: Load_Estimated + weather + thermal, plus the three Real-Time
@@ -137,11 +230,11 @@ N_SEQ_FEATURES = (1 + len(WEATHER_COLS) + len(THERMAL_SEQ_COLS)
 # TWO INDEPENDENT SWITCHES, composed in a fixed order. Each run names both explicitly and
 # trains one arm; the four arms coexist on disk, so any A/B is just two runs:
 #
-#     PJM_CONGESTION=1 PJM_LMP=1   ->  '_cong_lmp'       everything
-#     PJM_CONGESTION=1 PJM_LMP=2   ->  '_cong_lmpstat'   price statics, no price lookback
-#     PJM_CONGESTION=1 PJM_LMP=0   ->  '_cong'           the pre-price feature set
-#     PJM_CONGESTION=0 PJM_LMP=0   ->  ''                the original feature set
-_LMP_TAG = {0: '', 1: '_lmp', 2: '_lmpstat'}[_LMP]
+#     PJM_CONGESTION=1 PJM_LMP=1   ->  '_cong_lmp'   everything
+#     PJM_CONGESTION=1 PJM_LMP=0   ->  '_cong'       the pre-price feature set
+#     PJM_CONGESTION=0 PJM_LMP=1   ->  '_lmp'        price block only
+#     PJM_CONGESTION=0 PJM_LMP=0   ->  ''            the original feature set
+_LMP_TAG = {0: '', 1: '_lmp'}[_LMP]
 MATRIX_TAG = ('_cong' if CONGESTION_CONFIG['enabled'] else '') + _LMP_TAG
 
 # The two tags this repo writes. Needed because '' is a suffix of everything: with the block
@@ -152,9 +245,7 @@ MATRIX_TAG = ('_cong' if CONGESTION_CONFIG['enabled'] else '') + _LMP_TAG
 # which is why there is no '_cong2'/'_s2'. That keeps the naming honest, but it does mean a
 # change to the block's contents must be followed by wiping data/{zone}/matrix*: the builders
 # cache on filename alone, so a stale matrix under the same name would be silently reused.
-# '_lmpstat' deliberately does NOT end in '_lmp', so longest-suffix resolution keeps the two
-# LMP settings apart instead of reading a statics-only run dir as a full one.
-MATRIX_TAGS = ('', '_cong', '_lmp', '_lmpstat', '_cong_lmp', '_cong_lmpstat')
+MATRIX_TAGS = ('', '_cong', '_lmp', '_cong_lmp')
 
 
 def matrix_tag_of(name):
@@ -251,6 +342,8 @@ TRAIN_CONFIG = {
     'moe_mstnn_residual':  1,
     'moe_lstm':            1,
     'moe_lstm_residual':   1,
+    'archformer':          1,
+    'archformer_residual': 1,
 }
 
 # Per-run override: train ONLY these models, comma-separated, everything else skipped.
@@ -461,6 +554,61 @@ MSTNN_PARAMS = {
     'learning_rate': 3e-4,
     'weight_decay': 1e-4,
     'early_stop_patience': 50,
+}
+
+# ---------------------------------------------------------------------------
+# GARCHFormer / ARCHFormer3  (src/models/archformer.py)
+# ---------------------------------------------------------------------------
+# Moyi Guo's variance-aware Transformer, vendored unchanged in src/models/_garchformer/.
+# The ARCHITECTURE hyperparameters below are his cfgs_grid_search/archformer3.json
+# verbatim -- d_model 64, 4 heads, 2+2 layers, intermediate_dim 32, patch_len 24,
+# dropout 0.1 -- because the instruction was to run his model as published.
+#
+# The TRAINING knobs are set to mirror his run_point_forecast.py where the two
+# pipelines disagree, so the comparison is about the architecture and not about the
+# optimiser:
+#     loss 'mse'        his nn.MSELoss(), not this repo's default Huber
+#     lr 2e-3           his param_cfg["lr"]
+#     weight_decay 0    his optim.Adam has none, so AdamW must not add any
+#     batch_size 32     his run_point_forecast.py default
+#
+# EPOCHS IS THE ONE DEPARTURE, and it is deliberate. His config says 50; the other six neural
+# models here run to 200 with early stopping and in practice stop between 87 and 106. Training
+# this one for half as long and then reporting the gap as an ARCHITECTURE difference would be
+# measuring the schedule instead of the model. 100 puts it inside the same band, and
+# early_stop_patience is now 50 like every other sequence model rather than pinned to `epochs`
+# where it could never fire. Keeping the BEST-validation checkpoint is also this repo's
+# addition: his trainer computes best_val_loss but leaves the save commented out.
+#
+# NOTE this model gets no static skip: all C channels go into the PatchTokenizer,
+# which is what upstream does. n_seq_features is therefore deliberately absent.
+ARCHFORMER_FEATURE_CONFIG = dict(MOE_TRANSFORMER_FEATURE_CONFIG)   # same 0.16/0.1 split + embargo
+
+ARCHFORMER_PARAMS = {
+    'loss': 'mse',
+    'lookback_hours': 168,          # 7 patches of 24 h; must be divisible by patch_len
+    'patch_len': 24,                # one token = one DAY (the hourly nets use one hour)
+    'seq_length_dec': 168,          # his archformer3.json; the trainer aligns it to the encoder
+    'd_model': 64,
+    'num_heads': 4,
+    'num_encoder_layers': 2,
+    'num_decoder_layers': 2,
+    'intermediate_dim': 32,
+    'dropout': 0.1,
+    'out_dim': 24,
+    # Variance-consistency weight from ArchFormer3Trainer. 0 turns the sigma path's
+    # supervision off, which is the ARCHFormer2 behaviour on identical weights.
+    'lambda_cons': 0.1,
+    'epochs': 100,                  # NOT his 50 -- matched to the other nets' 87-106
+    'batch_size': 32,
+    'learning_rate': 2e-3,
+    'weight_decay': 0.0,
+    'early_stop_patience': 50,      # same as every other sequence model
+}
+
+ARCHFORMER_RESIDUAL_PARAMS = {
+    **ARCHFORMER_PARAMS,
+    'baseline': 'hourly',   # same as _RESIDUAL_BASELINE below
 }
 
 # --- LSTM Feature Generation (shares the same 3D matrix as Transformer) ---
@@ -926,7 +1074,7 @@ FOUNDATION_CONFIG = {
     # Context lengths to sweep, in hours. Each becomes its own run dir (_ctx{L}).
     # 168 matches the point models' lookback; the longer ones are what a foundation model can
     # actually use — one week cannot show it the annual cycle. Capped per adapter.
-    'context_hours': [144],     # six days: the point models' window minus metered's day of lag
+    'context_hours': [168],     # matches the point models' lookback exactly
 
     # Which series the model is handed as context.
     #   'estimated' — preliminary load. Current as of the real cutoff, but a PROXY for the
@@ -1009,6 +1157,23 @@ FOUNDATION_CONFIG = {
     # Where the results land — the SAME tree as the 16 point models, on purpose.
     'result_root': f'{RESULT_ROOT}/evaluation',
 
+    # --- per-target overrides -------------------------------------------------------
+    # PJM_TARGET decides what the y matrix holds, and the context series has to match it or
+    # _bench refuses the run. Everything below the switch is the LOAD configuration, which is
+    # left exactly as it was; a price run replaces only the fields whose load values describe
+    # metered load's publication lag.
+    #
+    #   series        the Real-Time price, realised hour by hour. At the cutoff it reaches the
+    #                 same last hour preliminary load does, so extra_lag is 0 and the target day
+    #                 sits at steps 25-48 -- the 48-step geometry, not metered's 72-step one.
+    #   context_hours 168, the point models' own lookback. Load uses 144 only because metered
+    #                 trails a day; price has no such lag, so there is nothing to give up.
+    #   horizon_steps 'auto'. The fixed 73 exists because metered's horizon spans exactly three
+    #                 days of covariates; price spans two, and 'auto' derives it per day so the
+    #                 fall-back day's 25th hour is covered without hard-coding a number.
+    #   est_to_metered  n/a -- that correction maps Load_Estimated onto metered load and _bench
+    #                 already applies it only when series == 'estimated'.
+
     'adapters': {
         'timesfm': {
             # TimesFM 3.0. The pip package is Apache-2.0 but THIS CHECKPOINT is under the
@@ -1023,3 +1188,19 @@ FOUNDATION_CONFIG = {
         },
     },
 }
+
+_FOUNDATION_BY_TARGET = {
+    # load_met IS TimesFM's geometry, so the foundation config needs no change beyond the
+    # context length -- metered + day_ahead is already what the point models now do.
+    'load_met': {
+        'context_hours': [168],
+    },
+    'rt_price': {
+        'series': 'rt_price',
+        'context_hours': [168],
+        'horizon_steps': 'auto',
+        'modes': ['direct'],
+        'est_to_metered': 'none',
+    },
+}
+FOUNDATION_CONFIG.update(_FOUNDATION_BY_TARGET.get(TARGET, {}))

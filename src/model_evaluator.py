@@ -7,11 +7,12 @@ import pandas as pd
 
 from src.feature_engine import build_or_load_matrix, build_timeseries_matrix, _split_indices
 from src.config import (
-    CLEANED_PATH, MATRIX_DIR, RESULT_ROOT, MATRIX_TAG, TRANSFORMER_FEATURE_CONFIG,
+    CLEANED_PATH, MATRIX_DIR, RESULT_ROOT, MATRIX_TAG, TARGET_TAG, TRANSFORMER_FEATURE_CONFIG,
     TRANSFORMER_PARAMS, LSTM_PARAMS, MOE_TRANSFORMER_PARAMS, MSTNN_PARAMS,
     TRANSFORMER_RESIDUAL_PARAMS, LSTM_RESIDUAL_PARAMS, MOE_TRANSFORMER_RESIDUAL_PARAMS,
     MSTNN_RESIDUAL_PARAMS, MOE_MSTNN_PARAMS, MOE_MSTNN_RESIDUAL_PARAMS,
     MOE_LSTM_PARAMS, MOE_LSTM_RESIDUAL_PARAMS,
+    ARCHFORMER_PARAMS, ARCHFORMER_RESIDUAL_PARAMS,
 )
 from src.models import transformer as transformer_mod
 from src.models import lstm as lstm_mod
@@ -29,6 +30,8 @@ from src.models import moe_mstnn as moe_mstnn_mod
 from src.models import moe_mstnn_residual as moe_mstnn_res_mod
 from src.models import moe_lstm as moe_lstm_mod
 from src.models import moe_lstm_residual as moe_lstm_res_mod
+from src.models import archformer as archformer_mod
+from src.models import archformer_residual as archformer_res_mod
 from src.models._eval_utils import plot_single_day
 
 # Residual models are drop-ins: same matrices, same predict()/evaluate() signatures. They
@@ -37,7 +40,8 @@ TREE_MODELS = ['xgboost', 'lightgbm', 'xgboost_residual', 'lightgbm_residual']
 SEQ_MODELS  = ['transformer', 'lstm', 'moe_transformer', 'mstnn',
                'transformer_residual', 'lstm_residual', 'moe_transformer_residual',
                'mstnn_residual', 'moe_mstnn', 'moe_mstnn_residual',
-               'moe_lstm', 'moe_lstm_residual']
+               'moe_lstm', 'moe_lstm_residual',
+               'archformer', 'archformer_residual']
 
 TREE_MOD = {'xgboost': xgboost_mod, 'lightgbm': lightgbm_mod,
             'xgboost_residual': xgb_res_mod, 'lightgbm_residual': lgbm_res_mod}
@@ -46,7 +50,8 @@ SEQ_MOD  = {'transformer': transformer_mod, 'lstm': lstm_mod,
             'transformer_residual': tr_res_mod, 'lstm_residual': lstm_res_mod,
             'moe_transformer_residual': moe_res_mod, 'mstnn_residual': mstnn_res_mod,
             'moe_mstnn': moe_mstnn_mod, 'moe_mstnn_residual': moe_mstnn_res_mod,
-            'moe_lstm': moe_lstm_mod, 'moe_lstm_residual': moe_lstm_res_mod}
+            'moe_lstm': moe_lstm_mod, 'moe_lstm_residual': moe_lstm_res_mod,
+            'archformer': archformer_mod, 'archformer_residual': archformer_res_mod}
 
 # One params registry, keyed exactly like SEQ_MOD — imported by both the evaluator's own
 # call sites AND model_predictor, so a model can never be in one map and missing from the
@@ -58,7 +63,9 @@ SEQ_PARAMS = {'transformer': TRANSFORMER_PARAMS, 'lstm': LSTM_PARAMS,
               'moe_transformer_residual': MOE_TRANSFORMER_RESIDUAL_PARAMS,
               'mstnn_residual': MSTNN_RESIDUAL_PARAMS,
               'moe_mstnn': MOE_MSTNN_PARAMS, 'moe_mstnn_residual': MOE_MSTNN_RESIDUAL_PARAMS,
-              'moe_lstm': MOE_LSTM_PARAMS, 'moe_lstm_residual': MOE_LSTM_RESIDUAL_PARAMS}
+              'moe_lstm': MOE_LSTM_PARAMS, 'moe_lstm_residual': MOE_LSTM_RESIDUAL_PARAMS,
+              'archformer': ARCHFORMER_PARAMS,
+              'archformer_residual': ARCHFORMER_RESIDUAL_PARAMS}
 assert set(SEQ_PARAMS) == set(SEQ_MOD), "SEQ_PARAMS and SEQ_MOD must cover the same models"
 
 
@@ -100,7 +107,7 @@ class ModelEvaluator:
             # block). Matching MATRIX_TAG keeps it true by construction.
             lb = TRANSFORMER_FEATURE_CONFIG['lookback_hours']
             hh = TRANSFORMER_FEATURE_CONFIG['latest_info_hour']
-            y_scaler_path = os.path.join(MATRIX_DIR, f'y_scaler_lb{lb}_h{hh}{MATRIX_TAG}.pkl')
+            y_scaler_path = os.path.join(MATRIX_DIR, f'y_scaler_lb{lb}_h{hh}{MATRIX_TAG}{TARGET_TAG}.pkl')
             if not os.path.exists(y_scaler_path):
                 raise FileNotFoundError(f"No y_scaler at {y_scaler_path} — train first.")
             self.y_scaler = joblib.load(y_scaler_path)

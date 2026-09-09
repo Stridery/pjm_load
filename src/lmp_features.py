@@ -115,49 +115,11 @@ N_LMP_FEATURES = len(LMP_FEATURE_NAMES)
 assert N_LMP_FEATURES == 10, N_LMP_FEATURES
 
 
-# --- The drift-normalised block (PJM_LMP=2) --------------------------------------------
-# Why a second block instead of fixing the first
-# ----------------------------------------------
-# The first block's departures were built on the lesson congestion_features measured: write a
-# quantity as a departure from its own trailing mean, not as a level. That removes LEVEL drift.
-# It does not remove SLOPE drift, and slope is what actually moves here. Measured on dom, mean
-# RT price per unit of mean load:
-#
-#     2021  3.47    2022  6.87    2023  2.71    2024  2.57    2025  3.97    2026  5.76
-#
-# A 2.7x swing between the extremes and a 2.2x rise from 2024 into the test period. So the same
-# relative price deviation meant a different amount of load in 2024 than it does in 2026, and a
-# model that learned the 2023-24 conversion under-reads load in 2026 — which is exactly the
-# monotonically worsening under-prediction the arms show (ME -138.9 -> -166.0 -> -180.7 as more
-# price features are added, and the gap growing from +0.048pp over the first half of the test
-# period to +0.109pp over the second).
-#
-# Two ways to be immune to that, and this block uses both:
-#
-#   z-scored  a departure divided by the SAME window's own standard deviation. Price volatility
-#             scales with the price level (it is multiplicative), so dividing by it cancels the
-#             elasticity rather than just the offset.
-#   shape     ratios taken INSIDE one day — peak vs mean, max vs min, congestion's share of the
-#             total. A uniform re-pricing of the whole day cancels exactly, by construction.
-LMP_NORM_FEATURE_NAMES = [
-    # --- scale-free deviations ---
-    'lmp_d0_e_z',           # system energy: departure / its own W_PRIMARY volatility
-    'lmp_d0_e_z_l',         # ... against the W_LONG window
-    'lmp_d0_e_peak_z',      # peak hours, same normalisation
-    'lmp_d0_t_max_z',       # the day's worst hour, same
-    # --- intraday shape: immune to any level OR slope drift by construction ---
-    'lmp_d0_peak_shape',    # log(peak / day mean)   — how peaky the day was priced
-    'lmp_d0_range_shape',   # log(max / min)         — how wide the day's price swing was
-    'lmp_d0_s_share',       # (total - energy) / total — congestion's share, a signed fraction
-]
-N_LMP_NORM_FEATURES = len(LMP_NORM_FEATURE_NAMES)
-assert N_LMP_NORM_FEATURES == 7, N_LMP_NORM_FEATURES
-
-
 def active_feature_names():
-    """Which static block this run uses — the full one (PJM_LMP=1) or the normalised (=2)."""
-    from src.config import LMP_CONFIG
-    return LMP_NORM_FEATURE_NAMES if LMP_CONFIG['normalised'] else LMP_FEATURE_NAMES
+    """The Day-Ahead static block. One block now: PJM_LMP=2's drift-normalised variant was
+    removed once the Real-Time lookback became unconditional, which is what it existed to
+    isolate."""
+    return LMP_FEATURE_NAMES
 
 
 def build_lmp_table(path):
@@ -227,34 +189,10 @@ def build_lmp_table(path):
         'lmp_d0_peak_shape': base['t_peak'] - base['t_mean'],
     })[LMP_FEATURE_NAMES]
 
-    # The drift-normalised block. rstd is the same trailing window's standard deviation, with a
-    # floor so a stretch of identical prices divides by something rather than exploding; two
-    # observations are enough for a std, hence min_periods=2.
-    rstd = lambda col, w: base[col].rolling(w, min_periods=2).std().fillna(0.0).clip(lower=1e-3)
-    zdev = lambda col, w: (base[col] - roll(col, w)) / rstd(col, w)
-    tn = pd.DataFrame({
-        'lmp_d0_e_z':        zdev('e_mean', W_PRIMARY),
-        'lmp_d0_e_z_l':      zdev('e_mean', W_LONG),
-        'lmp_d0_e_peak_z':   zdev('e_peak', W_PRIMARY),
-        'lmp_d0_t_max_z':    zdev('t_max',  W_PRIMARY),
-        'lmp_d0_peak_shape': base['t_peak'] - base['t_mean'],
-        'lmp_d0_range_shape': base['t_max'] - base['t_min'],
-        # Signed fraction on raw dollars: how much of the price is NOT system energy. Guarded
-        # against a near-zero denominator, which a genuinely free hour would produce.
-        'lmp_d0_s_share':    ((base['raw_t'] - base['raw_e'])
-                              / base['raw_t'].abs().clip(lower=1.0)).clip(-5, 5),
-    })[LMP_NORM_FEATURE_NAMES]
-    # peak_shape is in BOTH blocks by design (it was already scale-free), so join only
-    # what is new rather than suffixing a duplicate of the identical column.
-    t = t.join(tn[[c for c in tn.columns if c not in t.columns]])
-
     # A complete EPT day is 24 hours, 23 on spring-forward and 25 on fall-back.
     hours = f.groupby(level=0).size()
     t['_usable'] = t.index.map(lambda d: 23 <= hours.get(d, 0) <= 25) & t.notna().all(axis=1)
-    # dict.fromkeys, not a set: peak_shape appears in both blocks and the column order has to
-    # stay the one the feature names promise.
-    _all = list(dict.fromkeys(LMP_FEATURE_NAMES + LMP_NORM_FEATURE_NAMES))
-    t[_all] = t[_all].replace([np.inf, -np.inf], 0.0)
+    t[LMP_FEATURE_NAMES] = t[LMP_FEATURE_NAMES].replace([np.inf, -np.inf], 0.0)
     t.index = t.index.date
     return t
 
