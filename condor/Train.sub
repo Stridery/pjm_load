@@ -1,0 +1,44 @@
+# STAGE 2 — one job per (target, zone, arm, model). 360 jobs, CPU only.
+#
+# The slot size comes from the itemdata, not from this file: trees asked for 8 cores / 32G to
+# parse a 4265-column CSV and fit 24 hourly boosters, nets for 4 / 16G to train one small
+# model off a .npy. Asking for the smaller slot is what gets the 14 nets scheduled while the
+# pool is busy — condor matches per job, so a run is not held back by its fattest request.
+
+universe    = vanilla
+executable  = /home/zyou46/pjm_load/condor/train_one.sh
+initialdir  = /home/zyou46/pjm_load
+
+request_cpus   = $(CPUS)
+request_memory = $(MEM)
+# 1G, not the 20G this used to ask for. Measured DiskUsage is 2 KB: with
+# should_transfer_files = NO the job works directly on the NFS project and leaves the
+# execute node's scratch empty. The oversized request was a pure filter — on its own it
+# cut the matching slots from 235 to 53 and held the run to ~22 concurrent.
+request_disk   = 1G
+# request_gpus = 1     # the eighteen models are small (200 epochs x ~113 steps, batch 32) and
+                       # the PACE sbatch this replaces asked for no GPU either. Turn it on only
+                       # after measuring a net that is actually slow on CPU.
+
+# PJM_TRAIN_ONLY is how a single process is told to train exactly one model — the same
+# variable src/config.py already reads, so there is no condor-only spelling to keep in sync.
+environment = "PJM_TARGET=$(TARGET) PJM_DATASET=$(ZONE) PJM_CONGESTION=$(CONG) PJM_LMP=$(LMP) PJM_TRAIN_ONLY=$(MODEL) OMP_NUM_THREADS=$(CPUS)"
+getenv      = False
+
+should_transfer_files = NO
+
+output = logs/$(TARGET)_$(ZONE)_c$(CONG)_l$(LMP)_$(MODEL).$(Cluster).out
+error  = logs/$(TARGET)_$(ZONE)_c$(CONG)_l$(LMP)_$(MODEL).$(Cluster).err
+log    = logs/train.$(Cluster).log
+
+# A job that is EVICTED (someone with priority takes the slot) goes back to Idle and re-runs
+# from the start on its own — vanilla jobs hold no checkpoint, and that is the real argument
+# for 360 short jobs over 24 long ones: an eviction costs ten minutes, not two hours.
+# max_retries covers the other case, a job that exits non-zero by itself.
+max_retries = 2
+
+# Be a neighbour: keep at most this many of the 360 sitting in the queue at once. Removing the
+# line is not faster — the pool hands out what it has either way.
+max_idle = 60
+
+queue TARGET, ZONE, CONG, LMP, MODEL, CPUS, MEM from condor/jobs_train.txt

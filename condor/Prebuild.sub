@@ -1,0 +1,45 @@
+# STAGE 1 — build one 2D + one 3D matrix per (target, zone, arm). 24 jobs, CPU only.
+#
+# HOW A .sub FILE MAPS ONTO THE SBATCH YOU KNOW
+#   #SBATCH --cpus-per-task=8  ->  request_cpus = 8
+#   #SBATCH --mem=32G          ->  request_memory = 32G
+#   #SBATCH --gres=gpu:1       ->  request_gpus = 1        (not used — see README)
+#   #SBATCH --time=48:00:00    ->  no equivalent; condor does not time jobs out
+#   #SBATCH --account/--qos    ->  no equivalent; the pool's fair-share decides
+#   --export=ALL,PJM_X=y       ->  environment = "PJM_X=y"
+#   cd $SLURM_SUBMIT_DIR       ->  initialdir
+#   the for-loops in the body  ->  the `queue ... from` line at the bottom
+#
+# Everything above `queue` is a template; `queue` is what makes jobs from it. $(NAME) is
+# filled in per line from the itemdata file.
+
+universe    = vanilla
+executable  = /home/zyou46/pjm_load/condor/prebuild.sh
+initialdir  = /home/zyou46/pjm_load
+
+request_cpus   = 8
+# The one request in this directory that is still a guess: prebuild is the memory-heaviest
+# step (it materialises the full 2D frame and the 3D tensor before writing them), and no
+# prebuild job's usage has been read back yet. Check it and tighten:
+#   condor_history -constraint 'ClusterId == <prebuild cluster>' -af RequestMemory MemoryUsage
+request_memory = 16G
+# 1G, not the 20G this used to ask for. Measured DiskUsage is 2 KB: with
+# should_transfer_files = NO the job works directly on the NFS project and leaves the
+# execute node's scratch empty. The oversized request was a pure filter — on its own it
+# cut the matching slots from 235 to 53 and held the run to ~22 concurrent.
+request_disk   = 1G
+
+environment = "PJM_TARGET=$(TARGET) PJM_DATASET=$(ZONE) PJM_CONGESTION=$(CONG) PJM_LMP=$(LMP) OMP_NUM_THREADS=8"
+getenv      = False
+
+# $HOME is NFS from fileserver.isye.gatech.edu and the execute nodes mount it, so the job
+# reads and writes the project in place. Nothing to stage in, nothing to bring back.
+should_transfer_files = NO
+
+output = logs/prebuild.$(TARGET)_$(ZONE)_c$(CONG)_l$(LMP).$(Cluster).out
+error  = logs/prebuild.$(TARGET)_$(ZONE)_c$(CONG)_l$(LMP).$(Cluster).err
+log    = logs/prebuild.$(Cluster).log
+
+max_retries = 2
+
+queue TARGET, ZONE, CONG, LMP from condor/jobs_prebuild.txt

@@ -26,17 +26,22 @@ from src.models import archformer_residual as archformer_res_mod
 TEST_STRATEGIES = ['tail']
 VAL_STRATEGIES  = ['tail']
 
-# Residual models lean on a Load_Estimated baseline, so they are meaningful only for a load
-# target. Rather than let a price run abort halfway through on the guard in
-# src/models/_residual.py, drop them from TRAIN_CONFIG up front and say so once.
-if not cfg.TARGET_SPEC['residual_ok']:
+# Residual models subtract a baseline taken from the target's own lookback channel, and not
+# every (target, arm) has one: rt_price's baseline is the price history that rides in the LMP
+# block, so a PJM_LMP=0 price arm cannot build it. Rather than let such a run abort halfway
+# through on the guard in src/models/_residual.py, drop them up front and say why once.
+_residual_reason = cfg.residual_baseline_reason()
+if _residual_reason:
     _skipped = [m for m, on in cfg.TRAIN_CONFIG.items() if on and m.endswith('_residual')]
     if _skipped:
-        print(f"PJM_TARGET={cfg.TARGET!r}: skipping {len(_skipped)} residual model(s) — "
-              f"their baseline is Load_Estimated in MW, the target is "
-              f"{cfg.TARGET_COL} in {cfg.TARGET_UNIT}. ({', '.join(_skipped)})")
+        print(f"Skipping {len(_skipped)} residual model(s): {_residual_reason}")
+        print(f"  ({', '.join(_skipped)})")
     cfg.TRAIN_CONFIG = {m: (0 if m.endswith('_residual') else on)
                         for m, on in cfg.TRAIN_CONFIG.items()}
+else:
+    print(f"Residual baseline: per-clock-hour mean of {cfg.BASELINE_COL} over the lookback "
+          f"window, in {cfg.TARGET_UNIT}"
+          + (f" (decoding {cfg.BASELINE_TRANSFORM})" if cfg.BASELINE_TRANSFORM != 'none' else ""))
 
 
 def _model_path(model_type, feature_cfg, filename):
