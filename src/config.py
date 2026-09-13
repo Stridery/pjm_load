@@ -65,7 +65,7 @@ from src.lmp_features import LMP_SEQ_COLS       # per-hour price feats (go into 
 #                  own units. The baseline is always the same shape -- the mean of the
 #                  lookback window's days at each clock-hour -- but the channel it is taken
 #                  from is per target:
-#                      load / load_met   Load_Estimated / Load   (MW)
+#                      load              Load_Estimated          (MW)
 #                      rt_price          RT_Total_slog           ($/MWh, signed-log encoded)
 #                  Reading Load_Estimated for a price target is the failure this field exists
 #                  to prevent: the subtraction cancels arithmetically at inference so nothing
@@ -118,41 +118,6 @@ TARGET_SPECS = {
         # RT price is realised within the operating day, so there is no unlabelled tail to
         # preserve. A hole is a fetch gap, and a NaN target would reach the metrics.
         'drop_incomplete_target': True,
-    },
-    'load_met': {
-        # Metered load forecast from METERED history, on TimesFM's information geometry.
-        #
-        # Why it is a separate class and not an arm of 'load': the 16 point models read
-        # PRELIMINARY load, which is current as of the cutoff, while the TimesFM runs read
-        # METERED load, which PJM publishes about a day later. Comparing the two has always
-        # meant comparing models that saw the record at different moments. This class removes
-        # that difference by giving the point models the foundation model's constraint:
-        #
-        #     issue time            (T-1) 00:00      UNCHANGED -- same as every other class
-        #     metered load through  (T-3) 23:00      one day staler than preliminary
-        #     lookback window       (T-9) 00:00 .. (T-3) 23:00      168 h, shifted back a day
-        #     target                day T, 24 hours
-        #
-        # Only the WINDOW moves. The issue time does not, so everything keyed off the target
-        # day rather than the cutoff is untouched and cannot leak:
-        #   * the 31 fc_* features still come from the forecast issued on T-2, which exists
-        #     hours before a (T-1) 00:00 issue time (its latest run is ~18:00 EPT on T-2);
-        #   * congestion and the Day-Ahead price statics still describe day T-1, whose market
-        #     cleared ~13:30 on T-2.
-        # What the shift does cost is one day of observed weather in the window, and the macro
-        # and thermal-static blocks with it -- those are computed at the cutoff. That is the
-        # same cost TimesFM pays: its past_only covariates end where its context does.
-        #
-        # Load_Estimated is dropped entirely, here and from the foundation covariates, so the
-        # class has exactly one load series and it is the one being forecast.
-        'column': 'Load', 'unit': 'MW', 'tag': '_met',
-        'series_col': 'Load', 'lag_days': 1,
-        'mask_outliers': True, 'residual_ok': True,
-        # Metered load IS the lookback channel for this class, so the baseline is taken from
-        # the series being forecast rather than from a proxy.
-        'baseline_col': 'Load', 'baseline_transform': 'none',
-        'peak_label': 'load', 'report_wmape': False,
-        'drop_incomplete_target': False,
     },
 }
 if _TARGET not in TARGET_SPECS:
@@ -1254,11 +1219,6 @@ FOUNDATION_CONFIG = {
 }
 
 _FOUNDATION_BY_TARGET = {
-    # load_met IS TimesFM's geometry, so the foundation config needs no change beyond the
-    # context length -- metered + day_ahead is already what the point models now do.
-    'load_met': {
-        'context_hours': [168],
-    },
     'rt_price': {
         'series': 'rt_price',
         'context_hours': [168],

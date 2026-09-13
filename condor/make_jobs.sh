@@ -6,14 +6,14 @@
 # SAME VARIABLE NAMES AS THE SBATCH, same "one value for python, a list here" rule, so a PACE
 # submission and a Condor submission differ only in which scheduler reads the list:
 #
-#   PJM_TARGET      default "load load_met rt_price"
+#   PJM_TARGET      default "load rt_price"
 #   PJM_DATASET     default "dom bge"
 #   PJM_CONGESTION  default "1 0"
 #   PJM_LMP         default "1 0"
 #   PJM_TRAIN_ONLY  comma-separated model names, or `residual`   default: all eighteen
 #
 #   ./condor/make_jobs.sh                                   # everything
-#   PJM_TARGET=load_met ./condor/make_jobs.sh               # one class
+#   PJM_TARGET=rt_price ./condor/make_jobs.sh               # one class
 #   PJM_TRAIN_ONLY=archformer,archformer_residual ./condor/make_jobs.sh
 #
 # WHY ONE JOB PER MODEL RATHER THAN ONE PER COMBINATION
@@ -27,7 +27,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-_targets="${PJM_TARGET:-load load_met rt_price}"
+_targets="${PJM_TARGET:-load rt_price}"
 _zones="${PJM_DATASET:-dom bge}"
 _congs="${PJM_CONGESTION:-1 0}"
 _lmps="${PJM_LMP:-1 0}"
@@ -100,27 +100,13 @@ for TARGET in $_targets; do
         # Zero-shot TimesFM on the same arm. Nothing is trained, so it is a sibling of the
         # training jobs rather than something they wait for.
         #
-        # TWO TARGET CLASSES, NOT THREE. src/foundation/_bench.py pairs each context
-        # series with the one PJM_TARGET it may be scored against:
-        #
-        #     SERIES_TARGET = {'estimated': 'load', 'metered': 'load', 'rt_price': 'rt_price'}
-        #
-        # There is no entry for load_met, so run_one() refuses every load_met run with
-        # "series='metered' forecasts Load, but PJM_TARGET='load_met' scores Load" — the
-        # guard against scoring a forecast of one series against another series' y matrix.
-        # Generating those 16 jobs anyway is how the first full run lost its TimesFM
-        # stage: they failed, DAGMan failed the node, and 36 queued jobs were removed.
-        #
-        # NOTE this contradicts src/config._FOUNDATION_BY_TARGET, which carries a
-        # 'load_met' entry and a comment saying load_met IS TimesFM's geometry. One of
-        # the two is stale. Skipping here is the conservative reading: it changes no
-        # benchmark semantics, where adding load_met to SERIES_TARGET would.
-        if [ "$TARGET" != load_met ]; then
-            if [ "$TARGET" = rt_price ]; then _fmodes="direct"; else _fmodes="direct residual"; fi
-            for FMODE in $_fmodes; do
-                echo "$TARGET, $ZONE, $CONG, $LMP, $FMODE" >> condor/jobs_foundation.txt
-            done
-        fi
+        # rt_price is scored against series='rt_price' and load against
+        # series='metered'; src/foundation/_bench.SERIES_TARGET pairs them and refuses
+        # any other combination, so nothing here needs a per-target case.
+        if [ "$TARGET" = rt_price ]; then _fmodes="direct"; else _fmodes="direct residual"; fi
+        for FMODE in $_fmodes; do
+            echo "$TARGET, $ZONE, $CONG, $LMP, $FMODE" >> condor/jobs_foundation.txt
+        done
       done
     done
   done

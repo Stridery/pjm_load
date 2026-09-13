@@ -2,8 +2,13 @@
 # Trains nothing; it only needs the matrices, so it runs alongside Train.sub rather than after.
 
 universe    = vanilla
-executable  = /home/zyou46/pjm_load/condor/foundation_one.sh
-initialdir  = /home/zyou46/pjm_load
+# PORTABLE ON PURPOSE. `initialdir` is the job's working directory on the execute
+# node, and hard-coding one user's path means anyone else's clone submits jobs that
+# chdir into THAT user's tree and write models/ and results/ there. Omitting it makes
+# condor_submit resolve it to wherever it was run from, and a relative executable is
+# resolved against the same place and stored as an absolute path in the job ad.
+# So: always run condor_submit from the project root.
+executable  = condor/foundation_one.sh
 
 request_cpus   = 4
 request_memory = 8G
@@ -16,7 +21,7 @@ request_disk   = 1G
 # HF_HOME on the shared filesystem: the checkpoint is fetched ONCE on the submit host and all
 # forty jobs read that copy. $HOME would work too, but a ~1 GB blob does not belong in a
 # backed-up home quota.
-environment = "PJM_TARGET=$(TARGET) PJM_DATASET=$(ZONE) PJM_CONGESTION=$(CONG) PJM_LMP=$(LMP) PJM_FMODE=$(FMODE) HF_HOME=/home/zyou46/hf_cache OMP_NUM_THREADS=4"
+environment = "PJM_TARGET=$(TARGET) PJM_DATASET=$(ZONE) PJM_CONGESTION=$(CONG) PJM_LMP=$(LMP) PJM_FMODE=$(FMODE) HF_HOME=$ENV(HOME)/hf_cache OMP_NUM_THREADS=4"
 getenv      = False
 
 should_transfer_files = NO

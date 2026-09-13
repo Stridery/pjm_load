@@ -64,10 +64,9 @@ FUTURE_WEATHER = 'Temp_F'
 # past_only: observations that stop at the context end. The price channels are switched by
 # PJM_LMP, exactly like the point models' price block, so the run tag already distinguishes
 # the two arms and an A/B is two runs.
-# The load channel follows PJM_TARGET. For load and rt_price that is preliminary load; for
-# load_met it is metered load, which is also the CONTEXT series and is therefore removed again
-# by the `exclude` argument -- leaving that class with exactly one load series, the one being
-# forecast, exactly as the point models now see it.
+# The load channel follows PJM_TARGET: for both load and rt_price that is preliminary load.
+# A target whose context series IS its load channel would have it removed again by the
+# `exclude` argument, leaving one load series rather than two copies of it.
 def _past_only_load():
     from src.config import SERIES_COL
     return [SERIES_COL]

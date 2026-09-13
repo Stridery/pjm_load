@@ -49,7 +49,6 @@ has to be, because the one thing it must be is in the target's own units:
 | target | `baseline_col` | units | decode first |
 |---|---|---|---|
 | `load` | `Load_Estimated` | MW | — |
-| `load_met` | `Load` | MW | — |
 | `rt_price` | `RT_Total_slog` | $/MWh | `signed_log` |
 
 `src/config.TARGET_SPECS` holds the pair (`baseline_col`, `baseline_transform`);

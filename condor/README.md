@@ -64,7 +64,7 @@ model and blocks on them, for when one job's output is easier to read than 24.
 ## The same thing by hand
 
     ssh compute01                              # or isye-hps0401; castle has no condor binaries
-    cd /home/zyou46/pjm_load
+    cd <your clone>            # e.g. ~/pjm_load
 
     # 0. ONCE: environment. castle's default python3 is 3.8; use 3.11.
     python3.11 -m venv .venv
@@ -100,7 +100,7 @@ model and blocks on them, for when one job's output is easier to read than 24.
 
     # 4. Scoreboard, after the DAG reports done. Reads the metrics files off disk, so a
     #    partial run still scores whatever finished.
-    for t in load load_met rt_price; do for z in dom bge; do
+    for t in load rt_price; do for z in dom bge; do
       PJM_TARGET=$t PJM_DATASET=$z .venv/bin/python run_foundation.py --scoreboard
     done; done
 
@@ -111,13 +111,13 @@ an execute node probably cannot reach. Fetch it once on the submit host, or drop
 `condor/jobs_foundation.txt` to zero lines and skip the stage:
 
     .venv/bin/pip install 'timesfm[torch]'
-    HF_HOME=/home/zyou46/hf_cache .venv/bin/python run_foundation.py --model timesfm --mode direct
+    HF_HOME=$HOME/hf_cache .venv/bin/python run_foundation.py --model timesfm --mode direct
 
 ## Narrowing a run
 
 `make_jobs.sh` reads the same variables as the sbatch, one value or a space-separated list:
 
-    PJM_TARGET=load_met ./condor/make_jobs.sh                    # one class
+    PJM_TARGET=rt_price ./condor/make_jobs.sh                    # one class
     PJM_DATASET=dom PJM_CONGESTION=1 ./condor/make_jobs.sh       # one zone, one arm
     PJM_TRAIN_ONLY=archformer,archformer_residual ./condor/make_jobs.sh
 
@@ -179,7 +179,6 @@ After the DAG finishes:
 Each target class gets its OWN results root, so `results/dom` holds `load` only:
 
     results/{zone}            load        18 models x 4 arms
-    results/{zone}_met        load_met    18 models x 4 arms
     results/{zone}_rtprice    rt_price    18 models on the two _lmp arms, 9 on the others
 
 rt_price's nine residual models need the price history their baseline averages, and that
@@ -192,14 +191,3 @@ variable silently reports `load`:
     PJM_TARGET=rt_price PJM_DATASET=bge .venv/bin/python run_foundation.py --scoreboard
     ./condor/run_all.sh scoreboard        # all three classes, both zones
 
-## TimesFM covers two target classes, not three
-
-`src/foundation/_bench.py` maps each context series to the single `PJM_TARGET` it may be
-scored against — `{'estimated': 'load', 'metered': 'load', 'rt_price': 'rt_price'}` — and has
-no entry for `load_met`, so every `load_met` benchmark is refused by that guard.
-`make_jobs.sh` therefore generates 24 foundation jobs (16 `load` + 8 `rt_price`), not 40.
-
-This contradicts `src/config._FOUNDATION_BY_TARGET`, which has a `load_met` entry and a
-comment saying load_met is TimesFM's own geometry. One of the two is stale. Skipping is the
-conservative reading; adding `load_met` to `SERIES_TARGET` would change what the benchmark
-measures and is a decision for whoever owns that comparison.

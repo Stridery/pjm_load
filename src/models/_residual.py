@@ -19,7 +19,6 @@ WHICH CHANNEL THE BASELINE COMES FROM IS PER TARGET (config.BASELINE_COL), becau
 thing it must be is in the target's own units:
 
     load       Load_Estimated   MW      preliminary load, the proxy published in real time
-    load_met   Load             MW      metered load, the series being forecast
     rt_price   RT_Total_slog    $/MWh   the price's own history, signed-log encoded
 
 For rt_price the encoding is undone BEFORE the mean is taken (config.BASELINE_TRANSFORM),

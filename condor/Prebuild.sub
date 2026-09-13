@@ -14,8 +14,13 @@
 # filled in per line from the itemdata file.
 
 universe    = vanilla
-executable  = /home/zyou46/pjm_load/condor/prebuild.sh
-initialdir  = /home/zyou46/pjm_load
+# PORTABLE ON PURPOSE. `initialdir` is the job's working directory on the execute
+# node, and hard-coding one user's path means anyone else's clone submits jobs that
+# chdir into THAT user's tree and write models/ and results/ there. Omitting it makes
+# condor_submit resolve it to wherever it was run from, and a relative executable is
+# resolved against the same place and stored as an absolute path in the job ad.
+# So: always run condor_submit from the project root.
+executable  = condor/prebuild.sh
 
 request_cpus   = 8
 # The one request in this directory that is still a guess: prebuild is the memory-heaviest

@@ -23,7 +23,7 @@
 # The run can be narrowed with the SAME variables the sbatch used — they are passed straight
 # through to condor/make_jobs.sh, which turns each into a list of jobs:
 #
-#     PJM_TARGET=load_met ./condor/run_all.sh submit
+#     PJM_TARGET=rt_price ./condor/run_all.sh submit
 #     PJM_DATASET=dom PJM_TRAIN_ONLY=archformer ./condor/run_all.sh submit
 #
 # The whole thing is long (the crawl alone downloads ~230 MB of LMP shards), so for the full
@@ -212,8 +212,8 @@ step_submit() {
     cp condor/train.dag "$dag"
     local ok=0
     if .venv/bin/python -c 'import timesfm3' 2>/dev/null; then
-        _say "submit: warming the TimesFM checkpoint into /home/zyou46/hf_cache"
-        HF_HOME=/home/zyou46/hf_cache .venv/bin/python -c "
+        _say "submit: warming the TimesFM checkpoint into $HOME/hf_cache"
+        HF_HOME="$HOME/hf_cache" .venv/bin/python -c "
 import src.config as cfg
 from timesfm3 import TimesFM3Forecaster
 ckpt = cfg.FOUNDATION_CONFIG['adapters']['timesfm']['checkpoint']
@@ -264,7 +264,7 @@ step_failures() {
 step_scoreboard() {
     # Reads the metrics files off disk rather than anything held in memory, so a partial run
     # still scores whatever finished.
-    for t in ${PJM_TARGET:-load load_met rt_price}; do
+    for t in ${PJM_TARGET:-load rt_price}; do
         for z in ${PJM_DATASET:-dom bge}; do
             _say "scoreboard: $t / $z"
             PJM_TARGET=$t PJM_DATASET=$z .venv/bin/python run_foundation.py --scoreboard \
