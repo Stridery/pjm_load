@@ -10,7 +10,7 @@ Deliberately isolated from src/models/, for the same reason src/quantile and src
 that package's registry (TREE_MODELS / SEQ_MODELS) is what src/serving/predict.available_models()
 scans, and anything registered there is loaded by the daily CI forecast job. A model that needs
 an optional package and a ~1 GB checkpoint the CI runner does not have would break the daily
-forecast the moment it was registered. Keeping it out means Model_Training.py, model_evaluator,
+forecast the moment it was registered. Keeping it out means scripts/Model_Training.py, model_evaluator,
 serving, generate_web and Train_Model.sbatch are all untouched.
 
 The RESULTS are not isolated. They are written into results/{zone}/evaluation/ next to the 16

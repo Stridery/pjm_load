@@ -1,21 +1,19 @@
-"""Probabilistic forecast evaluation: Xie & Hong (2018) eq. (1) and eq. (2).
+"""Probabilistic forecast evaluation, shared by every baseline in this repo.
 
-Scenario point forecasts -> percentiles -> pinball loss -> quantile score. A LOWER quantile
-score is better.
+One scorer for all of them: src.density and src.qrnn import from here
+rather than each computing its own pinball loss, because a table in which two rows were
+scored by two implementations is not a comparison. Lower is better for every metric defined
+below.
 
-Why eq. (1) is transcribed instead of calling np.percentile
------------------------------------------------------------
-The paper uses the empirical distribution function WITH AVERAGING, and says explicitly that
-it chose it because it still produces percentiles when j is small. That is our regime: with
-four scenario years and no shifting, j = 4. numpy's default linear interpolation between
-order statistics gives different numbers there, and the resulting quantile scores would not
-be comparable with the published ones. At large j the two converge, so nothing is lost by
-always using the paper's rule.
-
-    N non-missing forecasts, sorted ascending as x_1..x_N;  p = q/100;  i = floor(Np);
-    g = Np - i:
-        g == 0  ->  y_q = 1/2 (x_i + x_{i+1})
-        g >  0  ->  y_q = x_{i+1}
+    pinball / quantile score   the metric of GEFCom2014; the mean over quantile levels and
+                               hours of the asymmetrically weighted absolute error
+    winkler                    interval score; charges for width at every hour and adds a
+                               1/alpha-scaled penalty only on a miss, which is what pinball
+                               alone cannot separate
+    crps_from_quantiles        distribution-level score, read off a quantile function so
+                               that density and quantile forecasts land on one scale
+    coverage_report            nominal vs empirical coverage — a calibration diagnostic,
+                               not a proper scoring rule
 """
 
 import numpy as np
@@ -23,31 +21,11 @@ import numpy as np
 QUANTILES = np.arange(1, 100)          # the 1st..99th percentiles, as in the paper
 
 
-def empirical_percentiles(preds):
-    """(J, N) scenario point forecasts -> (99, N) percentile forecasts.  Paper eq. (1).
-
-    Indices below are converted from the paper's 1-based x_i to 0-based numpy: x_i is
-    s[i-1] and x_{i+1} is s[i]. Both are clamped, which only ever binds for degenerate J.
-    """
-    preds = np.asarray(preds, dtype=float)
-    if preds.ndim != 2:
-        raise ValueError(f"preds must be (J, N), got shape {preds.shape}")
-    s = np.sort(preds, axis=0)
-    J = s.shape[0]
-
-    out = np.empty((len(QUANTILES), s.shape[1]))
-    for qi, q in enumerate(QUANTILES):
-        Np = J * (q / 100.0)
-        i = int(np.floor(Np))
-        if np.isclose(Np - i, 0.0):
-            out[qi] = 0.5 * (s[min(max(i - 1, 0), J - 1)] + s[min(i, J - 1)])
-        else:
-            out[qi] = s[min(i, J - 1)]
-    return out
-
-
 def pinball(y_true, y_quantiles):
-    """(99, N) pinball loss per quantile per hour.  Paper eq. (2).
+    """(99, N) pinball loss per quantile per hour.
+
+    Xie & Hong (2018) eq. (2); identical to the max-of-two-branches form in
+    src.qrnn.model.pinball_loss, which is the objective the neural baseline trains on.
 
         y_t <  y_q :  (1 - p) (y_q - y_t)        over-forecast at that quantile
         y_t >= y_q :       p  (y_t - y_q)
@@ -56,11 +34,6 @@ def pinball(y_true, y_quantiles):
     p = (QUANTILES / 100.0).reshape(-1, 1)
     d = np.asarray(y_quantiles, dtype=float) - y_true.reshape(1, -1)
     return np.where(d > 0, (1.0 - p) * d, p * (-d))
-
-
-def quantile_score(y_true, preds):
-    """Mean pinball loss over all 99 quantiles and all forecast hours. Lower is better."""
-    return float(pinball(y_true, empirical_percentiles(preds)).mean())
 
 
 def winkler(y_true, y_quantiles, coverage):
@@ -73,8 +46,8 @@ def winkler(y_true, y_quantiles, coverage):
     Pinball alone cannot separate "covers everything because it is enormously wide" from
     "covers everything and is tight". Winkler charges for width on every hour and adds a
     1/alpha-scaled penalty only when the interval misses, so the two attributes are scored
-    together. Lower is better. This is where the QRA paper's method separates itself most
-    clearly from its benchmarks, which is why it is reported alongside the pinball loss.
+    together. Lower is better, and it is reported alongside the pinball loss because the two
+    disagree exactly when width and coverage trade off against each other.
     """
     y_true = np.asarray(y_true, dtype=float)
     lo_q, hi_q = (100 - coverage) // 2, 100 - (100 - coverage) // 2
@@ -92,7 +65,7 @@ def coverage_report(y_true, y_quantiles, levels=(50, 80, 90, 95, 98)):
 
     Not from either paper: both score with pinball/Winkler only. Kept because a probabilistic
     baseline that is never checked for coverage is the one thing a reader will ask about
-    first (see the scenario baseline, whose nominal 98% covers 77%).
+    first.
     """
     y_true = np.asarray(y_true, dtype=float)
     q = np.asarray(y_quantiles)
@@ -110,10 +83,10 @@ def coverage_report(y_true, y_quantiles, levels=(50, 80, 90, 95, 98)):
 def crps_from_quantiles(levels, values, y_true):
     """(N,) CRPS per hour from a quantile function.  CRPS = 2 * integral_0^1 pinball dtau.
 
-    Added for baseline 3 (Li et al. 2020), whose headline metric is the CRPS — but written
-    against a quantile function rather than a Gaussian mixture so that the scenario and QRA
-    baselines can be scored on it too. That is the whole point: it is the first metric all
-    three papers share.
+    Added for baseline 2 (Li et al. 2020), whose headline metric is the CRPS — but written
+    against a quantile function rather than a Gaussian mixture so that the quantile-emitting
+    baselines can be scored on it too. That is the whole point: it is the one metric every
+    baseline here shares.
 
     `levels` are probabilities in (0, 1); the integral is a trapezoid over whatever grid is
     supplied, so a denser grid is a more accurate CRPS.

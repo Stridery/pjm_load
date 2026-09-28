@@ -3,11 +3,17 @@ Run the data crawler pipeline.
 
 Usage
 -----
-    python run_crawler.py                        # uses config.py defaults (zone=dom, 2021-2026)
-    python run_crawler.py --zone dom2            # specify zone folder
-    python run_crawler.py --zone dom2 --start 2022 --end 2023
-    python run_crawler.py --zone dom2 --location Richmond --no-skip
+    python scripts/run_crawler.py                        # uses config.py defaults (zone=dom, 2021-2026)
+    python scripts/run_crawler.py --zone dom2            # specify zone folder
+    python scripts/run_crawler.py --zone dom2 --start 2022 --end 2023
+    python scripts/run_crawler.py --zone dom2 --location Richmond --no-skip
 """
+
+# Entry points live in scripts/ but import the package from the repo root, and running
+# `python scripts/foo.py` puts scripts/ on sys.path rather than the root. Prepend the root so
+# `import src...` resolves from any working directory.
+import sys as _sys, pathlib as _pathlib
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 
 import argparse
 import logging

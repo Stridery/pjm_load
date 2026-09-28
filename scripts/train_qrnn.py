@@ -1,15 +1,15 @@
 """
-Probabilistic baseline 4 — Zhang, Quan & Srinivasan (2019), IEEE TSG 10(4):4425-4434.
+Probabilistic baseline 3 — Zhang, Quan & Srinivasan (2019), IEEE TSG 10(4):4425-4434.
 An improved quantile regression neural network: one network, all 99 percentiles.
 
-    PJM_DATASET=dom python train_qrnn.py
-    PJM_DATASET=bge python train_qrnn.py --models iQRNN-500 bQRNN-400 --n-runs 3
-    PJM_DATASET=dom python train_qrnn.py --lag-min 24        # QRA's issue time, for the
+    PJM_DATASET=dom python scripts/train_qrnn.py
+    PJM_DATASET=bge python scripts/train_qrnn.py --models iQRNN-500 bQRNN-400 --n-runs 3
+    PJM_DATASET=dom python scripts/train_qrnn.py --lag-min 24        # a D-1 -> D horizon, for the
                                                              # strict head-to-head
-    PJM_DATASET=dom python train_qrnn.py --size-sweep --noise-sweep
+    PJM_DATASET=dom python scripts/train_qrnn.py --size-sweep --noise-sweep
     PJM_DATASET=dom python -m src.qrnn.plots                 # figures from what the run wrote
 
-Parallel to train_quantile.py / train_qra.py / train_density.py in every structural respect:
+Parallel to scripts/train_density.py in every structural respect:
 reads exactly one input (data/{zone}/cleaned/cleaned_pjm_load_weather.csv), writes to
 results/{zone}/qrnn/, and touches neither the matrix cache, the 16 saved point models, nor
 the serving path. Tuning lives in QRNN_CONFIG in src/config.py.
@@ -20,8 +20,6 @@ Reports:
     bQRNN-*    the paper's own control: same MLP and batch training, none of the four
                additions (noise, dropout, early stopping, LR decay). Without this row the
                reported gain cannot be attributed to the training machinery.
-    QRA        folded in from results/{zone}/qra/ if present — this is the comparison the
-               paper's headline claim is about.
     density    folded in from results/{zone}/density/ if present.
 
 Every configuration is trained `n_runs` times from different seeds and reported as mean and
@@ -35,14 +33,22 @@ The folded-in rows do not all answer the same question and the table says so rat
 letting a reader assume otherwise:
 
     this run    data through (D-1) 23:00 -> day D+1     (--lag-min 48, the default)
-    QRA         data through (D-1) 23:00 -> day D       (a day nearer)
     density     data through (D-1) 23:00 -> day D+1     (same as this run)
 
-All of them, including this one, use REALISED temperature where a forecast would be, which
-is what the paper does ("actual temperatures ... as a proxy for temperature forecasts") and
-what makes the four comparable with each other. None of them is comparable with the 16 point
-models, which read archived real forecasts.
+--lag-min 24 moves this run to a D-1 -> D horizon, which is a different question and not
+comparable with the default rows; the table labels each row's horizon either way.
+
+Both use REALISED temperature where a forecast would be, which is what the paper does
+("actual temperatures ... as a proxy for temperature forecasts") and what makes the two
+comparable with each other. Neither is comparable with the 16 point models, which read
+archived real forecasts.
 """
+
+# Entry points live in scripts/ but import the package from the repo root, and running
+# `python scripts/foo.py` puts scripts/ on sys.path rather than the root. Prepend the root so
+# `import src...` resolves from any working directory.
+import sys as _sys, pathlib as _pathlib
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 
 import argparse
 import json
@@ -56,7 +62,7 @@ from src.qrnn import features as F
 from src.qrnn import model as M
 from src.quantile.qeval import (QUANTILES, coverage_report, crps_from_quantiles, pinball,
                                 point_metrics, winkler)
-from train_quantile import load_frame, split_at_day_boundary
+from src.quantile.frame import load_frame, split_at_day_boundary
 
 LEVELS = QUANTILES / 100.0
 MEDIAN = int(np.where(QUANTILES == 50)[0][0])
@@ -110,7 +116,7 @@ def _fold_in(npz_path, y_test, when_test, horizon, res, curves, only=None):
     a, b = ka.get_indexer(common), kb.get_indexer(common)
 
     # Two layouts are in the wild and both are read rather than one of them being rewritten:
-    # train_quantile / train_density store `labels` alongside cfg0..cfgN, train_qra stores
+    # train_density stores `labels` alongside cfg0..cfgN, older writers store
     # each curve under its own (paren-stripped) name. Touching either writer to unify them
     # would mean re-running those baselines to reuse their results, which is the opposite of
     # the point.
@@ -168,7 +174,7 @@ def main():
                     help='subset of src.qrnn.model.SPECS (default: whatever QRNN_CONFIG enables)')
     ap.add_argument('--n-runs', type=int, default=None)
     ap.add_argument('--lag-min', type=int, default=None,
-                    help='shortest load lag: 48 = this repo\'s cutoff, 24 = QRA\'s issue time')
+                    help='shortest load lag: 48 = this repo\'s cutoff (predict D+1), 24 = predict D')
     ap.add_argument('--device', default=None, choices=['auto', 'cpu', 'cuda'])
     ap.add_argument('--refresh-rfe', action='store_true', help='rebuild the feature selection')
     ap.add_argument('--size-sweep', action='store_true',
@@ -246,10 +252,8 @@ def main():
 
     pd.DataFrame(all_rows).to_csv(os.path.join(out_dir, 'runs.csv'), index=False)
 
-    # -- the other baselines, if they have been run for this zone --------------------
+    # -- the other baseline, if it has been run for this zone ------------------------
     print()
-    _fold_in(os.path.join(cfg.QRA_CONFIG['result_dir'], 'test_quantiles.npz'),
-             y_te, when_te, 'D-1 -> D', res, curves, only={'QRA', 'Vanilla(scenario)'})
     _fold_in(os.path.join(cfg.DENSITY_CONFIG['result_dir'], 'test_quantiles.npz'),
              y_te, when_te, 'D-1 -> D+1', res, curves, only={'CRPS-guided'})
 

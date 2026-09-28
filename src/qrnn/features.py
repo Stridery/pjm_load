@@ -21,13 +21,13 @@ places the pool differs from the paper are both forced:
     temperature only. The paper's weather is one averaged temperature series and nothing
         else; the cleaned CSV carries fourteen weather columns, and adding them would make
         this a different model from the published one. Temp_F alone also keeps the feature
-        set on the same footing as the QRA and scenario baselines.
+        set on the same footing as a D-1 -> D issue time.
 
-One candidate is deliberately absent: a linear TREND. The MLR baselines need one because a
-linear model has no other way to carry DOM's data-centre growth (see QUANTILE_CONFIG), but
-here the load-lag block states the current level outright, and a monotone trend column takes
-values in the test period that never occurred in training — which is the one input shape a
-neural network cannot extrapolate.
+One candidate is deliberately absent: a linear TREND. A linear model needs one because it
+has no other way to carry DOM's data-centre growth, but here the load-lag block states the
+current level outright, and a monotone trend column takes values in the test period that
+never occurred in training — which is the one input shape a neural network cannot
+extrapolate.
 
 
 Why RFE with a random forest on MAE

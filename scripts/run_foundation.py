@@ -1,12 +1,12 @@
 """
 Benchmark zero-shot foundation forecasters against the 16 trained point models.
 
-    PJM_DATASET=dom python run_foundation.py                       # config defaults
-    PJM_DATASET=dom python run_foundation.py --model seasonal_naive --mode direct
-    PJM_DATASET=dom python run_foundation.py --context 512 --mode residual
-    PJM_DATASET=dom python run_foundation.py --no-calibrate
-    PJM_DATASET=dom python run_foundation.py --scoreboard          # re-read results, run nothing
-    python run_foundation.py --list
+    PJM_DATASET=dom python scripts/run_foundation.py                       # config defaults
+    PJM_DATASET=dom python scripts/run_foundation.py --model seasonal_naive --mode direct
+    PJM_DATASET=dom python scripts/run_foundation.py --context 512 --mode residual
+    PJM_DATASET=dom python scripts/run_foundation.py --no-calibrate
+    PJM_DATASET=dom python scripts/run_foundation.py --scoreboard          # re-read results, run nothing
+    python scripts/run_foundation.py --list
 
 A pre-trained univariate model is handed the recent Load_Estimated history and asked for the
 target day. Nothing is trained, so there is no weights file and no train step — the run reads
@@ -23,8 +23,14 @@ under separate model names, so the scoreboard is a single scan of one tree:
     results/{zone}/evaluation/_scoreboard.{csv,png}
 
 Deliberately NOT registered in src/models — see src/foundation/__init__.py. That keeps the daily
-CI forecast job, Model_Training.py and Train_Model.sbatch untouched.
+CI forecast job, scripts/Model_Training.py and Train_Model.sbatch untouched.
 """
+
+# Entry points live in scripts/ but import the package from the repo root, and running
+# `python scripts/foo.py` puts scripts/ on sys.path rather than the root. Prepend the root so
+# `import src...` resolves from any working directory.
+import sys as _sys, pathlib as _pathlib
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 
 import argparse
 import sys

@@ -13,6 +13,8 @@ from src.config import (
     MSTNN_RESIDUAL_PARAMS, MOE_MSTNN_PARAMS, MOE_MSTNN_RESIDUAL_PARAMS,
     MOE_LSTM_PARAMS, MOE_LSTM_RESIDUAL_PARAMS,
     ARCHFORMER_PARAMS, ARCHFORMER_RESIDUAL_PARAMS,
+    ARCHFORMER_HP_PARAMS, ARCHFORMER_HP_RESIDUAL_PARAMS,
+    ARCHFORMER_SKIP_PARAMS, ARCHFORMER_SKIP_RESIDUAL_PARAMS,
 )
 from src.models import transformer as transformer_mod
 from src.models import lstm as lstm_mod
@@ -32,6 +34,10 @@ from src.models import moe_lstm as moe_lstm_mod
 from src.models import moe_lstm_residual as moe_lstm_res_mod
 from src.models import archformer as archformer_mod
 from src.models import archformer_residual as archformer_res_mod
+from src.models import archformer_hp as archformer_hp_mod
+from src.models import archformer_hp_residual as archformer_hp_res_mod
+from src.models import archformer_skip as archformer_skip_mod
+from src.models import archformer_skip_residual as archformer_skip_res_mod
 from src.models._eval_utils import plot_single_day
 
 # Residual models are drop-ins: same matrices, same predict()/evaluate() signatures. They
@@ -41,7 +47,9 @@ SEQ_MODELS  = ['transformer', 'lstm', 'moe_transformer', 'mstnn',
                'transformer_residual', 'lstm_residual', 'moe_transformer_residual',
                'mstnn_residual', 'moe_mstnn', 'moe_mstnn_residual',
                'moe_lstm', 'moe_lstm_residual',
-               'archformer', 'archformer_residual']
+               'archformer', 'archformer_residual',
+               'archformer_hp', 'archformer_hp_residual',
+               'archformer_skip', 'archformer_skip_residual']
 
 TREE_MOD = {'xgboost': xgboost_mod, 'lightgbm': lightgbm_mod,
             'xgboost_residual': xgb_res_mod, 'lightgbm_residual': lgbm_res_mod}
@@ -51,7 +59,10 @@ SEQ_MOD  = {'transformer': transformer_mod, 'lstm': lstm_mod,
             'moe_transformer_residual': moe_res_mod, 'mstnn_residual': mstnn_res_mod,
             'moe_mstnn': moe_mstnn_mod, 'moe_mstnn_residual': moe_mstnn_res_mod,
             'moe_lstm': moe_lstm_mod, 'moe_lstm_residual': moe_lstm_res_mod,
-            'archformer': archformer_mod, 'archformer_residual': archformer_res_mod}
+            'archformer': archformer_mod, 'archformer_residual': archformer_res_mod,
+            'archformer_hp': archformer_hp_mod, 'archformer_hp_residual': archformer_hp_res_mod,
+            'archformer_skip': archformer_skip_mod,
+            'archformer_skip_residual': archformer_skip_res_mod}
 
 # One params registry, keyed exactly like SEQ_MOD — imported by both the evaluator's own
 # call sites AND model_predictor, so a model can never be in one map and missing from the
@@ -65,7 +76,11 @@ SEQ_PARAMS = {'transformer': TRANSFORMER_PARAMS, 'lstm': LSTM_PARAMS,
               'moe_mstnn': MOE_MSTNN_PARAMS, 'moe_mstnn_residual': MOE_MSTNN_RESIDUAL_PARAMS,
               'moe_lstm': MOE_LSTM_PARAMS, 'moe_lstm_residual': MOE_LSTM_RESIDUAL_PARAMS,
               'archformer': ARCHFORMER_PARAMS,
-              'archformer_residual': ARCHFORMER_RESIDUAL_PARAMS}
+              'archformer_residual': ARCHFORMER_RESIDUAL_PARAMS,
+              'archformer_hp': ARCHFORMER_HP_PARAMS,
+              'archformer_hp_residual': ARCHFORMER_HP_RESIDUAL_PARAMS,
+              'archformer_skip': ARCHFORMER_SKIP_PARAMS,
+              'archformer_skip_residual': ARCHFORMER_SKIP_RESIDUAL_PARAMS}
 assert set(SEQ_PARAMS) == set(SEQ_MOD), "SEQ_PARAMS and SEQ_MOD must cover the same models"
 
 

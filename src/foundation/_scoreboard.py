@@ -105,6 +105,73 @@ def plot(df, zone, path):
     plt.close()
 
 
+# The MAPE bar chart answers one question. These three answer the question the point models are
+# actually being compared on, and they disagree: on dom the best mean MAPE and the best peak
+# MAPE are different models, and the flattest BRS is a third. A single-metric ranking hides that.
+_PANELS = [
+    ('MAPE',      'Mean MAPE  (%)',                  False),
+    ('peak_MAPE', 'Peak MAPE  (%)   top-10% hours',  False),
+    ('BRS',       'BRS  (|slope|, 0 = unbiased)',    True),
+]
+
+
+def best_arm_per_model(df):
+    """One row per model -- its best arm by MAPE.
+
+    Four rows of `transformer_residual` differing only by feature arm crowd out the other
+    twenty models, and the question a scoreboard answers is which model to use, not which arm
+    of one model. The arm that survives is named on the label so nothing is hidden.
+    """
+    d = df.dropna(subset=['MAPE'])
+    return d.loc[d.groupby('model')['MAPE'].idxmin()].reset_index(drop=True)
+
+
+def plot_by_metric(df, zone, path, per_model=True):
+    """MAPE, peak MAPE and BRS as small multiples, each panel sorted on its own metric.
+
+    BRS is ranked on |BRS| because it is a bias slope: zero is the target and a large negative
+    slope is as wrong as a large positive one. Its bars are drawn from zero with the sign kept,
+    so the direction stays visible even though the ordering ignores it.
+    """
+    d = best_arm_per_model(df) if per_model else df.dropna(subset=['MAPE'])
+    if d.empty:
+        return
+    n = len(d)
+    fig, axes = plt.subplots(1, 3, figsize=(15.5, 0.34 * n + 2.0))
+    for ax, (key, title, by_abs) in zip(axes, _PANELS):
+        if key not in d.columns or d[key].isna().all():
+            ax.set_visible(False)
+            continue
+        s = d.dropna(subset=[key])
+        order = s[key].abs() if by_abs else s[key]
+        s = s.loc[order.sort_values(ascending=False).index]      # best ends up at the top
+        colors = ['#DD8452' if k == 'foundation' else '#4C72B0' for k in s['kind']]
+        ax.barh(range(len(s)), s[key], color=colors, edgecolor='black', alpha=0.85, height=0.7)
+        ax.set_yticks(range(len(s)))
+        ax.set_yticklabels([f"{m} [{a}]" for m, a in zip(s['model'], s['arm'])], fontsize=7.5)
+        for i, v in enumerate(s[key]):
+            ax.text(v, i, f'  {v:.3f}' if by_abs else f'  {v:.2f}',
+                    va='center', ha='left' if v >= 0 else 'right', fontsize=6.8)
+        ax.set_xlabel(title, fontsize=9)
+        ax.grid(axis='x', linestyle='--', alpha=0.5)
+        if by_abs:
+            ax.axvline(0, color='black', linewidth=0.8)
+            lim = s[key].abs().max() * 1.35
+            ax.set_xlim(-lim, lim)
+        else:
+            ax.set_xlim(0, s[key].max() * 1.22)
+    scope = 'best arm per model' if per_model else 'every run'
+    fig.suptitle(f'{zone} — point models vs foundation models, each metric ranked '
+                 f'independently ({scope})', fontsize=12, fontweight='bold')
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in ('#4C72B0', '#DD8452')]
+    axes[0].legend(handles, ['trained point model', 'zero-shot foundation'],
+                   loc='lower right', fontsize=8)
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+
+
 def write(evaluation_root, zone):
     df = collect(evaluation_root)
     if df.empty:
@@ -113,10 +180,15 @@ def write(evaluation_root, zone):
     csv_path = os.path.join(evaluation_root, '_scoreboard.csv')
     df.to_csv(csv_path, index=False)
     plot(df, zone, os.path.join(evaluation_root, '_scoreboard.png'))
+    plot_by_metric(df, zone, os.path.join(evaluation_root, '_scoreboard_by_metric.png'))
+    plot_by_metric(df, zone, os.path.join(evaluation_root, '_scoreboard_by_metric_all.png'),
+                   per_model=False)
     cols = ['model', 'arm', 'name', 'MAPE', 'peak_MAPE', 'MAE', 'RMSE', 'ME', 'days', 'kind']
     if 'wMAPE' in df.columns and df['wMAPE'].notna().any():
         cols.insert(5, 'wMAPE')          # price runs only; absent on load runs
     print(f"\n{'=' * 96}\nSCOREBOARD | zone {zone} | {evaluation_root}\n{'=' * 96}")
     print(df[cols].to_string(index=False, float_format=lambda v: f'{v:.3f}'))
     print(f"\n-> {csv_path}")
+    print(f"-> {os.path.join(evaluation_root, '_scoreboard_by_metric.png')}  "
+          f"(best arm per model, 3 metrics)")
     return df

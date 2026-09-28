@@ -1,11 +1,9 @@
-"""Process-pool helpers for the QRA baseline.
+"""Process-pool helpers, shared by the probabilistic baselines.
 
-The two expensive stages are embarrassingly parallel — eight sister models that never see
-each other, and the (m, L) configurations scored independently — so a pool computes
-BIT-IDENTICAL results and only changes how long they take. That property is why this is the
-one optimisation applied: it needs no numerical argument to defend, unlike replacing the
-per-day `lstsq` with incremental normal equations, which squares the condition number of a
-~650-column design and would have to be justified rather than merely timed.
+The expensive stage in each is embarrassingly parallel — the fifteen density base learners
+never see each other — so a pool computes BIT-IDENTICAL results and only changes how long
+they take. That property is why this is the one optimisation applied: it needs no numerical
+argument to defend, only a timing.
 
 Thread oversubscription is the trap here. This node hands out 4 CPUs while OpenBLAS defaults
 to 4 threads, so four workers would launch sixteen threads onto four cores and finish SLOWER

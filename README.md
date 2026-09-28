@@ -1,11 +1,11 @@
 1.put dom_load.csv and pjm_dominionhub_hourly_2015_2025_openmeteo.csv into /data/raw/
-run Data_Preparation.py and Model_Training.py
+run Data_Preparation.py and scripts/Model_Training.py
 
 salloc -A gts-sd111 -p gpu-v100 -q inferno -N 1 -c 4 --mem=16G -t 2:00:00 --gres=gpu:1
 
 source .venv/bin/activate
 
-python Model_Training.py
+python scripts/Model_Training.py
 
 python generate_web.py
 
@@ -37,7 +37,7 @@ What it buys, measured on dom with `lightgbm_residual`: MAE −1.7%, peak MAPE �
 is real but small and concentrated on high-stress days; roughly 70% of what congestion carries
 is a system-load-level proxy the models already see through the 168 h lookback.
 
-    PJM_DATASET=dom python run_crawler.py       # fetches marginal value along with everything else
+    PJM_DATASET=dom python scripts/run_crawler.py       # fetches marginal value along with everything else
 
 ### Run configuration
 
@@ -50,10 +50,10 @@ takes one value, and loops.
 | `PJM_DATASET` | zone | one | list | `dom bge` (sbatch) / `dom` (python) |
 | `PJM_CONGESTION` | congestion block on/off | `0` or `1` | list | `1` |
 | `PJM_TRAIN_ONLY` | which models | comma-separated names, or `residual` | same | all of `TRAIN_CONFIG` |
-| `PJM_CRAWL` | refresh data first | — (run `run_crawler.py`) | `0`/`1` | `1` |
+| `PJM_CRAWL` | refresh data first | — (run `scripts/run_crawler.py`) | `0`/`1` | `1` |
 
     # one process, one zone, one arm
-    PJM_DATASET=dom PJM_CONGESTION=0 PJM_TRAIN_ONLY=residual python Model_Training.py
+    PJM_DATASET=dom PJM_CONGESTION=0 PJM_TRAIN_ONLY=residual python scripts/Model_Training.py
 
     # the same thing in the queue, plus a second zone and a second arm
     sbatch --export="ALL,PJM_CRAWL=0,PJM_CONGESTION=1 0,PJM_TRAIN_ONLY=residual" Train_Model.sbatch
@@ -82,7 +82,7 @@ setting and refuses a mismatch rather than feeding a model the wrong number of f
 Note that the tag records the congestion switch, NOT a version of the feature set as a whole.
 Changing what the other blocks contain therefore requires wiping `data/{zone}/matrix*` by
 hand: the builders cache on filename alone, so a matrix left from the previous definition
-would be silently reused. `run_crawler.py` does that wipe as its last step, so a crawl covers
+would be silently reused. `scripts/run_crawler.py` does that wipe as its last step, so a crawl covers
 it; a bare edit-then-train does not.
 
 ### Comparing across time
@@ -94,20 +94,37 @@ second one, or no crawl at all). The durable record is the
 `results/{zone}/evaluation/**/**_metrics.txt` files themselves.
 
 
-## Probabilistic baselines (Xie & Hong 2018, IEEE TSG 9(3):1680-1687)
+## Probabilistic baselines
 
-Temperature scenarios -> an MLR point model -> percentiles -> quantile score (pinball loss).
-CPU only, ~30 s per zone, no GPU and no sbatch needed.
+Three reproductions, each isolated from the point-model stack: one input
+(`data/{zone}/cleaned/cleaned_pjm_load_weather.csv`), results under `results/{zone}/{name}/`,
+no matrix cache, no scalers, and deliberately not registered in `src/models` (see
+`src/quantile/__init__`). Both are scored by the same functions in `src/quantile/qeval.py` on
+the same tail-0.16 test period, so their tables are comparable.
 
-    PJM_DATASET=dom python train_quantile.py        # T-cube / Vanilla / Hong-2014
-    PJM_DATASET=dom python -m src.quantile.plots    # figures from what the run wrote
+| baseline | paper | entry | tuning |
+|---|---|---|---|
+| Density combination | Li et al. 2020, TSG 11(2):1679-1690 | `scripts/train_density.py` | `DENSITY_CONFIG` |
+| iQRNN | Zhang et al. 2019, TSG 10(4):4425-4434 | `scripts/train_qrnn.py` | `QRNN_CONFIG` |
 
-Reads ONE input, data/{zone}/cleaned/cleaned_pjm_load_weather.csv, and writes to
-results/{zone}/quantile/. It shares nothing else with the point-model stack: no matrix
-cache, no scalers, and deliberately not registered in src/models (see src/quantile/__init__).
-Tuning lives in QUANTILE_CONFIG in src/config.py.
+    PJM_DATASET=dom python scripts/train_density.py   &&  python -m src.density.plots
+    PJM_DATASET=dom python scripts/train_qrnn.py      &&  python -m src.qrnn.plots
 
-## Foundation models (zero-shot) — `run_foundation.py`
+`scripts/train_qrnn.py` folds the density row into its own scoreboard when those results are present,
+labelling each row with its forecast horizon rather than assuming they answer the same
+question.
+
+Two further baselines were removed. The temperature-scenario method of Xie & Hong (2018)
+needed a thirty-year weather archive, which made it the one baseline that could not be
+pointed at an arbitrary load dataset. Quantile Regression Averaging on sister forecasts (Liu
+et al. 2017) followed: its sister family is built from a temperature recency effect, and
+driving it from lagged load instead collapses the disagreement the method converts into
+quantiles — a change to the mechanism, not to the features.
+
+The same two baselines are ported to the public datasets (`elia`, `ercot`, `spain`) under
+`src/bench/`, with their own entries `scripts/train_bench_density.py` and `scripts/train_bench_iqrnn.py`.
+
+## Foundation models (zero-shot) — `scripts/run_foundation.py`
 
 A pre-trained univariate forecaster (TimesFM 2.5 today) is handed the recent `Load_Estimated`
 history and asked for the target day. **Nothing is trained**, so there is no weights file, no
@@ -115,11 +132,11 @@ matrix cache and no train step — the run reads the cleaned CSV, calls the mode
 
     .venv/bin/pip install 'timesfm[torch]'          # optional; nothing else needs it
     export HF_HOME=/path/with/room                  # ~1 GB checkpoint, keep it off $HOME
-    PJM_DATASET=dom python run_foundation.py                          # config defaults
-    PJM_DATASET=dom python run_foundation.py --context 512 --mode residual
-    PJM_DATASET=dom python run_foundation.py --model zero --mode residual   # harness self-check
-    PJM_DATASET=dom python run_foundation.py --scoreboard             # re-read results only
-    python run_foundation.py --list
+    PJM_DATASET=dom python scripts/run_foundation.py                          # config defaults
+    PJM_DATASET=dom python scripts/run_foundation.py --context 512 --mode residual
+    PJM_DATASET=dom python scripts/run_foundation.py --model zero --mode residual   # harness self-check
+    PJM_DATASET=dom python scripts/run_foundation.py --scoreboard             # re-read results only
+    python scripts/run_foundation.py --list
 
 Tuning lives in `FOUNDATION_CONFIG` in `src/config.py`; every flag above is a per-run override
 of the same field. ~1 min per (mode, context) for a 310-day test year on CPU.
@@ -129,7 +146,7 @@ of the same field. ~1 min per (mode, context) for a 310-day test year on CPU.
 Not registered in `src/models`, for the reason `src/quantile` and `src/density` are not: that
 registry is what `src/serving/predict.available_models()` scans, and the daily CI forecast job
 loads everything it finds. A model needing an optional package and a 1 GB checkpoint the runner
-does not have would break the daily forecast the moment it was registered. `Model_Training.py`,
+does not have would break the daily forecast the moment it was registered. `scripts/Model_Training.py`,
 `model_evaluator`, `serving`, `generate_web` and `Train_Model.sbatch` are all untouched.
 
 The RESULTS are not separate — comparing them is the point. They land in the same tree as the

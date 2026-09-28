@@ -1,3 +1,8 @@
+# Entry points live in scripts/ but import the package from the repo root, and running
+# `python scripts/foo.py` puts scripts/ on sys.path rather than the root. Prepend the root so
+# `import src...` resolves from any working directory.
+import sys as _sys, pathlib as _pathlib
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 import os
 
 import src.config as cfg
@@ -22,6 +27,10 @@ from src.models import moe_lstm as moe_lstm_mod
 from src.models import moe_lstm_residual as moe_lstm_res_mod
 from src.models import archformer as archformer_mod
 from src.models import archformer_residual as archformer_res_mod
+from src.models import archformer_hp as archformer_hp_mod
+from src.models import archformer_hp_residual as archformer_hp_res_mod
+from src.models import archformer_skip as archformer_skip_mod
+from src.models import archformer_skip_residual as archformer_skip_res_mod
 
 TEST_STRATEGIES = ['tail']
 VAL_STRATEGIES  = ['tail']
@@ -204,9 +213,16 @@ if cfg.TRAIN_CONFIG['mstnn']:
 # --- GARCHFormer / ARCHFormer3 (+ residual) ---
 # Same shape as the MSTNN block. Both variants are driven from one matrix build,
 # because the two runs differ only in their target.
+# Three versions side by side: the author's as published, a pure-hyperparameter shrink
+# (patch_len 6), and the static-skip rewiring. Separate run dirs, so they are three
+# scoreboard rows on one test set rather than a claim about which wins.
 for _name, _mod, _params in [
-    ('archformer',          archformer_mod,     cfg.ARCHFORMER_PARAMS),
-    ('archformer_residual', archformer_res_mod, cfg.ARCHFORMER_RESIDUAL_PARAMS),
+    ('archformer',               archformer_mod,          cfg.ARCHFORMER_PARAMS),
+    ('archformer_residual',      archformer_res_mod,      cfg.ARCHFORMER_RESIDUAL_PARAMS),
+    ('archformer_hp',            archformer_hp_mod,       cfg.ARCHFORMER_HP_PARAMS),
+    ('archformer_hp_residual',   archformer_hp_res_mod,   cfg.ARCHFORMER_HP_RESIDUAL_PARAMS),
+    ('archformer_skip',          archformer_skip_mod,     cfg.ARCHFORMER_SKIP_PARAMS),
+    ('archformer_skip_residual', archformer_skip_res_mod, cfg.ARCHFORMER_SKIP_RESIDUAL_PARAMS),
 ]:
     if not cfg.TRAIN_CONFIG[_name]:
         continue

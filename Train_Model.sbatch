@@ -38,7 +38,7 @@
 #   Nine of the eighteen regress on the deviation from a same-hour-last-week baseline built
 #   from the class's own load channel. That baseline is in MW, so it is meaningful for the
 #   two LOAD classes and a category error against a $/MWh target — src/config marks that with
-#   `residual_ok` and Model_Training.py drops them for rt_price with a printed reason. Nothing
+#   `residual_ok` and scripts/Model_Training.py drops them for rt_price with a printed reason. Nothing
 #   here needs to know: the loop asks for every model and the config decides.
 #
 # WHY THE CRAWL SITS OUTSIDE EVERY LOOP
@@ -95,7 +95,7 @@ echo "============================================================"
 if [ "$_crawl" = "1" ]; then
     for ZONE in $_zones; do
         echo "--- Crawling $ZONE | $(date) ---"
-        PJM_DATASET=$ZONE python run_crawler.py \
+        PJM_DATASET=$ZONE python scripts/run_crawler.py \
             || { echo "Crawl failed for $ZONE — aborting."; exit 1; }
     done
 else
@@ -131,7 +131,7 @@ for TARGET in $_targets; do
         # One combination is ~100 min of the 18 models. A failure here is reported and the
         # loop continues: losing one arm should not cost the twenty-three that follow.
         PJM_TARGET=$TARGET PJM_DATASET=$ZONE PJM_CONGESTION=$CONG PJM_LMP=$LMP \
-            python Model_Training.py \
+            python scripts/Model_Training.py \
             || echo "!! Training FAILED: target=$TARGET zone=$ZONE cong=$CONG lmp=$LMP — continuing."
 
         # Zero-shot TimesFM on the same arm. Nothing is trained, so a failure must not cost
@@ -142,7 +142,7 @@ for TARGET in $_targets; do
         if [ "$TARGET" = "rt_price" ]; then _fmodes="direct"; else _fmodes="direct residual"; fi
         for FMODE in $_fmodes; do
             PJM_TARGET=$TARGET PJM_DATASET=$ZONE PJM_CONGESTION=$CONG PJM_LMP=$LMP \
-                python run_foundation.py --model timesfm --mode $FMODE \
+                python scripts/run_foundation.py --model timesfm --mode $FMODE \
                 || echo "!! TimesFM $FMODE failed: target=$TARGET zone=$ZONE cong=$CONG lmp=$LMP — continuing."
         done
 
@@ -163,7 +163,7 @@ echo "============================================================"
 for TARGET in $_targets; do
   for ZONE in $_zones; do
     echo "============================================================"
-    PJM_TARGET=$TARGET PJM_DATASET=$ZONE python run_foundation.py --scoreboard \
+    PJM_TARGET=$TARGET PJM_DATASET=$ZONE python scripts/run_foundation.py --scoreboard \
         || echo "Scoreboard failed for target=$TARGET zone=$ZONE — the per-model metrics files are still on disk."
   done
 done

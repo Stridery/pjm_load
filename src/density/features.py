@@ -32,7 +32,7 @@ observed day"; the second is still six daily lags out to a week. Eleven features
 
 One consequence worth stating rather than discovering later: this puts the baseline on the
 SAME information set as the repo's 16 point models (data through D-1, predict D+1) and 24 h
-behind the QRA baseline (data through D-1, predict D).
+behind a D-1 -> D issue time (data through D-1, predict D).
 """
 
 import numpy as np

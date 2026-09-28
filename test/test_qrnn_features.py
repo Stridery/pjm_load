@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.qrnn import features as F                                   # noqa: E402
 from src.qrnn import model as M                                      # noqa: E402
 from src.quantile.qeval import QUANTILES, pinball                    # noqa: E402
-from train_quantile import load_frame, split_at_day_boundary         # noqa: E402
+from src.quantile.frame import load_frame, split_at_day_boundary     # noqa: E402
 
 
 def test_lag_alignment(lag_min=48):
@@ -83,7 +83,7 @@ def test_split_boundaries(val_days=365, test_frac=0.16):
     assert ept_r[tr][-1] < ept_r[va][0], "training runs past the validation start"
 
     # The test period is the one every baseline in this repo shares; if this drifts, the
-    # folded-in QRA and density rows stop being comparable and nothing else would say so.
+    # the folded-in density row stops being comparable and nothing else would say so.
     assert ept_r[te][0].normalize() == test_start, (ept_r[te][0], test_start)
     print(f"  split boundaries   train {tr.sum()} / valid {va.sum()} / test {te.sum()} h, "
           f"test opens {test_start.date()}")
@@ -128,7 +128,7 @@ def test_crossing_detector():
 def main():
     print("=== iQRNN baseline contracts ===")
     test_lag_alignment()
-    test_lag_alignment(lag_min=24)         # the QRA-issue-time setting must hold too
+    test_lag_alignment(lag_min=24)         # the D-1 -> D setting must hold too
     test_split_boundaries()
     test_loss_equals_metric()
     test_crossing_detector()

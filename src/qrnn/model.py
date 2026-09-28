@@ -9,7 +9,7 @@ Architecture (their Fig. 1), in order:
 Output width IS the quantile set, and the loss IS the quantile score of their eq. (1)-(2),
 so one fit produces all 99 percentiles. That is the whole point of the family: "training
 quantile forecasting models for different quantiles simultaneously has some advantages over
-training quantile forecasting models separately", and it is also why a QRA-style method
+training quantile forecasting models separately", and it is also why a per-quantile method
 needs 99 regressions where this needs one.
 
 Training scheme (their Fig. 2). One `bad` counter, epochs since the best validation quantile
@@ -229,7 +229,7 @@ def crossing_rate(q_raw, step=None):
     ("adjacent output layer neurons use similar information", its Fig. 10), and that claim is
     only checkable BEFORE the output is sorted. Everything scored downstream uses the sorted
     array, since rearranging weakly improves the pinball loss and is what
-    src/quantile/qra.py already does.
+    every baseline here already does.
     """
     v = np.clip(q_raw[:-1] - q_raw[1:], 0, None)             # (Q-1, N)
     theta = step if step is not None else 1.0 / (q_raw.shape[0] + 1)

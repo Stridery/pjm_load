@@ -1,0 +1,940 @@
+% ============================================================================
+%  Compiles with pdfLaTeX out of the box (Overleaf default compiler).
+%  No XeLaTeX / fontspec needed: every symbol is a LaTeX command or plain
+%  ASCII, and all diagrams are ASCII inside fancyvrb.
+% ============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{fancyvrb}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+% left-aligned wrapping column for the wide text tables
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+
+% all architecture diagrams / code blocks go through this
+\DefineVerbatimEnvironment{code}{Verbatim}{fontsize=\small,xleftmargin=1.2em}
+\DefineVerbatimEnvironment{codetiny}{Verbatim}{fontsize=\footnotesize,xleftmargin=1.2em}
+
+\newcommand{\yhat}{\hat{y}}
+\newcommand{\ytil}{\tilde{y}}
+\newcommand{\ind}{\mathbf{1}}
+
+\title{Porting three probabilistic baselines to \texttt{elia} / \texttt{ercot} / \texttt{spain}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+
+\noindent
+Software architecture, the three model architectures, how features are fed in, and every
+deviation from the published specifications --- revised against the chapter's protocol, and
+against what is now actually built.
+
+\medskip
+\noindent
+Fully separate from the PJM stack: new package \texttt{src/bench/}, one entry per model
+(\texttt{train\_bench\_density.py}, \ldots), new tree \texttt{results/bench/}.
+\texttt{src/config.py}, \texttt{train\_qra.py}, \texttt{train\_density.py},
+\texttt{train\_qrnn.py} and \texttt{results/\{zone\}/} are untouched.
+
+\medskip
+\noindent
+\textbf{Status.} \textbf{Models A and B are built and have been run on all three datasets};
+their numbers are in Sec.~\ref{sec:results}. \textbf{Model C (QRA) has been dropped} --- not
+deferred --- for the reason in Sec.~\ref{sec:qradropped}. Sec.~\ref{sec:status} is the
+per-item state.
+
+\tableofcontents
+
+% ============================================================================
+\section{Software architecture}
+
+\subsection{Modules}
+
+\begin{code}
+src/bench/
+    __init__.py      package contract, the protocol, and the isolation rationale
+    data.py          Dataset: load + validate, the day set, the splits, the lag window,
+                     the standardisation scale                          [built]
+    metrics.py       Pinball / PICP / MPIW / Winkler / MAE / RMSE / MSE / MAPE / SMAPE,
+                     for an arbitrary quantile grid                     [built]
+    density.py       Model A: features, T1-T4, one seed                 [built]
+    iqrnn.py         Model B: candidate pool, RFE, driver               [built]
+scripts/train_bench_density.py   CLI entry, Model A                             [built]
+scripts/train_bench_iqrnn.py     CLI entry, Model B                             [built]
+\end{code}
+
+\noindent
+Five modules from the first draft are gone. \texttt{qra.py} went with Model C
+(Sec.~\ref{sec:qradropped}). \texttt{config.py} and \texttt{lags.py} were each
+a handful of lines and live inside \texttt{data.py} and the model driver respectively;
+\texttt{plots.py} is deferred until there are numbers to plot; and \texttt{matrix.py}, the lazy
+design-matrix builder, is no longer needed --- the two-sided lag window
+(Sec.~\ref{sec:lagwindow}) cuts \texttt{elia}'s candidate pool far enough that the full matrix
+fits in memory, so the one piece of machinery in the draft that existed purely to work around
+size has no reason to exist.
+
+\medskip
+\noindent
+One entry point per model rather than one with a \texttt{-{}-models} switch: the three have
+nothing to share at the CLI level beyond the dataset name, and a single entry would have to
+succeed or fail as a unit.
+
+\subsection{What is reused, what is replaced}
+
+\begin{tabularx}{\textwidth}{@{}p{5.3cm} l L@{}}
+\toprule
+existing module & & reason \\
+\midrule
+\texttt{src/quantile/qeval.py} & \textbf{replace} & every function indexes into a fixed \texttt{QUANTILES = 1..99} grid and so cannot score $\{0.05, 0.50, 0.95\}$; \texttt{src/bench/metrics.py} takes the levels as an argument \\
+\texttt{src/quantile/\_pool.py} & \textbf{reuse} & process pool, dataset-agnostic \\
+\texttt{src/quantile/plots.py} & \textbf{reuse} & style helpers plus the three generic figures \\
+\texttt{src/density/\{base\_models,} \texttt{combine,crps\_gmm,gaussfit\}.py} & \textbf{reuse} & they take plain \texttt{(X, y)} arrays and know nothing about PJM \\
+\texttt{src/qrnn/model.py} & \textbf{reuse} & network, loss and schedule all take \texttt{(X, y, masks, cfg)} \\
+\texttt{src/density/features.py} & \textbf{replace} & PJM lag list hardcoded at module level \\
+\texttt{src/qrnn/features.py} & \textbf{replace} & PJM candidate pool \\
+\texttt{src/quantile/frame.py} & \textbf{replace} & single hardcoded CSV schema \\
+\bottomrule
+\end{tabularx}
+
+\medskip
+\noindent
+The three papers' \emph{methods} are therefore reused unchanged; what is rewritten is only the
+layer that decides which columns at which lags become a matrix.
+
+\subsection{The Dataset object}
+
+The unit is a \textbf{day}, not a step. Everything downstream addresses days by the position
+of their first step, and expands to steps only when a matrix is built --- which is what makes
+the day-set rule of Sec.~\ref{sec:dayset} expressible at all.
+
+\begin{code}
+class Dataset:
+    name            'spain' | 'ercot' | 'elia'
+    index           pd.DatetimeIndex, UTC, verified strictly regular
+    y               np.ndarray, the target column
+    step_minutes    15 or 60          steps_per_hour   4 or 1
+    H               steps in a target day        24 or 96
+    L               steps in the lookback window  168 or 672
+    G               steps from the deadline to the target day's first step
+    lag_min         = G + H - 1       lag_max          = L - 1 + G
+
+    day_starts()          positions of the first step of every usable day
+    splits()              {'train','val','test'} -> day-start positions
+    steps_of(days)        (n_days * H,) step positions, chronological
+    standardiser(days)    (mean, sd) of the target over those days
+\end{code}
+
+\noindent
+Construction rejects the record outright unless the timestamp grid is \emph{strictly} regular
+--- a single value of \texttt{diff}, equal to the configured granularity, and no duplicates ---
+because that is what allows every lag to be a positional shift rather than a timestamp join.
+All three datasets pass: \texttt{spain} 35{,}039 hourly stamps, \texttt{ercot} 16{,}958,
+\texttt{elia} 359{,}228 quarter-hourly, no gaps and no duplicates in any of them. Unlike PJM
+there is no DST irregularity to normalise.
+
+\medskip
+\noindent
+Column classes (\texttt{past\_cols} / \texttt{known\_cols} / \texttt{aux\_cols}) and the
+alignment probe are not in \texttt{data.py}. Model A uses none of them
+(Sec.~\ref{sec:densityfeat}), so they are deferred to whichever of Models B and C needs them
+first rather than built speculatively.
+
+\subsection{Execution flow}
+
+\begin{code}
+scripts/train_bench_density.py --dataset spain --seeds 0 1 2 [--workers N] [--models ...]
+   |
+   +-- data.load("spain")         JSON + CSV -> validated Dataset
+   +-- ds.splits()                day sets for train / val / test
+   |
+   +-- for each seed:
+   |      standardiser(train)     (mean, sd) -> z-score the whole target series
+   |      density.build(...)      (X, y) for T1..T4, every step of every usable day
+   |      fit 15 base models on T1, predict on T2+T3+T4   [process pool]
+   |      weights on T3, score on T4  -> (3, n_test) sorted quantiles
+   |
+   +-- metrics.aggregate(...)     mean and sd across seeds -> table + CSVs
+\end{code}
+
+\noindent
+Every model emits the same object --- a \texttt{(3, n\_test)} array of sorted quantiles, the
+test timestamps, and the \texttt{(mean, sd)} used to standardise --- so one scorer serves all
+three.
+
+\subsection{Config changes needed}
+
+\texttt{csv\_path} in all three JSON files pointed at \texttt{data/public\_cleaned\_data/},
+which does not exist; the files are in \texttt{data/quantile/}. \textbf{Done} --- that one
+field is rewritten in place in all three, and it is the only edit made to the configs.
+
+\medskip
+\noindent
+The draft proposed adding \texttt{shift\_steps} and \texttt{quantiles} fields. Neither was
+added. The quantile set is a property of the chapter's protocol, not of a dataset, so it lives
+in code (\texttt{density.LEVELS}); and no column is shifted (Sec.~\ref{sec:align}), so a
+per-column shift map would be an empty dict in all three files.
+
+\medskip
+\noindent
+\texttt{spain\_config.json} has \texttt{"lookback\_hours": [336, 168]} where the others have a
+scalar. Read as \texttt{min(...)} $=$ \textbf{168}, in code, leaving the file as the senior
+wrote it.
+
+% ============================================================================
+\section{Datasets}
+
+\begin{center}
+\small
+\begin{tabular}{@{}l r r r@{}}
+\toprule
+ & \texttt{elia} & \texttt{ercot} & \texttt{spain} \\
+\midrule
+granularity                    & 15 min & 60 min & 60 min \\
+steps per day $H$              & \textbf{96} & 24 & 24 \\
+target                         & \texttt{Total Load} & \texttt{ACTUAL\_NetLoad} & \texttt{total load actual} \\
+lookback                       & 672 steps (168 h) & 168 steps & 168 steps \\
+horizon                        & 96 steps (24 h) & 24 steps & 24 steps \\
+\texttt{forecast\_deadline\_hour} & 23 & \textbf{9} & 23 \\
+deadline gap $G$ (steps)       & 4 & \textbf{15} & 1 \\
+\textbf{lag window} $[G{+}H{-}1,\ L{-}1{+}G]$ & \textbf{[99, 675]} & \textbf{[38, 182]} & \textbf{[24, 168]} \\
+\textbf{usable days} train / val / test & \textbf{2239 / 748 / 746} & \textbf{416 / 142 / 140} & \textbf{869 / 292 / 291} \\
+steps                          & 214{,}944 / 71{,}808 / 71{,}616 & \textbf{9{,}984} / 3{,}408 / 3{,}360 & 20{,}856 / 7{,}008 / 6{,}984 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+The day counts are not chosen here --- they reproduce the chapter's own table exactly, which is
+the check that the data layer implements the chapter's protocol and not a near-miss of it.
+
+\subsection{The day set}
+\label{sec:dayset}
+
+A target day is usable when three conditions hold together:
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
+  \item all $H$ of its steps are present in the record;
+  \item the whole lookback window ending at its deadline is present too;
+  \item all $H$ of its steps lie inside the split's date range.
+\end{enumerate}
+
+\noindent
+Condition 3 is the one that is easy to get wrong, and it is what makes \texttt{elia}'s test set
+746 days rather than 747: \texttt{test\_end} is \texttt{23:00}, but a 15-minute day's last step
+is \texttt{23:45}, so the final day is incomplete and is dropped rather than scored on
+three-quarters of its steps.
+
+\medskip
+\noindent
+A \emph{sample} is still one target step, as in all three papers --- days are the unit of
+admission, steps the unit of fitting. A day-level layout would leave \texttt{ercot} with 416
+training rows, which none of the three models can be fitted on.
+
+\subsection{The lag window}
+\label{sec:lagwindow}
+
+The first draft had a one-sided \emph{floor}. The chapter's window is anchored at the deadline
+and has a fixed length, so the bound is two-sided. Write $G$ for the number of steps from the
+deadline step to the target day's first step. A lag $k$, counted back from a target step, is
+observable for \emph{every} step of the day and lies inside the window exactly when
+\begin{equation}
+  G + H - 1 \;\leq\; k \;\leq\; L - 1 + G .
+  \label{eq:window}
+\end{equation}
+
+\noindent
+The lower bound is the old floor: the day's last step is $H-1$ after its first, which is itself
+$G$ after the deadline. The upper bound is new and is the one the draft missed --- a lag deeper
+than $L-1+G$ reaches back past the start of the lookback window, so using it would quietly give
+the model a longer history than the protocol allows.
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l l l l l@{}}
+\toprule
+ & deadline & $G$ & $H$ & $L$ & window \\
+\midrule
+\texttt{elia}  & $(D{-}1)$ 23:00 & 4  & 96 & 672 & $[99,\ 675]$ \\
+\texttt{ercot} & $(D{-}1)$ 09:00 & 15 & 24 & 168 & $[38,\ 182]$ \\
+\texttt{spain} & $(D{-}1)$ 23:00 & 1  & 24 & 168 & $[24,\ 168]$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\texttt{elia}'s lower bound is 99 rather than a round 96 because the final 15-minute step runs
+45 minutes past the whole day. \texttt{ercot}'s deadline of 9 gives a blind spot of 15--38
+hours, far wider than the other two; that is its market rule (the day-ahead market closes the
+previous morning), not an error.
+
+\medskip
+\noindent
+Eq.~\eqref{eq:window} is the single rule every model's feature set is filtered through. For
+Model A it costs one lag on two of the three datasets (Sec.~\ref{sec:densityfeat}); for Model B
+it is the change that makes the lazy matrix builder unnecessary.
+
+\subsection{Feature availability}
+\label{sec:avail}
+
+One rule, shared by all three models:
+
+\begin{tabularx}{\textwidth}{@{}p{5.5cm} l L@{}}
+\toprule
+column class & usable lags & reason \\
+\midrule
+\texttt{target\_col} & inside Eq.~\eqref{eq:window} & realised value, known only after the cutoff, and only back to the start of the window \\
+\texttt{past\_cols} (\texttt{actual\_cols} minus target) & inside Eq.~\eqref{eq:window} & same \\
+\texttt{known\_cols} (\texttt{forecast\_cols}) & \textbf{lag 0} & day-ahead forecast, describes the target day, published before the cutoff \\
+\texttt{aux\_cols} (HoD / DoW / MoY) & always & calendar \\
+\bottomrule
+\end{tabularx}
+
+\medskip
+\noindent
+\texttt{target\_col} also appearing inside \texttt{actual\_cols} is harmless --- it is handled
+as the target.
+
+% ============================================================================
+\section{Model A --- density combination (Li, Wang \& Zhang 2020)}
+
+\noindent
+\textbf{Built and unit-tested; not yet run end to end.}
+\texttt{src/bench/density.py} $+$ \texttt{train\_bench\_density.py}. The numerical core is
+imported unchanged from \texttt{src/density} --- the fifteen base specifications, the probit
+fit, the closed-form mixture CRPS and the simplex QP. What is written new is only what the
+protocol changes: the feature assembly, the T1--T4 mapping, the reporting space, and the
+three-level output.
+
+\subsection{Architecture}
+
+\begin{codetiny}
+15 base learners, three families of five
+
+  GPR  x5   ARD Matern 3/2 + RBF + White kernel
+            diversity: a different 2000-point random subsample of T1 (seeds 100-104)
+
+  QRNN x5   diversity: architecture x feature subset x width
+            NN1 bn/all/64    NN2 bn/lags/128   NN3 l2/all/64
+            NN4 l2/all/128   NN5 l2/recent/96
+            subsets: all, lags = the lag columns only, recent = short lags + calendar
+
+  QRGB x5   diversity: max_depth / min_child_weight / subsample / colsample_bytree
+            XGB1 4/1/0.9/0.9    XGB2 6/5/0.8/0.8    XGB3 8/10/0.7/0.7
+            XGB4 3/20/0.9/0.6   XGB5 6/2/0.6/1.0
+       |
+       +--- GPR emits a Gaussian (mu, sigma) natively
+       +--- QRNN / QRGB emit 9 deciles -> Gaussian by probit regression
+       |
+       v
+  Gaussian mixture   F = sum_i w_i F_i
+       |
+       v
+  weights minimise the CRPS; for a Gaussian mixture it is closed form, hence
+  quadratic in w  ->  a small QP on the simplex, not a simulation.
+  w_i = 0 drops model i, so selection and weighting happen in one solve.
+       |
+       v
+  reported alongside: MAPE-guided weights, simple average, best single model on T3
+\end{codetiny}
+
+\noindent
+The probit conversion: if $y_q = \mu + \Phi^{-1}(q)\,\sigma$, then an OLS fit of $y_q$ on
+$\Phi^{-1}(q)$ returns the intercept as $\mu$ and the slope as $\sigma$.
+
+\medskip
+\noindent
+The closed form is the Baringhaus--Franz identity,
+\begin{equation*}
+  \mathrm{CRPS}(F, y) \;=\; \mathbb{E}|Y - y| - \tfrac{1}{2}\,\mathbb{E}|Y - Y'|
+  \;=\; \sum_i \sum_k \alpha_{i,k}\, w_i w_k \;+\; \sum_i \beta_i w_i ,
+\end{equation*}
+so the weights solve
+$\min_{w} w^{\top} Q w + c^{\top} w$ subject to $\mathbf{1}^{\top}w = 1,\ w \geq 0$.
+$Q$ is indefinite ($\alpha_{i,i} = -\sigma_i/\sqrt{\pi}$); the paper eliminates the equality
+constraint and reports the reduced matrix positive definite, which is computed here as a
+certificate rather than assumed. Multi-start SLSQP either way.
+
+\subsection{Features --- the paper's list, no exogenous variables}
+\label{sec:densityfeat}
+
+\texttt{10--11 target lags + hour + dayofweek + month + is\_weekend}
+
+\medskip
+\noindent
+The published lag list (hours) is $24, 25, 26, 27, 28, 48, 72, 96, 120, 144, 168$: the same
+step of day on the most recent fully observed day plus the four before it, then six daily lags
+out to a week.
+
+\medskip
+\noindent
+The list is instantiated per dataset by one rule: convert to steps, then shift by \textbf{whole
+days} until the smallest member clears the lower bound of Eq.~\eqref{eq:window}, then drop any
+member past the upper bound. Shifting by whole days preserves the structure of the list --- a
+sub-daily block of five followed by daily lags out to a week --- where truncating the front
+would not.
+
+\begin{tabularx}{\textwidth}{@{}l c p{5.4cm} L@{}}
+\toprule
+ & $n$ & lag list (steps) & note \\
+\midrule
+\textbf{\texttt{spain}} & 11 & \texttt{24,25,26,27,28,48,72,\allowbreak 96,120,144,168}
+  & \textbf{the paper's list verbatim} --- the window is exactly $[24, 168]$ \\
+\textbf{\texttt{ercot}} & \textbf{10} & \texttt{48,49,50,51,52,72,96,\allowbreak 120,144,168}
+  & shifted $+24$: with deadline 9, day $D{-}1$ is not fully observed, so the most recent fully observed day is $D{-}2$. \textbf{192 exceeds the upper bound 182 and is dropped} \\
+\textbf{\texttt{elia}}  & \textbf{10} & \texttt{192,196,200,204,208,\allowbreak 288,384,480,576,672}
+  & in steps the list is $96, 100, \ldots, 672$; its minimum 96 is below 99, so shifted one day ($+96$). \textbf{768 exceeds the upper bound 675 and is dropped} \\
+\bottomrule
+\end{tabularx}
+
+\medskip
+\noindent
+So \texttt{ercot} and \texttt{elia} carry \textbf{fourteen} features, not fifteen. Both lose the
+same member --- the far end of the weekly block, the least informative lag in the list --- and
+both lose it to the same cause: the shift that clears the lower bound pushes the deepest lag
+past the upper one. There is no shift that satisfies both ends with eleven lags, so this is
+forced, not a choice.
+
+\medskip
+\noindent
+This model gets \textbf{no} \texttt{known\_cols} and \textbf{no} \texttt{past\_cols} --- Li's
+explicit design choice is that the base learners are generic, so that the combination step is
+what is being tested. It is also why Model A is the right first build: it exercises the whole
+data layer while depending on none of the column-class machinery.
+
+\subsection{Periods and input shape}
+
+\begin{code}
+T1 = train             fit the 15 base models
+T2 = first half val    report base models (the paper's Table I)
+T3 = second half val   optimise the 15 weights
+T4 = test              reported
+
+X : (n_days * H, 14 or 15)      y : (n_days * H,)
+\end{code}
+
+\noindent
+Li's own split is $\mathrm{T1}:\mathrm{T2}:\mathrm{T3}:\mathrm{T4} = 10{:}1{:}1{:}1$. The
+configs define three periods, so T2 and T3 are the two halves of the validation days, in
+order. T3 only has to pin down fifteen weights --- the paper itself uses five weeks --- so the
+split is not delicate.
+
+\subsection{Reporting space}
+\label{sec:zspace}
+
+The target is z-scored with the mean and standard deviation of the \textbf{training days}, and
+Pinball, MPIW, Winkler, MAE, RMSE and MSE are reported in those units. This is what puts three
+datasets of different size on one axis, and it is the scale the chapter reports in.
+
+\medskip
+\noindent
+MAPE and SMAPE are the exception. They divide by the target, and the z-scored target crosses
+zero, so a percentage error in z units is not a percentage error of anything; both are computed
+after mapping the median and the actuals back through $(\text{mean}, \text{sd})$.
+
+\medskip
+\noindent
+The same reasoning applies inside the model, to the competing MAPE-guided weighting scheme:
+it is solved in physical units. The weights are unaffected by that choice --- they sum to one,
+so the affine map commutes with the combination --- but the objective would otherwise be
+meaningless.
+
+\subsection{Seeds}
+
+Three seeds by default, reported as mean and standard deviation. A seed re-seeds the
+\emph{whole} pipeline: the five GPR subsamples, the five network initialisations, the five
+boosters' row and column subsampling, and the QP's multi-start. Anything less would report the
+spread of one run dressed up as a spread of three.
+
+\subsection{Implementation note: the one-hot shortcut}
+
+Both the ``best individual model'' benchmark and the four schemes' test CRPS come out of a
+single $(Q, c)$ computation per period. For a one-hot weight vector $e_i$ the mean CRPS is
+exactly $(Q_{ii} + c_i)/T$, so no per-model rerun is needed; for a general $w$ it is
+$(w^{\top} Q w + c^{\top} w)/T$. On \texttt{elia}'s test block the $\alpha$ tensor is 129 MB,
+and the naive version would build it sixteen times.
+
+\subsection{Deviations}
+
+\begin{tabularx}{\textwidth}{@{}p{4.1cm} p{4.7cm} L@{}}
+\toprule
+paper & here & forced? \\
+\midrule
+11 lags, $24 \ldots 168$ h & shifted by whole days to clear the lower bound (\texttt{spain} unchanged)
+  & \textbf{yes} --- lag 24 is not observable on \texttt{ercot} / \texttt{elia} \\
+& \textbf{10 lags} on \texttt{ercot} and \texttt{elia}
+  & \textbf{yes} --- the shifted deepest lag leaves the lookback window, Eq.~\eqref{eq:window} \\
+T1:T2:T3:T4 $=$ 10:1:1:1 & T1 $=$ train, T2/T3 $=$ val halved, T4 $=$ test
+  & \textbf{yes} --- the configs define three periods, not four \\
+9 deciles reported & \textbf{3 levels} $\{0.05, 0.50, 0.95\}$
+  & \textbf{yes} --- the chapter's quantile set. The base learners still emit 9 deciles, which is what the probit fit consumes; only the final mixture inversion changes \\
+CRPS in physical units & \textbf{z-scored} target, Sec.~\ref{sec:zspace}
+  & \textbf{yes} --- the chapter's reporting scale \\
+one run & 3 seeds, mean $\pm$ sd & no --- cheap, and the QP is multi-start anyway \\
+CVXOPT & scipy SLSQP, multi-start
+  & no --- equivalent at 15 variables; the convexity certificate is computed rather than assumed \\
+deciles as base-learner output & unchanged & --- \\
+GPR 2000-point subsample & unchanged & --- \\
+\bottomrule
+\end{tabularx}
+
+% ============================================================================
+\section{Model B --- iQRNN (Zhang, Quan \& Srinivasan 2019)}
+
+\noindent
+\textbf{Built and run on all three datasets.} \texttt{src/bench/iqrnn.py} $+$
+\texttt{train\_bench\_iqrnn.py}. The network, the pinball objective and the training schedule
+are imported unchanged from \texttt{src/qrnn/model.py}; what is written here is the candidate
+pool, which is the one part of that paper written against its own dataset. The pool figures
+below are the revised ones, filtered through Eq.~\eqref{eq:window}.
+
+
+\subsection{Architecture}
+
+\begin{code}
+input (103)
+  |-- Linear(103 -> 500)
+  |-- PReLU(500)                 per-channel learnable slope
+  |-- Dropout(p)                 p = 0.5, or 0 for the -ZD variant
+  |-- GaussianNoise(sd = 0.3)    training only; largest single ablation effect
+  |-- Linear(500 -> 500)
+  |-- PReLU(500)
+  |-- Dropout(p)
+  |-- GaussianNoise(sd = 0.3)
+  +-- Linear(500 -> 3)           output width = the quantile set {5%, 50%, 95%}
+
+schedule (paper Fig. 2)
+    Adam, lr 1e-3, batch 168
+    one `bad` counter = epochs since the best validation pinball, two rules:
+        bad >= 20              stop
+        every 5 bad epochs     lr *= 0.4, floored at 1e-5
+    best weights restored at the end
+\end{code}
+
+\noindent
+The loss is $\sum_q \mathrm{pinball}(y, \yhat_q)$. The output width \emph{is} the quantile set
+and the objective \emph{is} the reported metric, so one fit produces every quantile. Two
+configurations are run ($p = 0.5$ and $p = 0$), 5 seeds each, reported as mean and SD.
+
+\subsection{Features --- candidate pool $\rightarrow$ RFE $\rightarrow$ 103}
+
+The paper's pool is \texttt{calendar + holiday + load lags (1 d ... 5 w) + temperature
+(now ... 5 w)}, 1760 candidates, cut to 100 by RFE plus 3 manual add-backs.
+
+\medskip
+\noindent
+\textbf{None of these datasets has temperature.} Temperature is the paper's exogenous driver
+known at the deadline, so it is replaced by whatever each dataset provides, under
+Sec.~\ref{sec:avail}:
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l l l l r@{}}
+\toprule
+ & target lags & \texttt{past\_cols} & \texttt{known\_cols} & calendar & \textbf{pool} \\
+\midrule
+\textbf{\texttt{elia}}  & 3{,}262 (99\ldots3360, every step) & none & $4 \times$ lag 0 & 11 & \textbf{3{,}277} \\
+\textbf{\texttt{ercot}} & 803 (38\ldots840)   & 11 cols $\times$ 8 echoes $=$ 88  & none & 11 & \textbf{902} \\
+\textbf{\texttt{spain}} & 817 (24\ldots840)   & 22 cols $\times$ 7 echoes $=$ 154 & $1 \times$ lag 0 & 11 & \textbf{983} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item the \textbf{target} gets a dense grid (floor $\rightarrow$ 5 weeks, every step) ---
+        the paper's treatment of load;
+  \item \textbf{\texttt{past\_cols}} get a daily-echo grid
+        $\{\mathrm{floor}\} \cup \{\lceil \mathrm{floor}/H \rceil \cdot H + kH,\; k = 0 \ldots 6\}$.
+        The paper affords a dense grid because it has one exogenous series; \texttt{spain} has
+        22, and a dense grid there would be an 18{,}000-column pool;
+  \item \textbf{calendar}: HoD / DoW / MoY raw codes, three sine--cosine pairs, and
+        \texttt{is\_weekend}.
+\end{itemize}
+
+\noindent
+RFE uses \texttt{RandomForestRegressor(n\_estimators=40, criterion='absolute\_error',
+max\_depth=12, max\_features=0.3, min\_samples\_leaf=20)} with \texttt{step=0.35}, on a
+12{,}000-row subsample of the training rows only, cached by a signature covering the dataset,
+floor, pool definition and seed.
+
+\subsection{The candidate matrix is never materialised}
+
+\begin{code}
+elia, if built whole:   355,868 x 3,277 x 4 B = 4.66 GB
+  RFE stage, subsample:  12,000 x 3,277 x 4 B = 0.157 GB
+  after selection:      355,868 x   103 x 4 B = 0.147 GB
+                                        peak  = 0.16 GB
+\end{code}
+
+\noindent
+\texttt{matrix.py} builds only the rows or columns a stage asks for, so peak memory is
+essentially independent of dataset size. RFE costs about 10 minutes and is cached, so
+\texttt{elia} can use the full 3{,}262-lag grid with no subsampling.
+
+\subsection{Input shape}
+
+\begin{code}
+X   : (n_samples, 103)  float32, standardised on training rows only, then frozen
+y   : (n_samples,)      standardised the same way, inverted after prediction
+out : (n_samples, 3)    sorted to remove crossing
+\end{code}
+
+\subsection{Deviations}
+
+\begin{tabularx}{\textwidth}{@{}p{4.4cm} p{4.2cm} L@{}}
+\toprule
+paper & here & forced? \\
+\midrule
+temperature lags $0 \ldots 5$ w & each dataset's own exogenous columns
+  & \textbf{yes} --- no temperature exists \\
+dense lag grid for the exogenous series & daily-echo grid for \texttt{past\_cols}
+  & \textbf{yes} --- 22 series $\times$ a dense grid is not tractable \\
+99 quantiles & $\{5, 50, 95\}$ & no --- your specification \\
+per-sample $L_2$ norm, then per-column standardisation & per-column only
+  & no --- a sample-wise norm makes the target scale unrecoverable from its own row \\
+validation year selects, then retrain with an internal 90/10 split
+  & one validation block does both early stopping and configuration choice
+  & \textbf{yes} --- retraining on the selection set leaves nothing to stop on \\
+100 independent runs & 5 & no --- cost; mean and SD still reported \\
+bQRNN control included & off by default
+  & no --- already run on PJM (250.5 vs 404.2 pinball); adds ${\sim}3.6$ h on \texttt{elia} and no new information. One switch \\
+1760 candidates $\rightarrow$ 100 $+$ 3 & pool size varies by dataset $\rightarrow$ 100 $+$ 3
+  & \textbf{yes} --- pool size follows from the available columns \\
+\bottomrule
+\end{tabularx}
+
+% ============================================================================
+\section{Model C --- QRA on sister forecasts: dropped}
+\label{sec:qradropped}
+
+\textbf{Not built, and not deferred.} Liu et al.'s method builds a family of sister point
+forecasts and converts their DISAGREEMENT into quantiles by quantile regression. The family's
+members differ only in how they treat a \textbf{temperature} recency effect, and none of these
+three datasets carries a temperature column at all. Driving the family from lagged load
+instead leaves all eight sisters reading one signal, so the disagreement the method exists to
+convert largely disappears --- a change to the mechanism, not to the feature set. The PJM port,
+still driven by real temperature, already showed the premise straining: sister dispersion of
+259.6 MW against an actual error spread of 726.2 MW on \texttt{dom} (a shortfall of 2.80x, median
+pairwise error correlation 0.88), and 28.9 against 199.3 on \texttt{bge} (6.89x, correlation
+0.96).
+
+\medskip
+\noindent
+Each dataset then breaks it a second time, differently. The estimation window must be full
+before the first forecast origin, and Liu's family is two windows (2 y and 3 y) crossed with
+four selection schemes:
+
+\begin{center}
+\small
+\begin{tabular}{@{}l r c c l@{}}
+\toprule
+ & history before validation & 2 y & 3 y & consequence \\
+\midrule
+\texttt{spain} & 2.38 y & yes & no  & 8 sisters collapse to 4 \\
+\texttt{ercot} & 1.14 y & no  & no  & no feasible window at all \\
+\texttt{elia}  & 6.13 y & yes & yes & family intact, but see below \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\texttt{elia}'s 15-minute granularity puts the stage-1 design at 2953 columns; one
+\texttt{lstsq} was measured at 26.2 s on this node, so daily re-estimation over 1494 forecast
+days is 11{,}952 fits and 87 h. Two concessions (hour-of-day rather than step-of-day
+interactions, weekly rather than daily re-estimation) bring it to 2.8 h.
+
+\medskip
+\noindent
+So the cheapest honest version would be a relabelled method (``QRA applied to an
+autoregressive sister family'') with a different deviation on every dataset and an empty cell
+for \texttt{ercot}. Models A and B each survive the missing temperature intact --- Li's
+combination step and Zhang's training machinery depend on no particular exogenous variable ---
+so the baseline set is those two. The PJM implementation
+(\texttt{src/quantile/\{qra,sisters,design,qra\_plots\}.py}, \texttt{train\_qra.py}) has been
+deleted from the repository; \texttt{src/quantile/\_\_init\_\_.py} records why.
+
+% ============================================================================
+\section{Metrics}
+
+\noindent
+\textbf{Built} --- \texttt{src/bench/metrics.py}.
+Quantile set $\{5\%, 50\%, 95\%\}$, interval $[\yhat_{0.05}, \yhat_{0.95}]$, so
+$\alpha = 0.10$. Write $\ell$ and $u$ for the interval bounds and index the test block by day
+$d$ and step $h$, over $N$ days $\times$ $H$ steps:
+
+\begin{align}
+  \mathrm{Pinball} &= \frac{1}{|Q|\,N H} \sum_{q \in Q} \sum_{d,h}
+      \max\!\Big\{ (q-1)\big(y_{d,h} - \yhat_{d,h,q}\big),\;
+                    q\big(y_{d,h} - \yhat_{d,h,q}\big) \Big\} \\[2pt]
+  \mathrm{PICP} &= \frac{1}{N H} \sum_{d,h} \ind\{\ell_{d,h} \leq y_{d,h} \leq u_{d,h}\} \\[2pt]
+  \mathrm{MPIW} &= \frac{1}{N H} \sum_{d,h} \big(u_{d,h} - \ell_{d,h}\big) \\[2pt]
+  \mathrm{Winkler} &= \frac{1}{N H} \sum_{d,h} \Big[
+      \big(u_{d,h} - \ell_{d,h}\big)
+      + \tfrac{2}{\alpha}\big(\ell_{d,h} - y_{d,h}\big)\ind\{y_{d,h} < \ell_{d,h}\} \nonumber \\
+      &\hspace{6.2em}
+      + \tfrac{2}{\alpha}\big(y_{d,h} - u_{d,h}\big)\ind\{y_{d,h} > u_{d,h}\} \Big]
+\end{align}
+
+\noindent
+Point metrics use the median $\yhat_{0.50}$:
+\begin{align}
+  \mathrm{MAE}  &= \frac{1}{N H} \sum_{d,h} \big| \yhat_{d,h,0.5} - y_{d,h} \big| \\
+  \mathrm{RMSE} &= \sqrt{ \frac{1}{N H} \sum_{d,h} \big( \yhat_{d,h,0.5} - y_{d,h} \big)^2 } \\
+  \mathrm{MSE}  &= \frac{1}{N H} \sum_{d,h} \big( \yhat_{d,h,0.5} - y_{d,h} \big)^2 \\
+  \mathrm{MAPE} &= \frac{100}{N H} \sum_{d,h}
+                   \frac{\big| \yhat_{d,h,0.5} - y_{d,h} \big|}{\big| y_{d,h} \big|} \\
+  \mathrm{SMAPE} &= \frac{100}{N H} \sum_{d,h}
+                   \frac{2\,\big| \yhat_{d,h,0.5} - y_{d,h} \big|}
+                        {\big| \yhat_{d,h,0.5} \big| + \big| y_{d,h} \big|}
+\end{align}
+
+\noindent
+\textbf{Not reused from \texttt{qeval}.} Its \texttt{pinball}, \texttt{winkler} and
+\texttt{coverage\_report} all index into a module-level \texttt{QUANTILES = np.arange(1, 100)},
+so they can score a 99-level grid and nothing else --- including, in \texttt{winkler}, looking
+up the band by integer percentile. Every function here takes the levels as an argument instead,
+which is also what lets the same code score a dense grid when a reference CRPS is wanted.
+
+\medskip
+\noindent
+Units follow Sec.~\ref{sec:zspace}: everything above is on the z-scored target except MAPE and
+SMAPE, which are computed in physical units. A crossing-rate diagnostic is reported alongside;
+every model here sorts its output, so a non-zero value means a bug upstream rather than a
+property of the forecast.
+
+\medskip
+\noindent
+The test block reshapes to $(N, H)$ exactly --- no dataset has DST or missing steps, and the
+day-set rule of Sec.~\ref{sec:dayset} admits only complete days --- so per-step and per-day
+breakdowns fall out of the same array with no partial day to drop.
+
+% ============================================================================
+\section{Results}
+\label{sec:results}
+
+Test period, three seeds, mean and sample standard deviation (\texttt{ddof=1}). Pinball, MPIW,
+Winkler, MAE and RMSE are on the z-scored target; PICP is a fraction against a nominal 0.90;
+MAPE is a percentage in physical units. \texttt{CRPS-LOP} is Model A's CRPS-guided weighting,
+which is the paper's method --- the MAPE-guided, simple-average and best-individual rows it
+also reports are diagnostics and are in \texttt{test\_scores.csv}.
+
+\begin{center}
+\small
+\begin{tabular}{@{}l l l c c c c c c@{}}
+\toprule
+ & model & Pinball & PICP & MPIW & Winkler & MAE & RMSE & MAPE \\
+\midrule
+\texttt{spain} & CRPS-LOP & 0.0867 $\pm$ 0.0002 & 0.8826 & 1.2348 & 2.1218 & 0.3079 & 0.4903 & 4.82 \\
+ & iQRNN-500 & 0.1008 $\pm$ 0.0006 & 0.8441 & 1.3587 & 2.3612 & 0.3687 & 0.5325 & 5.83 \\
+\addlinespace
+\texttt{ercot} & CRPS-LOP & 0.1154 $\pm$ 0.0004 & 0.8598 & 1.6311 & 2.2960 & 0.4625 & 0.5710 & 18.92 \\
+ & iQRNN-500 & 0.0979 $\pm$ 0.0010 & 0.8358 & 1.3673 & 1.9799 & 0.3895 & 0.4863 & 15.32 \\
+\addlinespace
+\texttt{elia} & CRPS-LOP & 0.0573 $\pm$ 0.0002 & 0.8949 & 0.8701 & 1.2977 & 0.2139 & 0.3025 & 3.35 \\
+ & iQRNN-500 & 0.0433 $\pm$ 0.0003 & 0.9035 & 0.6930 & 0.9292 & 0.1670 & 0.2217 & 2.61 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Three things worth stating before these are quoted anywhere.
+
+\medskip
+\noindent
+\textbf{The two baselines do not agree on which is stronger.} Model B wins on \texttt{ercot}
+and \texttt{elia} and loses on \texttt{spain}. The \texttt{spain} loss lines up with the
+early-stopping problem in Sec.~\ref{sec:earlystop}, so it should not yet be read as a property
+of the method.
+
+\medskip
+\noindent
+\textbf{Model A's combination loses to its own best member on \texttt{ercot}} (CRPS 0.3234
+against 0.3143), while winning by about 4\% on the other two. The cause is visible in the
+period boundaries: \texttt{ercot}'s T3, where the weights are fitted, is 71 days of high
+summer, and T4 runs from late August into January. The weights are chosen on one season and
+applied across a change of season. \texttt{spain}'s T3 is 146 days spanning autumn and winter
+and \texttt{elia}'s is 374 days spanning a full year; both transfer. This is a consequence of
+\texttt{ercot}'s record being about two years long, not of the combination step.
+
+\medskip
+\noindent
+\textbf{\texttt{ercot}'s MAPE is not comparable with the other two.} Its target is NET load,
+whose test-period minimum is 0.353 of its median, so the denominator gets small where the
+other two never do. The z-unit MAE is 1.5x \texttt{spain}'s while the MAPE is 3.9x, and the gap
+between those ratios is the artefact. Quote SMAPE alongside it, or say that the target is net
+load.
+
+% ============================================================================
+\section{Known problems}
+
+\subsection{The forecast columns are shifted relative to their timestamps}
+\label{sec:align}
+
+\begin{codetiny}
+spain  total load forecast     lag 0   8.76%  ->  +24 steps    1.11%
+ercot  ERC_Load                lag 0   4.45%  ->  +24 steps    2.46%
+ercot  ERC_Wind                lag 0  70.32%  ->  +24 steps   17.25%
+ercot  ERC_Solar               lag 0  49.07%  ->  +24 steps   29.38%
+elia   Day-ahead 6PM forecast  lag 0  13.04%  ->  +24 steps (= 6 h)    2.63%
+elia   Week-ahead forecast     lag 0  15.24%  -> +168 steps (= 42 h)   2.94%
+elia   Most recent forecast    lag 0   1.92%  ->   +0 steps  (not shifted)
+\end{codetiny}
+
+\noindent
+It is the forecast columns and not the actuals that moved: \texttt{spain}'s summed generation
+correlates best with \texttt{total load actual} at lag 0 (0.8972, against 0.6335 at lag 24).
+On \texttt{elia} the shifts are 24 and 168 --- the \emph{hourly} lag constants applied to a
+15-minute series, giving 6 h and 42 h instead of 24 h and 168 h --- and \texttt{Most recent
+forecast} was not shifted at all, which an intentional scheme would not do.
+
+\medskip
+\noindent
+\textbf{Resolved as: leave it.} Per your instruction the columns are used at lag 0, unshifted.
+Running as configured is not a leak, only a degradation, and the cost lands hardest on
+\texttt{ercot}, whose target is \textbf{net load} and whose wind and solar day-ahead forecasts
+are its main exogenous signal. This affects Models B and C only --- Model A uses no exogenous
+column at all, so it is unaffected either way. The probe and the per-column shift map are
+therefore deferred with the rest of the column-class machinery.
+
+\subsection{Model A's combination may not beat its best member}
+\label{sec:combloss}
+
+Open, and the first thing to look at once Model A runs. On the PJM port of this same paper the
+CRPS-guided combination \emph{lost} to the best individual base model, with all fifteen weights
+non-zero, none above 0.20, and a result within 0.2\% of the simple average --- the signature of
+a QP sitting on a flat or local solution rather than of a real finding, since the paper's whole
+claim is that $w_i = 0$ drops models.
+
+\medskip
+\noindent
+That was never diagnosed. It matters here because the convexity certificate
+described above is computed on every run: if it comes back positive, the solution
+is global and a flat weight vector is genuinely what the data says; if it comes back negative,
+the multi-start is the only defence and the result should not be trusted without more starts.
+
+\medskip
+\noindent
+\texttt{spain} is the clean test, because its lag list is the paper's verbatim --- if the
+combination underperforms \emph{there}, the cause is the implementation, not the adaptation.
+
+\subsection{iQRNN stops after three to five epochs on \texttt{spain} and \texttt{ercot}}
+\label{sec:earlystop}
+
+Open. With \texttt{stop\_patience} at 20, runs that end at epoch 23--25 had their best
+validation score around epoch 3--5. On \texttt{spain} an epoch is 124 batches, so the network
+saw roughly 600 updates. \texttt{elia} trains for 58--61 epochs and scores far better relative
+to Model A (pinball 0.0433 against 0.0573) where \texttt{spain} scores worse (0.1008 against
+0.0867), which is consistent with the two small datasets stopping before they have converged
+rather than after.
+
+\subsection{\texttt{ercot} has 9{,}984 training samples against the paper's 42{,}984}
+\label{sec:ercotsize}
+
+The $103 \rightarrow 500 \rightarrow 500$ network carries ${\sim}350$k parameters. The paper's
+own size sweep found 500 sufficient at 43k samples; 200--300 is probably right here. A short
+width sweep on the validation block before fixing the number is cheap (\texttt{ercot} trains in
+${\sim}25$ s per run).
+
+\subsection{The three datasets do not pose the same task}
+
+\texttt{elia}'s \texttt{known\_cols} contains the official day-ahead load forecast;
+\texttt{spain}'s and \texttt{ercot}'s do not (\texttt{spain}'s \texttt{total load forecast} is
+excluded from both lists, which looks deliberate --- including it would reduce the task to
+copying the TSO). \texttt{elia}'s scores will look better and part of that is the TSO's, not
+the model's. Printed in each dataset's output header.
+
+\subsection{Feature sets are not symmetric across models}
+
+Following each paper, density gets no exogenous variables at all (Li's explicit design
+choice), while iQRNN's pool does --- so on \texttt{elia} iQRNN sees the official forecast and
+density does not. Faithful, but it needs saying in the results. The alternative, giving all
+three the same feature set, would take density away from its published specification.
+
+% ============================================================================
+\section{Build order and status}
+\label{sec:status}
+
+Each step ends with something checkable, so a mistake in the data layer surfaces before the
+models are built on it. Density first because it is the only one of the three that needs no
+conceptual adaptation on \texttt{spain} --- it is the cleanest test that the data layer is
+right.
+
+\begin{tabularx}{\textwidth}{@{}c p{4.6cm} c L@{}}
+\toprule
+ & deliverable & state & evidence \\
+\midrule
+1 & \texttt{src/bench/data.py}
+  & \textbf{done}
+  & day counts reproduce the chapter's table exactly for all three datasets; grid regularity checked on load \\
+2 & \texttt{src/bench/metrics.py}
+  & \textbf{done}
+  & pinball agrees with the max-of-two-branches definition to machine precision \\
+3 & \texttt{src/bench/density.py}, \texttt{train\_bench\_density.py}
+  & \textbf{done}
+  & contract tests pass; run on all three datasets, 3 seeds each \\
+4 & \texttt{src/bench/iqrnn.py}, \texttt{train\_bench\_iqrnn.py}
+  & \textbf{done}
+  & run on all three datasets, 3 seeds each \\
+5 & \texttt{qra.py} & \textbf{dropped} & Sec.~\ref{sec:qradropped} \\
+6 & \texttt{plots.py}, scoreboard & not started & --- \\
+\bottomrule
+\end{tabularx}
+
+\medskip
+\noindent
+First run should start small to shake out runtime faults before paying for the slow families:
+
+\begin{code}
+PYTHONPATH=. python3 scripts/train_bench_density.py --dataset spain --seeds 0 \
+        --models XGB1 XGB2 --workers 2
+\end{code}
+
+\noindent
+This skips GPR, which is the expensive member --- an ARD kernel with one length scale per
+feature, fitted on a 2000-point subsample --- and the networks, whose 120 epochs over
+\texttt{elia}'s 214{,}944 training steps is the largest single cost in the port.
+
+% ============================================================================
+\section{Contract tests}
+\label{sec:tests}
+
+\texttt{test/test\_bench\_density.py}, in the style of
+\texttt{test/test\_qrnn\_features.py} --- five things that would produce a plausible-looking but
+wrong table rather than raise. \textbf{All five pass.}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+  \item \textbf{day set} --- \texttt{(train, val, test)} day counts equal the chapter's
+        $869/292/291$, $416/142/140$, $2239/748/746$ for the three datasets;
+  \item \textbf{lag window} --- every lag lies inside Eq.~\eqref{eq:window} on all three
+        datasets, and at least ten survive;
+  \item \textbf{lag alignment} --- every \texttt{lag\{k\}} column equals the target series at
+        exactly $k$ steps earlier, and no lag taken from the target day's first step reaches
+        past the forecast deadline;
+  \item \textbf{pinball} --- equals
+        $\max\{\tau(y - \yhat),\,(\tau-1)(y - \yhat)\}$ elementwise, to machine precision;
+  \item \textbf{no crossing} --- the mixture quantiles at $\{0.05, 0.50, 0.95\}$ are strictly
+        increasing, so the grid inversion is fine at three levels as it was at ninety-nine.
+\end{enumerate}
+
+\medskip
+\noindent
+Two tests from the draft are gone with the code they covered: the lazy-matrix equivalence test
+(no lazy matrix) and the \texttt{qeval} agreement test (\texttt{qeval} is replaced, not reused,
+so agreeing with it is not the property wanted --- agreeing with the \emph{definition} is).
+
+\end{document}

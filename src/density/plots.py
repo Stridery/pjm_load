@@ -2,7 +2,7 @@
 
     PJM_DATASET=dom python -m src.density.plots
 
-Reads only what train_density.py wrote under results/{zone}/density/, so it restyles without
+Reads only what scripts/train_density.py wrote under results/{zone}/density/, so it restyles without
 refitting. Style helpers, palette and the generic probabilistic figures come from
 src.quantile.plots: the three baselines are read side by side, so they are drawn by one set
 of rules rather than three.
@@ -166,7 +166,7 @@ def main():
     import src.config as cfg
     d, zone = cfg.DENSITY_CONFIG['result_dir'], cfg.DATASET
     if not os.path.exists(os.path.join(d, 'test_scores.csv')):
-        raise SystemExit(f"No results in {d} — run train_density.py first.")
+        raise SystemExit(f"No results in {d} — run scripts/train_density.py first.")
 
     tbl = pd.read_csv(os.path.join(d, 'test_scores.csv'))
     plot_scoreboard(tbl, zone, os.path.join(d, 'scoreboard.png'))
@@ -198,7 +198,7 @@ def main():
         plot_monthly(p_mth, zone, os.path.join(d, 'monthly.png'),
                      colors=[_hue(c) for c in cols])
     else:
-        print("  (pinball_by_quantile / monthly not present — re-run train_density.py)")
+        print("  (pinball_by_quantile / monthly not present — re-run scripts/train_density.py)")
 
 
 if __name__ == '__main__':

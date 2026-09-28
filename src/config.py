@@ -179,8 +179,8 @@ CONGESTION_CONFIG = {
     #
     # Overridable per run, like PJM_DATASET, so an A/B needs no file edit (and cannot be left
     # flipped by accident):
-    #     PJM_CONGESTION=0 python Model_Training.py
-    #     PJM_CONGESTION=1 python Model_Training.py
+    #     PJM_CONGESTION=0 python scripts/Model_Training.py
+    #     PJM_CONGESTION=1 python scripts/Model_Training.py
     'enabled': _CONGESTION,
 
     # The trailing-mean windows the departures are taken against live in
@@ -291,7 +291,7 @@ CRAWLER_CONFIG = {
 
     # Location name passed to Open-Meteo Geocoding API — resolved from the dataset,
     # so `PJM_DATASET=dom` fetches Richmond, not Baltimore. Override with the
-    # OPENMETEO_LOCATION env var or run_crawler.py's --location flag.
+    # OPENMETEO_LOCATION env var or scripts/run_crawler.py's --location flag.
     'location_name': os.environ.get('OPENMETEO_LOCATION', _ZONE_LOCATION.get(DATASET, 'Baltimore')),
 
     # IANA timezone string for Open-Meteo requests and timezone alignment.
@@ -342,13 +342,17 @@ TRAIN_CONFIG = {
     'moe_mstnn_residual':  1,
     'moe_lstm':            1,
     'moe_lstm_residual':   1,
-    'archformer':          1,
-    'archformer_residual': 1,
+    'archformer':               1,
+    'archformer_residual':      1,
+    'archformer_hp':            1,
+    'archformer_hp_residual':   1,
+    'archformer_skip':          1,
+    'archformer_skip_residual': 1,
 }
 
 # Per-run override: train ONLY these models, comma-separated, everything else skipped.
-#     PJM_TRAIN_ONLY=transformer_residual python Model_Training.py
-#     PJM_TRAIN_ONLY=residual python Model_Training.py        # every *_residual model
+#     PJM_TRAIN_ONLY=transformer_residual python scripts/Model_Training.py
+#     PJM_TRAIN_ONLY=residual python scripts/Model_Training.py        # every *_residual model
 # For probing one change on one model without editing (and having to restore) the dict above
 # — the A/B of the congestion block being the case in point. Unknown names are rejected here
 # rather than silently training nothing, which is what a typo would otherwise look like.
@@ -498,6 +502,30 @@ TRANSFORMER_PARAMS = {
 # --- MoE Transformer (shares the same 3D matrix + feature config as Transformer) ---
 # Shared encoder + 8 regime expert heads (see REGIME_MAP). Reuses the transformer
 # feature config for splitting; only the head/routing differs.
+# --- Soft-gated MoE -------------------------------------------------------------------------
+# Same encoder as the vanilla transformer, same feature arm, same recipe. The ONLY difference
+# from TRANSFORMER_PARAMS is the output head: n_experts full-width heads combined by a learned
+# softmax gate, instead of one MLP. That makes it a controlled comparison against both the
+# plain transformer (does a mixture help at all) and moe_transformer (does learning the route
+# beat imposing it from the calendar).
+#
+# n_experts 4, not 12. The soft gate does not split the data, so more experts is not the same
+# hazard it is for RegimeHead -- but each expert still needs enough distinct gradient to become
+# distinct, and with 1461 days there is no case for starting large.
+#
+# balance_weight is the load-balancing term's coefficient. Shazeer uses 1e-2 on much larger
+# batches; at batch_size 32 the per-batch gate mass is noisy, so a smaller weight avoids the
+# balance term fighting the forecast loss over what is mostly sampling noise.
+SMOE_TRANSFORMER_FEATURE_CONFIG = dict(TRANSFORMER_FEATURE_CONFIG)
+
+SMOE_TRANSFORMER_PARAMS = {
+    **{k: v for k, v in TRANSFORMER_PARAMS.items()},
+    'n_experts': 4,
+    'gate_noise': 0.1,          # training-only exploration on the gate logits
+    'balance_weight': 1e-3,     # 0 turns load balancing off
+    'expert_fc_hidden': 128,    # each expert is the same width the plain head was
+}
+
 MOE_TRANSFORMER_FEATURE_CONFIG = {
     **TRANSFORMER_FEATURE_CONFIG,
     'test_frac': 0.16,   # last ~1 year  = out-of-time test  (all seasons, dom: 2025-05→2026-05)
@@ -572,13 +600,21 @@ MSTNN_PARAMS = {
 #     weight_decay 0    his optim.Adam has none, so AdamW must not add any
 #     batch_size 32     his run_point_forecast.py default
 #
-# EPOCHS IS THE ONE DEPARTURE, and it is deliberate. His config says 50; the other six neural
-# models here run to 200 with early stopping and in practice stop between 87 and 106. Training
-# this one for half as long and then reporting the gap as an ARCHITECTURE difference would be
-# measuring the schedule instead of the model. 100 puts it inside the same band, and
-# early_stop_patience is now 50 like every other sequence model rather than pinned to `epochs`
-# where it could never fire. Keeping the BEST-validation checkpoint is also this repo's
-# addition: his trainer computes best_val_loss but leaves the save commented out.
+# THE SCHEDULE IS THE ONE DEPARTURE, and it is deliberate. His config is 50 epochs with no
+# early stopping; the other six nets here run to 200 with patience 50 and stop at 87-106.
+#
+# Measured on _cong, direct, one seed: this model's validation loss peaks at epoch 13 and
+# then flattens for the next fifty. 505k parameters on 1461 training samples overfits fast
+# -- the vanilla Transformer, at 120k, holds out to epoch 41. So a long budget buys nothing
+# here, and what matters is that early stopping can actually FIRE: with patience == epochs
+# it never could, and every run burned the full schedule regardless.
+#
+# 50 with patience 15 keeps the same patience/epochs ratio the other nets use (50/200), lets
+# each variant stop when IT stops improving, and roughly halves the sweep. Note the two
+# reduced variants carry a THIRD fewer parameters, so they may well peak later than 13 --
+# that is the reason the cap is 50 and not the 20-30 the baseline alone would justify.
+# Keeping the BEST-validation checkpoint is also this repo's addition: his trainer computes
+# best_val_loss but leaves the save commented out.
 #
 # NOTE this model gets no static skip: all C channels go into the PatchTokenizer,
 # which is what upstream does. n_seq_features is therefore deliberately absent.
@@ -599,16 +635,161 @@ ARCHFORMER_PARAMS = {
     # Variance-consistency weight from ArchFormer3Trainer. 0 turns the sigma path's
     # supervision off, which is the ARCHFormer2 behaviour on identical weights.
     'lambda_cons': 0.1,
-    'epochs': 100,                  # NOT his 50 -- matched to the other nets' 87-106
+    'epochs': 50,                   # validation peaks at ~13; see the note above
     'batch_size': 32,
     'learning_rate': 2e-3,
     'weight_decay': 0.0,
-    'early_stop_patience': 50,      # same as every other sequence model
+    'early_stop_patience': 15,      # MUST be < epochs or it can never fire
+    # How many seeds `scripts/bench_seeds.py` trains, and how many nets the ensemble it reports
+    # averages. Here rather than on the command line because the 5-net ensemble is the
+    # configuration that wins -- 2.993 MAPE against 3.280 for the seed mean and 3.022 for the
+    # best single-seed transformer_residual -- so the count is a property of the model, not of
+    # one measurement. The CLI can still override it for a quick run.
+    'n_seeds': 5,
+}
+
+# --- The two tuned variants ---------------------------------------------------------------
+# Shipped ALONGSIDE the baseline, never instead of it. All three carry the author's
+# ARCHITECTURE untouched -- d_model 64, patch_len 24, 2+2 layers, intermediate_dim 32,
+# lambda_cons 0.1. What the variants change is the TRAINING RECIPE, and in skip's case where
+# the static block enters.
+#
+# WHY THE RECIPE AND NOT THE ARCHITECTURE
+# A first attempt shrank the model instead, on the theory that 505k parameters over-fit 1461
+# training samples -- its validation loss peaks at epoch 8. That theory was wrong and the
+# measurement says so: cutting the parameters by a third (patch_len 24 -> 6) made it WORSE,
+# 3.46% against 3.30%, and the baseline's best validation loss was already lower. The reason
+# was the step size, not the capacity: the validation curve bounced rather than descended
+# (0.2601 -> 0.2163 -> 0.2008 -> 0.2299), which is what too high a learning rate looks like.
+#
+# It over-fits as well, and fast -- that part of an earlier note here was wrong. A per-epoch
+# train/validation trace on the tuned recipe (dom _cong, residual, seed 0) reads:
+#
+#     epoch  1   train 0.1263   val 0.1526
+#     epoch 21   train 0.0325   val 0.0942   <- best
+#     epoch 60   train 0.0086   val 0.1188
+#
+# Training loss goes to nearly zero against 1461 samples and 504,725 parameters, and validation
+# turns up after ~epoch 21. Early stopping restoring the best checkpoint is what makes this
+# survivable, which is why removing it costs 0.15 pp -- see results/dom/_tuning/README.md.
+#
+# Four knobs differ from every other net in this repo, all toward less regularisation and a
+# more aggressive step, and a one-at-a-time sweep (scripts/tune_archformer.py --group 3, dom _cong,
+# residual) found that NONE of them helps alone -- only the combination does:
+#
+#     his mse / 2e-3 / wd 0    / dr 0.1    MAPE 3.303   peak 3.772
+#     huber only                           MAPE 3.482   peak 3.812
+#     lr 3e-4 only                         MAPE 3.298   peak 4.134
+#     dropout 0.3 only                     MAPE 3.244   peak 4.013
+#     wd 1e-4 only                         MAPE 3.800   peak 4.233
+#     the repo's full recipe (lr 3e-4)     MAPE 3.299   peak 4.117   <- best epoch 9, underfit
+#     huber / 5e-4 / wd 1e-4 / dr 0.2      MAPE 3.097   peak 3.666   <- both best
+#
+# Regularisation only pays once the step is small enough to stop bouncing, and the repo's own
+# 3e-4 is too small for this architecture -- with dropout 0.3 it underfits. 5e-4 with dropout
+# 0.2 is the middle setting that won both metrics.
+#
+# CONFIRMED ON dom, NOT ON bge (scripts/bench_seeds.py, _cong arm, 5 seeds, seeds 42-46). The
+# one-at-a-time sweep that found these values was a single seed and stood only as a direction;
+# repeating it on both zones settles it on one of them and leaves it open on the other:
+#
+#                    hp (this recipe)   baseline (his)   difference   Welch p
+#   dom  residual    3.274 +/- 0.115    3.569 +/- 0.151    0.295 pp    0.009
+#   dom  direct      3.965 +/- 0.198    4.313 +/- 0.219    0.349 pp    0.030
+#   bge  residual    4.798 +/- 0.171    4.878 +/- 0.102    0.080 pp    0.40
+#   bge  direct      4.619 +/- 0.069    5.290 +/- 1.012    0.672 pp    0.21
+#
+# On dom the gap is ~2.5x the seed sd in both modes: the recipe, not luck. On bge it is not
+# established -- residual moves 0.080 pp, a third of dom's, and direct moves more but against a
+# baseline whose sd is 1.012 (one seed lands at 7.084), so the mean being compared against is
+# not a stable quantity. The recipe is demonstrated on dom and unresolved on bge; it is not
+# worse there. What holds on BOTH zones is the seed ensemble: 0.23-0.60 pp wherever measured.
+# Five seeds x three checkpoint policies, dom _cong residual (2026-09-25):
+#
+#     60ep + patience 15, restore val-argmin   mean 3.280  sd 0.115  5-seed ens 2.993
+#     fixed 20ep, no early stop, final weights mean 3.431  sd 0.145  5-seed ens 3.172
+#     fixed 30ep, no early stop, final weights mean 3.429  sd 0.098  5-seed ens 3.167
+#
+# Removing early stopping costs 0.15 pp. Best epochs land at 3/6/9/19/21, so an early best is
+# this model overfitting fast, not early stopping firing prematurely -- at a fixed 20 epochs a
+# seed whose optimum was epoch 3 has spent 17 epochs past it. 20 and 30 score the same because
+# validation rises off the optimum and then plateaus, which also means no fixed budget is worth
+# searching for. Hence patience comes DOWN rather than off: the optimum can arrive by epoch 3,
+# and 15 epochs of grace after it is 15 epochs of nothing.
+#
+# The seed spread does NOT come from checkpoint selection -- sd is 0.115/0.145/0.098 across the
+# three policies, no ordering. It is initialisation and batch order, and only ensembling
+# touches it: 5 seeds average to 2.993, below every single-seed transformer_residual run
+# (3.022-3.093, mean 3.065).
+#
+# patience 5 was then tried and REVERTED (seed 0, dom _cong residual):
+#     patience 15   MAPE 3.103   peak 3.340   best epoch 21, stopped at 36
+#     patience  5   MAPE 3.470   peak 3.916   best epoch  8, stopped at 13
+# The optimum can arrive at epoch 3 on one seed and epoch 21 on another, and which it will be
+# is not knowable in advance. Patience buys that uncertainty; shortening it makes the run miss
+# a late optimum entirely. 15 stays.
+_ARCHFORMER_TUNED = {
+    'loss': 'huber', 'huber_delta': 1.0,
+    'learning_rate': 5e-4,
+    'weight_decay': 1e-4,
+    'dropout': 0.2,
+}
+
+# hp: the author's architecture, this dataset's training recipe. The only difference from the
+#     baseline is the four knobs above -- same 504,725 parameters, same forward pass.
+ARCHFORMER_HP_PARAMS = {
+    **ARCHFORMER_PARAMS,
+    **_ARCHFORMER_TUNED,
+}
+
+# skip: the same recipe, plus the static block routed past the patch tokenizer to its own
+#     out_dim head (see src/models/archformer.py). That cuts the tokenizer's input from
+#     24 x C to 24 x n_seq, so the compression it performs drops from ~28:1 to ~8:1 -- which
+#     means the recipe tuned ON the 28:1 model is not necessarily right for this one. Treat
+#     these four values as a starting point and re-run `--group 3` against this variant
+#     before trusting them.
+# skip's own recipe. NOT hp's: the two are different optimisation problems, and one of the
+# differences is structural rather than a matter of degree.
+#
+#   the shortcut.  Routing the statics to their own head makes them an ADDITIVE path two
+#       layers deep, against ten-odd transformations on the main path. Short paths fit first.
+#       If the statics -- which include the 24 hourly forecast-weather departures, the
+#       strongest single block in the feature set -- are absorbed by that head early, the
+#       GARCH machinery never has to learn anything, and the variant would post a decent
+#       number while measuring nothing about the architecture. Hence a lower step (3e-4
+#       rather than hp's 5e-4) and a heavier dropout on the shortcut alone (0.3).
+#   less to regularise.  The main path carries 347k parameters against 504k, and its
+#       tokenizer compresses 8:1 rather than 28:1. Its own dropout comes DOWN to 0.15.
+#   huber stays.  That choice is about the target's outlier days, not about the wiring.
+#
+# DESIGNED, NOT MEASURED. hp's four values came out of a one-at-a-time sweep on the baseline;
+# these are reasoned from what changed and have not been swept. The obvious first check is
+# whether 3e-4/0.3 is over-correcting -- the broken first version of this variant underfit
+# badly, so erring toward regularisation deserves a look before it is trusted:
+#     python scripts/tune_archformer.py --group 3 --mode residual     (then compare against this row)
+ARCHFORMER_SKIP_PARAMS = {
+    **ARCHFORMER_PARAMS,
+    'loss': 'huber', 'huber_delta': 1.0,
+    'learning_rate': 3e-4,
+    'weight_decay': 1e-4,
+    'dropout': 0.15,
+    'static_dropout': 0.3,
+    'n_seq_features': N_SEQ_FEATURES,
 }
 
 ARCHFORMER_RESIDUAL_PARAMS = {
     **ARCHFORMER_PARAMS,
     'baseline': 'hourly',   # same as _RESIDUAL_BASELINE below
+}
+
+ARCHFORMER_HP_RESIDUAL_PARAMS = {
+    **ARCHFORMER_HP_PARAMS,
+    'baseline': 'hourly',
+}
+
+ARCHFORMER_SKIP_RESIDUAL_PARAMS = {
+    **ARCHFORMER_SKIP_PARAMS,
+    'baseline': 'hourly',
 }
 
 # --- LSTM Feature Generation (shares the same 3D matrix as Transformer) ---
@@ -701,6 +882,11 @@ TRANSFORMER_RESIDUAL_PARAMS = {
     'baseline': _RESIDUAL_BASELINE,
 }
 
+SMOE_TRANSFORMER_RESIDUAL_PARAMS = {
+    **SMOE_TRANSFORMER_PARAMS,
+    'baseline': _RESIDUAL_BASELINE,
+}
+
 LSTM_RESIDUAL_PARAMS = {
     **LSTM_PARAMS,
     'baseline': _RESIDUAL_BASELINE,
@@ -735,126 +921,10 @@ MOE_LSTM_RESIDUAL_PARAMS = {
 }
 
 # ---------------------------------------------------------------------------
-# Probabilistic baselines — Xie & Hong (2018), IEEE TSG 9(3):1680-1687
-# ---------------------------------------------------------------------------
-# Temperature scenarios fed to an MLR point model, scored with the pinball loss. Driven by
-# train_quantile.py; shares NOTHING with the point-model stack above except the cleaned CSV
-# (no matrix cache, no scalers, no src/models registry — see src/quantile/__init__.py).
-QUANTILE_CONFIG = {
-    # Which of the paper's three MLR specifications to run (1 = run, 0 = skip).
-    #
-    # Vanilla is the shipped baseline, and it is the only one of the three that can be
-    # claimed as a reproduction: it is the GEFCom2012 benchmark model, with a frozen
-    # published specification the paper notes was "later reproduced by other scholars".
-    #   hong2014 - the paper states its variable list "may change from year to year
-    #              depending on the validation dataset that is used for the model selection
-    #              process", so there is no specification to reproduce; ours is an invented
-    #              instantiation. It scores within 0.5% of Vanilla either way.
-    #   tcube    - is literally GSP + poly3(T), and no PJM zone has a state-product series,
-    #              so substituting the linear Trend replaces HALF the model (in Vanilla the
-    #              same substitution is one term among 285 columns).
-    # Both were run before being switched off and reproduce the same qualitative findings
-    # (optimum at the same n, same shifted-date gain, bootstrap no better than fixed-date);
-    # their results are kept under results/{zone}/quantile/ as evidence. Flip to 1 to re-run.
-    'models': {'tcube': 0, 'vanilla': 1, 'hong2014': 0},
-
-    # Tail split on HOURLY rows, snapped back to an EPT day boundary so the per-day plots
-    # have no partial day at either end. 0.16 matches the point models, so the probabilistic
-    # baselines are scored on the same test period.
-    'test_frac': 0.16,
-
-    # Length of the estimation window ending at the split, in years (None = everything
-    # before the split). 3 is the paper's fixed rolling-window length, and on DOM it also
-    # matters a lot: the models carry growth in ONE linear Trend term (we have no GSP index
-    # to stand in for the paper's macroeconomic driver), so a longer window averages the
-    # zone's accelerating data-centre growth and under-forecasts the recent peaks. Measured
-    # on dom: perfect-weather MAPE 3.28% at 3 y vs 3.68% on the full 4.66 y, and mean error
-    # at the top decile +836 MW vs +1095 MW.
-    'train_years': 3,
-
-    # Scenario pool: complete calendar years of observed temperature that end strictly
-    # BEFORE the test period starts (the paper keeps 1976-2005 clear of its 2006-2011 test
-    # years). None = use every year that qualifies.
-    #
-    # Temperature is read from data/{zone}/raw/weather_long/ when that exists (run
-    # fetch_scenario_weather.py; ERA5 reaches back to 1940), otherwise it falls back to the
-    # cleaned CSV, which caps the pool at k=4. The long store is what makes the paper's
-    # central results reachable at all: its findings are functions of k over 1..30, and four
-    # points cannot show a curve flattening at fifteen. Verified to be the same series as the
-    # cleaned CSV — 35,060 overlapping hours agree to within 1e-6. Note the pool spans a
-    # warming climate (+0.85 F/decade at Richmond, +0.76 at Baltimore), so its oldest profiles
-    # run ~2.5 F cool; the paper assigns past temperatures date-by-date with no such
-    # adjustment and this follows it.
-    'scenario_years': None,
-
-    # Which k the grid is computed on. The n=0 column (fixed-date) is swept over EVERY
-    # available k, which is cheap and reproduces the paper's Fig. 2/3; the full k x n grid is
-    # restricted to the paper's own Table I columns, because a 30 x 41 grid spends most of its
-    # time sorting ensembles of thousands of scenarios for cells nobody reports.
-    'k_grid_shifted': [1, 2, 3, 4, 5, 10, 20, 30],
-
-    # Shifted-date sweep. The paper's rule of thumb is n = ceil(30/k - 1) — 7 for k=4, 29
-    # for k=1 — but the point of the grid is not to hardcode it: sweep 0..n_max and read the
-    # optimum off the result (its Table III). 40 covers the full range of its Table I,
-    # including the k=1 rule-of-thumb cell, and the sweep is cheap (the cost is the scenario
-    # cube, which is built once).
-    'n_max': 40,
-
-    # Block bootstrap: m and l in the paper's notation.
-    'bootstrap_block_days': 9,
-    'bootstrap_scenarios': 100,
-
-    'random_state': 42,
-    'result_dir': f'{RESULT_ROOT}/quantile',
-}
-
-
-# ---------------------------------------------------------------------------
-# Probabilistic baseline 2 — Liu, Nowotarski, Hong & Weron (2017), IEEE TSG 8(2):730-737
-# ---------------------------------------------------------------------------
-# Sister point forecasts -> quantile regression averaging. Driven by train_qra.py. Parallel
-# to QUANTILE_CONFIG in every structural respect: same one input (the cleaned CSV), no matrix
-# cache, no src/models registration, invisible to serving.
-QRA_CONFIG = {
-    'test_frac': 0.16,      # same tail split, so both baselines score the same test period
-    'val_days': 365,        # validation year: selects the recency orders, m, and L
-
-    # Sisters: `sisters_per_window` recency orders per estimation window (2 y and 3 y) = 8,
-    # chosen off a (lag, dma) grid by validation MAE. See src/quantile/sisters.py for why the
-    # orders are selected directly rather than via [26]'s four calibration schemes.
-    'sisters_per_window': 4,
-    'max_lag': 3,
-    'max_dma': 3,
-
-
-    'm_grid': [2, 3, 4, 5, 6, 7, 8],       # how many sisters QRA averages over
-
-    # QRA calibration windows, in days. The paper sweeps 91/122/183/365; 365 CANNOT fit this
-    # record and is dropped rather than faked. A 365-day window in front of a 365-day
-    # validation year pushes the earliest sister forecast to 2023-08, whose own 3-year
-    # estimation window would start 2020-08 — four months before the data begins. Keeping the
-    # full validation year and capping L at 183 is the better of the two trims: a half-year
-    # validation would select m and L on a seasonally lopsided sample, then apply them across
-    # a full test year.
-    'L_grid': [91, 122, 183],
-
-    # Refit cadence, in days. The paper re-estimates everything daily; 1 reproduces that.
-    # The validation sweep runs 21 (m, L) combinations, so it gets a coarser cadence — the
-    # weights barely move when a 183-day window slides by one day, and this is model
-    # SELECTION, not the reported result.
-    'sister_refit_every': 1,
-    'qra_refit_every_val': 7,
-    'qra_refit_every_test': 1,
-
-    'result_dir': f'{RESULT_ROOT}/qra',
-}
-
-
-# ---------------------------------------------------------------------------
-# Probabilistic baseline 3 — Li, Wang & Zhang (2020), IEEE TSG 11(2):1679-1690
+# Probabilistic baseline 1 — Li, Wang & Zhang (2020), IEEE TSG 11(2):1679-1690
 # ---------------------------------------------------------------------------
 # Fifteen base density models -> a Gaussian mixture whose weights minimise the CRPS, solved
-# as a small quadratic program. Driven by train_density.py. Same isolation as the other two
+# as a small quadratic program. Driven by scripts/train_density.py. Same isolation as the other two
 # baselines: one input (the cleaned CSV), no matrix cache, no src/models registration.
 DENSITY_CONFIG = {
     'test_frac': 0.16,        # same tail split as the other two, so T4 is the shared test set
@@ -880,10 +950,10 @@ DENSITY_CONFIG = {
 
 
 # ---------------------------------------------------------------------------
-# Probabilistic baseline 4 — Zhang, Quan & Srinivasan (2019), IEEE TSG 10(4):4425-4434
+# Probabilistic baseline 2 — Zhang, Quan & Srinivasan (2019), IEEE TSG 10(4):4425-4434
 # ---------------------------------------------------------------------------
 # One neural network trained on the summed pinball loss emits all 99 percentiles at once.
-# Driven by train_qrnn.py. Same isolation as the other three baselines: one input (the
+# Driven by scripts/train_qrnn.py. Same isolation as the other three baselines: one input (the
 # cleaned CSV), no matrix cache, no src/models registration, invisible to serving.
 QRNN_CONFIG = {
     'test_frac': 0.16,      # same tail split, so all four baselines score the same hours
@@ -1048,7 +1118,7 @@ JOINT_EVAL_CONFIG = {
 }
 
 # ---------------------------------------------------------------------------
-# Foundation models (zero-shot, pre-trained elsewhere) — run_foundation.py
+# Foundation models (zero-shot, pre-trained elsewhere) — scripts/run_foundation.py
 # ---------------------------------------------------------------------------
 # A pre-trained univariate forecaster is handed the recent Load_Estimated history and asked
 # for the target day directly. Nothing is fitted on this data, so there is no train step and

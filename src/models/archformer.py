@@ -73,10 +73,17 @@ class ARCHFormerNet(nn.Module):
             f"lookback_hours={lookback} must be divisible by patch_len={patch_len}"
 
         self.lambda_cons = float(params.get('lambda_cons', 0.1))
+
+        # Static skip, OFF by default so the shipped configuration stays the author's.
+        # n_seq_features splits the tensor the way the other six nets split it: the
+        # time-varying channels go through the patch tokenizer, the broadcast constants go
+        # straight to the head. See _StaticProjectionHead for the measurement behind it.
+        self.n_seq = int(params.get('n_seq_features') or num_features)
+        self.n_static = num_features - self.n_seq
         self.net = ARCHFormer3(
             seq_length_enc=lookback,
             seq_length_dec=params.get('seq_length_dec', lookback),
-            num_features=num_features,
+            num_features=self.n_seq,
             patch_len=patch_len,
             d_model=params['d_model'],
             num_heads=params['num_heads'],
@@ -86,10 +93,43 @@ class ARCHFormerNet(nn.Module):
             out_len=params['out_dim'],
             dropout=params['dropout'],
         )
+        # The static path is a SEPARATE head that emits all out_dim hours, added to the
+        # network's own output. It is not folded into FinalProjectionHead, and that is the
+        # whole point: that head is Linear(C -> 1) applied per position, so a static value
+        # concatenated there contributes the SAME scalar at all 168 positions -- 54 features,
+        # including the 24 hourly forecast-weather departures that carry the target day's
+        # shape, collapse into one number. Measured: with the sequence path zeroed, the
+        # static contribution had std 0.0 across the 24 hours, and the model then underfit
+        # (train loss 0.29 against the baseline's 0.14). Emitting out_dim gives every static
+        # its own weight on every hour, which is what the other six sequence models do.
+        #
+        # Deliberately NOT added to sigma_sq: the variance head stays the author's, and the
+        # vendored FinalProjectionHead is used unmodified for both paths.
+        if self.n_static > 0:
+            fc_hidden = params.get('fc_hidden', 128)
+            # Its OWN dropout, defaulting to the main path's. The static head is an additive
+            # SHORTCUT: two layers from the statics straight to the 24 outputs, against ten-odd
+            # transformations on the main path (tokenizer -> 2 encoder layers -> bridge ->
+            # 2 decoder layers -> inverse tokenizer -> head). Gradient descent fits the short
+            # path first, and if it absorbs enough of the signal the GARCH machinery never has
+            # to learn anything -- the variant would score well while measuring nothing about
+            # the architecture under test. Handicapping the shortcut is the cheapest guard.
+            self.static_head = nn.Sequential(
+                nn.Linear(self.n_static, fc_hidden),
+                nn.ReLU(),
+                nn.Dropout(float(params.get('static_dropout', params['dropout']))),
+                nn.Linear(fc_hidden, params['out_dim']),
+            )
         self._sigma_sq = None
 
     def forward(self, x):
+        static = None
+        if self.n_static > 0:
+            static = x[:, 0, self.n_seq:]          # constant along t by construction
+            x = x[:, :, :self.n_seq]
         y_hat, sigma_sq = self.net(x)
+        if static is not None:
+            y_hat = y_hat + self.static_head(static)
         # Stashed rather than returned: every caller in this repo expects a single
         # tensor, and a tuple would have to be unpacked in the trainer, the
         # evaluator, the residual factory and the serving path alike.
@@ -122,58 +162,82 @@ class ARCHFormerNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Variant factory
 # ---------------------------------------------------------------------------
-
-def train(X_3d, y_3d, mask_3d, params=None, feature_cfg=None, dataset=None):
-    print("\n--- Training GARCHFormer (ARCHFormer3) ---")
-    train_sequence(
-        ARCHFormerNet, MODEL_TYPE, FILENAME,
-        X_3d, y_3d, mask_3d,
-        params or ARCHFORMER_PARAMS,
-        feature_cfg or ARCHFORMER_FEATURE_CONFIG,
-        dataset,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
-def predict(model_path, X_np, params):
-    """Load a saved model and return scaled predictions (N, out_dim)."""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    params = params or ARCHFORMER_PARAMS
-    model = ARCHFormerNet(X_np.shape[2], params).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    model.eval()
-    out = []
-    with torch.no_grad():
-        # Chunked: the decoder holds (B, 168, d_model) activations per layer, and the
-        # full 313-day test split at once is a needless spike on a CPU node.
-        for i in range(0, len(X_np), 256):
-            xb = torch.FloatTensor(X_np[i:i + 256]).to(device)
-            out.append(model(xb).cpu().numpy())
-    return np.concatenate(out, axis=0)
+# Three versions of this architecture ship side by side, so they land in the scoreboard as
+# separate rows on one test set rather than as a claim about which is better:
+#
+#   archformer        the author's architecture exactly as published. 504,725 parameters on
+#                     the _cong arm, all C channels through the patch tokenizer.
+#   archformer_hp     the same code, smaller patches. patch_len 6 instead of 24, which cuts
+#                     the tokenizer's input from 24xC to 6xC and raises the token count from
+#                     7 to 28. A pure hyperparameter change -- no code path differs.
+#   archformer_skip   the static block routed past the tokenizer to the head, the way the
+#                     other six sequence models treat it. Only the wrapper differs; the
+#                     vendored files are byte-identical in all three.
+#
+# Why smaller at all: his configs carry 5-28 feature columns and this repo hands the model
+# 68-89, so Linear(24 x C -> 64) compresses 33:1 here against 6.8:1 on the config he wrote
+# for this very dataset -- and 72% of that input is a static value repeated once per hour
+# inside the patch. Both variants attack the same ratio from different sides. Measured on
+# _cong (C=76): 504,725 -> 330,962 (hp) and -> 337,541 (skip).
 
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
+def make_variant(*, name, model_type, filename, params_default):
+    """(train, predict, evaluate) for one ARCHFormer variant.
 
-def evaluate(model_path, X_test, y_true_mw, y_scaler, timestamps, result_dir,
-             params=None, X_train=None, y_true_train_mw=None, timestamps_train=None):
-    """Predict, inverse-transform, then run the full evaluation suite."""
-    params = params or ARCHFORMER_PARAMS
-    y_pred_scaled = predict(model_path, X_test, params)
-    N, P = y_pred_scaled.shape
-    y_pred_mw = y_scaler.inverse_transform(y_pred_scaled.flatten().reshape(-1, 1)).reshape(N, P)
+    Everything except the parameter dict and the directory name is shared, so a variant
+    cannot drift from the others in anything but the setting under test.
+    """
 
-    train_df = None
-    if X_train is not None and y_true_train_mw is not None:
-        y_ptr = predict(model_path, X_train, params)
-        N2, P2 = y_ptr.shape
-        y_pred_train_mw = y_scaler.inverse_transform(y_ptr.flatten().reshape(-1, 1)).reshape(N2, P2)
-        train_df = EvalUtils.build_detailed_df(NAME, y_true_train_mw, y_pred_train_mw, timestamps_train)
+    def train(X_3d, y_3d, mask_3d, params=None, feature_cfg=None, dataset=None):
+        print(f"\n--- Training {name} ---")
+        train_sequence(
+            ARCHFormerNet, model_type, filename,
+            X_3d, y_3d, mask_3d,
+            params or params_default,
+            feature_cfg or ARCHFORMER_FEATURE_CONFIG,
+            dataset,
+        )
 
-    EvalUtils.evaluate_one(NAME, y_true_mw, y_pred_mw, timestamps, result_dir, train_df)
+    def predict(model_path, X_np, params=None):
+        """Load a saved model and return scaled predictions (N, out_dim)."""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = ARCHFormerNet(X_np.shape[2], params or params_default).to(device)
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        model.eval()
+        out = []
+        with torch.no_grad():
+            # Chunked: the decoder holds (B, L, d_model) activations per layer, and the full
+            # 313-day test split at once is a needless spike on a CPU node.
+            for i in range(0, len(X_np), 256):
+                xb = torch.FloatTensor(X_np[i:i + 256]).to(device)
+                out.append(model(xb).cpu().numpy())
+        return np.concatenate(out, axis=0)
+
+    def evaluate(model_path, X_test, y_true_mw, y_scaler, timestamps, result_dir,
+                 params=None, X_train=None, y_true_train_mw=None, timestamps_train=None):
+        """Predict, inverse-transform, then run the full evaluation suite."""
+        params = params or params_default
+        y_pred_scaled = predict(model_path, X_test, params)
+        N, P = y_pred_scaled.shape
+        y_pred_mw = y_scaler.inverse_transform(
+            y_pred_scaled.flatten().reshape(-1, 1)).reshape(N, P)
+
+        train_df = None
+        if X_train is not None and y_true_train_mw is not None:
+            y_ptr = predict(model_path, X_train, params)
+            N2, P2 = y_ptr.shape
+            y_pred_train_mw = y_scaler.inverse_transform(
+                y_ptr.flatten().reshape(-1, 1)).reshape(N2, P2)
+            train_df = EvalUtils.build_detailed_df(name, y_true_train_mw, y_pred_train_mw,
+                                                   timestamps_train)
+        EvalUtils.evaluate_one(name, y_true_mw, y_pred_mw, timestamps, result_dir, train_df)
+
+    return train, predict, evaluate
+
+
+train, predict, evaluate = make_variant(
+    name=NAME, model_type=MODEL_TYPE, filename=FILENAME,
+    params_default=ARCHFORMER_PARAMS,
+)

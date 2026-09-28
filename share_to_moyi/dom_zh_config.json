@@ -1,0 +1,31 @@
+{
+  "dataset_name": "pjm_dom_zh",
+  "granularity_minutes": 60,
+  "csv_path": "data/public_cleaned_data/cleaned_pjm_load_weather_dom.csv",
+
+  "target_col": "Load",
+
+  "actual_cols": [
+    "Load", "Load_Estimated",
+    "Temp_F", "ApparentTemp_F", "Dewpoint_F", "RelativeHumidity_pct",
+    "SolarRadiation_Wm2", "WindSpeed_mph", "WindDirection_deg", "WindGusts_mph",
+    "Precip_in", "CloudCover_pct", "SoilTemp0_7cm_F",
+    "LMP_RT_Total", "LMP_RT_Energy", "LMP_RT_Cong"
+  ],
+  "forecast_cols": [],
+  "aux_cols": [
+    "hour_sin", "hour_cos", "month_sin", "month_cos",
+    "dayofweek", "is_weekend", "is_holiday"
+  ],
+
+  "lookback_hours": [168],
+  "forecast_hours": 24,
+  "forecast_deadline_hour": -1,
+
+  "train_start": "2021-03-25 00:00:00",
+  "train_end":   "2025-04-21 23:00:00",
+  "val_start":   "2025-05-06 00:00:00",
+  "val_end":     "2025-10-02 23:00:00",
+  "test_start":  "2025-10-17 00:00:00",
+  "test_end":    "2026-08-25 23:00:00"
+}

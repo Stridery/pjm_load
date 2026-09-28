@@ -2,10 +2,10 @@
 
     PJM_DATASET=dom python -m src.qrnn.plots
 
-Reads only what train_qrnn.py wrote under results/{zone}/qrnn/, so it restyles without
+Reads only what scripts/train_qrnn.py wrote under results/{zone}/qrnn/, so it restyles without
 refitting. Style helpers, palette and the generic probabilistic figures come from
-src.quantile.plots: four baselines are read side by side, so they are drawn by one set of
-rules rather than four.
+src.quantile.plots: the baselines are read side by side, so they are drawn by one set of
+rules rather than one per package.
 """
 
 import os
@@ -21,9 +21,8 @@ from src.quantile.plots import (INK, INK2, MUTED, PALETTE, SURFACE, _save, _styl
 
 # Fixed name -> hue, shared by every figure here, so no model changes colour between charts.
 # The proposed network leads; its control is red because the whole point of that row is that
-# it is the thing being beaten; the folded-in baselines are muted greens and ambers.
-HUE = {'iQRNN': PALETTE[0], 'bQRNN': PALETTE[5], 'QRA': PALETTE[1],
-       'CRPS-guided': PALETTE[2], 'Vanilla': PALETTE[3]}
+# it is the thing being beaten; the folded-in baseline is a muted green.
+HUE = {'iQRNN': PALETTE[0], 'bQRNN': PALETTE[5], 'CRPS-guided': PALETTE[2]}
 BENCH = '#b9b9b4'
 GRIDLINE = '#e3e3e0'
 
@@ -39,8 +38,8 @@ def plot_scoreboard(tbl, zone, path):
     """Pinball, Winkler(90%) and CRPS as small multiples — three units never share an axis.
 
     Pinball is the paper's headline (its quantile score); Winkler adds the width-and-coverage
-    view that pinball alone cannot separate; CRPS is the one metric all four baselines in this
-    repo share. Rows whose horizon differs from the run's are hatched, because a bar chart is
+    view that pinball alone cannot separate; CRPS is the one metric every baseline in this
+    repo shares. Rows whose horizon differs from the run's are hatched, because a bar chart is
     exactly where a reader stops reading the horizon column.
     """
     metrics = [('pinball', 'Quantile score  (MW)'), ('winkler90', 'Winkler score, 90% PI'),
@@ -192,7 +191,7 @@ def main():
     a = ap.parse_args()
     d, zone = a.dir or cfg.QRNN_CONFIG['result_dir'], cfg.DATASET
     if not os.path.exists(os.path.join(d, 'test_scores.csv')):
-        raise SystemExit(f"No results in {d} — run train_qrnn.py first.")
+        raise SystemExit(f"No results in {d} — run scripts/train_qrnn.py first.")
 
     plot_scoreboard(pd.read_csv(os.path.join(d, 'test_scores.csv')), zone,
                     os.path.join(d, 'scoreboard.png'))

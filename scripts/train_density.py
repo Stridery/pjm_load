@@ -1,9 +1,9 @@
 """
-Probabilistic baseline 3 — Li, Wang & Zhang (2020), IEEE TSG 11(2):1679-1690.
+Probabilistic baseline 2 — Li, Wang & Zhang (2020), IEEE TSG 11(2):1679-1690.
 Combining probability density forecasts by minimising the CRPS.
 
-    PJM_DATASET=dom python train_density.py
-    PJM_DATASET=dom python train_density.py --workers 8 --models GPR1 NN1 XGB1
+    PJM_DATASET=dom python scripts/train_density.py
+    PJM_DATASET=dom python scripts/train_density.py --workers 8 --models GPR1 NN1 XGB1
 
 Parallel to the other two baselines in every structural respect: reads exactly one input
 (data/{zone}/cleaned/cleaned_pjm_load_weather.csv), writes to results/{zone}/density/, and
@@ -19,9 +19,15 @@ MAPE-guided, and simple average. The best individual base model on T3 is carried
 because the paper's claim is that the combination beats it.
 
 Horizon: data through day D-1, target day D+1 — this repo's cutoff, which is also the 16
-point models'. It is 24 h behind the QRA baseline, and the paper's lag list is shifted by 24
+point models'. It is 24 h behind a D-1 -> D issue time, and the paper's lag list is shifted by 24
 to stay observable (see src/density/features.py).
 """
+
+# Entry points live in scripts/ but import the package from the repo root, and running
+# `python scripts/foo.py` puts scripts/ on sys.path rather than the root. Prepend the root so
+# `import src...` resolves from any working directory.
+import sys as _sys, pathlib as _pathlib
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 
 import argparse
 import json
@@ -38,7 +44,7 @@ from src.density import features as F
 from src.density.gaussfit import mixture_mean, mixture_quantiles
 from src.quantile._pool import n_workers, run
 from src.quantile.qeval import (QUANTILES, coverage_report, pinball, point_metrics, winkler)
-from train_quantile import load_frame, split_at_day_boundary
+from src.quantile.frame import load_frame, split_at_day_boundary
 
 EVAL_LEVELS = QUANTILES / 100.0          # the grid pinball/Winkler/coverage are read off
 
