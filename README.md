@@ -39,6 +39,58 @@ is a system-load-level proxy the models already see through the 168 h lookback.
 
     PJM_DATASET=dom python scripts/run_crawler.py       # fetches marginal value along with everything else
 
+## Residual models: what baseline, per target
+
+Nine of the eighteen models regress on the DEVIATION from a naive baseline and add it back at
+inference. The baseline is always the same shape — for each clock-hour, the mean of that hour
+over the lookback window's seven days — but the CHANNEL it is taken from is per target, and it
+has to be, because the one thing it must be is in the target's own units:
+
+| target | `baseline_col` | units | decode first |
+|---|---|---|---|
+| `load` | `Load_Estimated` | MW | — |
+| `rt_price` | `RT_Total_slog` | $/MWh | `signed_log` |
+
+`src/config.TARGET_SPECS` holds the pair (`baseline_col`, `baseline_transform`);
+`src/models/_residual.py` reads the channel back out of the built matrix by index, from
+`config.sequence_feature_cols()` so the builder and the reader cannot drift.
+
+### Why rt_price got one
+
+The direct price models under-forecast the test period by 27–41 $/MWh — a level offset, which
+is exactly what carrying the target as a deviation from its own recent level removes. Measured
+on dom, `_lmp` arm, 1957 days:
+
+    naive baseline alone     MAPE 57.6%   MAE 33.2   RMSE 98.1   ME  +0.1
+    best direct model        MAPE 86.3%   MAE 45.7   RMSE 136.9  ME -27.0
+
+The baseline alone beats every one of the nine direct models, and its mean error is +0.1
+$/MWh against their −27 to −41. That is the offset, and it is what the residual target hands
+the estimator for free.
+
+Two details that are not free:
+
+* **decode before averaging.** `RT_Total_slog` is `sign(x)·log1p(|x|)`. Averaging logs and
+  exponentiating gives a geometric mean, which on a series with median 36 and maximum 4392
+  sits far below the arithmetic level the target needs added back. `_residual._decode` undoes
+  the encoding per hour, then averages.
+* **`series_col` stays `Load_Estimated`.** The lookback's load channel is what DRIVES price;
+  the baseline is what the target is measured AGAINST. Different jobs, different fields.
+
+### Where it is unavailable
+
+`RT_Total_slog` rides in the LMP lookback block, so a `PJM_LMP=0` price arm has no price
+history in the window to average. `config.residual_baseline_reason()` returns the reason and
+the fix; `scripts/Model_Training.py` drops the nine residual models with that message rather than
+failing halfway, and `condor/make_jobs.sh` does not generate the jobs at all. So rt_price
+trains 18 models on its two `_lmp` arms and 9 on the other two.
+
+    PJM_TARGET=rt_price PJM_LMP=1 PJM_TRAIN_ONLY=residual python scripts/Model_Training.py
+
+TimesFM has no residual mode for price: `FOUNDATION_CONFIG` sets `modes: ['direct']` for
+rt_price, and `src/foundation/_context.baseline_series` still builds a load baseline. Giving
+the foundation benchmark the same price baseline is a separate change.
+
 ### Run configuration
 
 Four variables, read by `src/config.py`. The command line and the sbatch use the SAME names —

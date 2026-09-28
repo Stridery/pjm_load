@@ -2,18 +2,30 @@
 """
 Shared machinery for the residual-learning models.
 
-Instead of predicting metered load directly, predict its DEVIATION from a naive
+Instead of predicting the target directly, predict its DEVIATION from a naive
 same-hour-last-week baseline, and add the baseline back at inference:
 
-    baseline[h] = mean of the past 7 days' PRELIMINARY load at clock-hour h   -> (24,)
-    train target : y_residual = y_metered - baseline
-    inference    : pred_metered = model.predict(X) + baseline
+    baseline[h] = mean of the lookback window's days at clock-hour h   -> (24,)
+    train target : y_residual = y - baseline
+    inference    : pred = model.predict(X) + baseline
 
 Features are unchanged and the estimator is unchanged — only the target moves. The
 baseline is derived per-sample from that sample's OWN lookback window, so nothing is fit
-on the training set and it cannot leak; and it reads only the preliminary load, which is
-published in real time. That makes the residual models deployable on exactly the same
-forecast path as everything else.
+on the training set and it cannot leak; and it reads only series published in real time.
+That makes the residual models deployable on exactly the same forecast path as everything
+else.
+
+WHICH CHANNEL THE BASELINE COMES FROM IS PER TARGET (config.BASELINE_COL), because the one
+thing it must be is in the target's own units:
+
+    load       Load_Estimated   MW      preliminary load, the proxy published in real time
+    rt_price   RT_Total_slog    $/MWh   the price's own history, signed-log encoded
+
+For rt_price the encoding is undone BEFORE the mean is taken (config.BASELINE_TRANSFORM),
+so the baseline is a mean of dollars rather than a mean of logs. With a 120x price tail
+those are very different numbers and only the first can be added back to a $/MWh target.
+The price channel rides in the LMP lookback block, so a residual price model needs
+PJM_LMP=1; config.residual_baseline_reason() is the check, and it names the fix.
 
 The baseline is recovered from the feature matrix itself rather than re-read from the
 cleaned CSV. That is what lets predict() keep the same signature as the plain models — and
@@ -29,6 +41,30 @@ from sklearn.metrics import (mean_absolute_error, mean_absolute_percentage_error
                              mean_squared_error)
 
 BASELINE_MODES = ('hourly', 'scalar')
+
+
+def _decode(x):
+    """Undo the lookback channel's encoding so the mean is taken in the target's real units.
+
+    'signed_log' is src.lmp_features.signed_log, sign(x)*log1p(|x|); its inverse is
+    sign(z)*expm1(|z|). Applied per-hour BEFORE averaging on purpose — averaging logs and
+    then exponentiating gives a geometric mean, which on a series whose median is 36 and
+    maximum 4392 sits far below the arithmetic level the target actually needs added back.
+    """
+    from src.config import BASELINE_TRANSFORM
+    if BASELINE_TRANSFORM == 'none':
+        return x
+    if BASELINE_TRANSFORM == 'signed_log':
+        return np.sign(x) * np.expm1(np.abs(x))
+    raise ValueError(f"unknown baseline_transform {BASELINE_TRANSFORM!r}")
+
+
+def assert_baseline_available(what):
+    """Raise with the arm-specific fix if this run cannot build a baseline at all."""
+    from src.config import residual_baseline_reason
+    reason = residual_baseline_reason()
+    if reason:
+        raise ValueError(f"{what} is a residual model and cannot run here. {reason}")
 
 
 def print_metrics(tag, y_true, y_pred):
@@ -60,32 +96,42 @@ def baseline_from_windows(win, mode='hourly'):
 def tree_baseline(X_opt, mode='hourly', lookback=168):
     """Baseline for the 2D matrix — the lookback window is sitting right there in columns.
 
-    The column stem follows PJM_TARGET's own load channel: `load_estimated_h*` for the
-    preliminary-load classes, `load_h*` for load_met, whose sequence carries METERED load.
-    Hard-coding the preliminary stem here would raise a KeyError on load_met rather than
-    silently misread, but naming it from config keeps the two in step by construction.
+    The column stem is PJM_TARGET's baseline channel (`load_estimated_h*`, `load_h*`,
+    `rt_total_slog_h*`), lower-cased the way build_or_load_matrix flattens it. Naming it from
+    config rather than hard-coding one stem is what keeps the three classes in step: a wrong
+    stem raises here instead of averaging whichever channel happens to be present.
     """
-    from src.config import SERIES_COL
-    cols = [f'{SERIES_COL.lower()}_h{k}' for k in range(lookback)]
+    from src.config import BASELINE_COL, residual_baseline_reason
+    cols = [f'{BASELINE_COL.lower()}_h{k}' for k in range(lookback)]
     missing = [c for c in cols if c not in X_opt.columns]
     if missing:
         raise KeyError(
-            f"2D matrix is missing {len(missing)} {SERIES_COL.lower()}_h* column(s) "
-            f"(first: {missing[0]}). The residual model reads the preliminary-load window "
-            f"straight out of the features; without it there is no baseline."
-        )
-    return baseline_from_windows(X_opt[cols].values, mode)
+            f"2D matrix is missing {len(missing)} {BASELINE_COL.lower()}_h* column(s) "
+            f"(first: {missing[0]}). The residual model reads its baseline window straight "
+            f"out of the features; without it there is no baseline. "
+            f"{residual_baseline_reason() or ''}".strip())
+    return baseline_from_windows(_decode(X_opt[cols].values), mode)
 
 
 def sequence_baseline(X_3d, seq_scaler, mode='hourly'):
     """Baseline for the 3D matrix.
 
-    Channel 0 of the window is Load_Estimated, standardized by the sequence scaler that
-    build_timeseries_matrix fitted. Undo that one channel to get raw MW — the same 168 h
-    window the 2D path reads, so both models see an identical baseline.
+    The baseline channel is standardized by the sequence scaler build_timeseries_matrix
+    fitted, so undo that one channel, then undo any encoding it carries — the same window the
+    2D path reads, so both models see an identical baseline.
+
+    The channel INDEX comes from config.sequence_feature_cols(), the same list the builder
+    laid the channels out with. Hard-coding 0 was correct only while every target's baseline
+    was the sequence's load channel; rt_price's is channel 22.
     """
-    win = X_3d[:, :, 0] * seq_scaler.scale_[0] + seq_scaler.mean_[0]
-    return baseline_from_windows(win, mode)
+    from src.config import BASELINE_COL, sequence_feature_cols, residual_baseline_reason
+    cols = sequence_feature_cols()
+    if BASELINE_COL not in cols:
+        raise ValueError(residual_baseline_reason()
+                         or f"{BASELINE_COL!r} is not among the lookback channels {cols}.")
+    c = cols.index(BASELINE_COL)
+    win = X_3d[:, :, c] * seq_scaler.scale_[c] + seq_scaler.mean_[c]
+    return baseline_from_windows(_decode(win), mode)
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +166,7 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
     """Return (train, predict, evaluate) for a residual sequence model."""
     from sklearn.preprocessing import StandardScaler
 
-    from src.config import (MATRIX_DIR, EMBARGO_DAYS, MATRIX_TAG, TARGET_TAG,
-                            TARGET, TARGET_SPEC)
+    from src.config import MATRIX_DIR, EMBARGO_DAYS, MATRIX_TAG, TARGET_TAG
     from src.feature_engine import _split_indices, apply_embargo
     from src.models._eval_utils import EvalUtils
     from src.models._utils import _make_run_dir
@@ -151,27 +196,21 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
         return _make_run_dir('models', model_type, feature_cfg, dataset)
 
     def _train(X_3d, y_3d, mask_3d, timestamps_3d, params, dataset):
-        # Refuse rather than produce plausible noise. The baseline below is a
-        # same-hour-last-week mean of Load_Estimated, in MW. Subtract it from a price
-        # target and the arithmetic still cancels at inference -- nothing raises -- but
-        # measured on dom the price signal is 0.14% of the residual's variance
-        # (baseline std 2637 MW against a price std of 99 $/MWh), so the network spends
-        # its whole capacity rebuilding the baseline it is about to add back.
-        if not TARGET_SPEC['residual_ok']:
-            raise ValueError(
-                f"{name} is a residual model and PJM_TARGET={TARGET!r} does not support one: "
-                f"the baseline is built from Load_Estimated (MW) and the target is "
-                f"{TARGET_SPEC['column']} ({TARGET_SPEC['unit']}). Train the direct models "
-                f"instead (PJM_TRAIN_ONLY without the *_residual names), or give this target "
-                f"its own baseline before enabling residual_ok in TARGET_SPECS.")
+        # Refuse rather than produce plausible noise. Subtracting a baseline in the wrong
+        # units still cancels arithmetically at inference -- nothing raises -- but the
+        # network spends its capacity rebuilding a baseline it is about to add back.
+        # residual_baseline_reason() names both the cause and the fix.
+        assert_baseline_available(name)
         params = {**(params or params_default)}
         mode = params.pop('baseline', 'hourly')
         N, H = y_3d.shape
         seq_scaler, y_scaler = _matrix_scalers()
 
-        baseline = sequence_baseline(X_3d, seq_scaler, mode)                     # (N, 24) MW
-        y_mw = y_scaler.inverse_transform(y_3d.reshape(-1, 1)).reshape(N, H)     # (N, 24) MW
-        residual_mw = y_mw - baseline
+        # All three arrays are in the TARGET's own units — MW for the load classes, $/MWh
+        # for rt_price — which is the whole reason baseline_col is per target.
+        baseline = sequence_baseline(X_3d, seq_scaler, mode)                     # (N, 24)
+        y_real   = y_scaler.inverse_transform(y_3d.reshape(-1, 1)).reshape(N, H)  # (N, 24)
+        residual = y_real - baseline
 
         # The same split (+embargo, +mask denoise) the plain model trains on, so the residual
         # scaler sees exactly the samples the net will fit on and not one more.
@@ -182,14 +221,15 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
         train_idx, _v = apply_embargo(train_pool[rtr], train_pool[rval], EMBARGO_DAYS)
         fit_idx = train_idx[mask_3d[train_idx]]
 
-        res_scaler = StandardScaler().fit(residual_mw[fit_idx].reshape(-1, 1))
-        y_res = res_scaler.transform(residual_mw.reshape(-1, 1)).reshape(N, H).astype('float32')
+        res_scaler = StandardScaler().fit(residual[fit_idx].reshape(-1, 1))
+        y_res = res_scaler.transform(residual.reshape(-1, 1)).reshape(N, H).astype('float32')
 
-        print(f"Baseline mode:    {mode}")
-        print(f"Residual (MW):    mean {residual_mw[fit_idx].mean():+.1f}  "
-              f"std {residual_mw[fit_idx].std():.1f}  -> standardized by its own scaler "
+        from src.config import BASELINE_COL, TARGET_UNIT
+        print(f"Baseline mode:    {mode}  (from {BASELINE_COL}, in {TARGET_UNIT})")
+        print(f"Residual ({TARGET_UNIT}): mean {residual[fit_idx].mean():+.2f}  "
+              f"std {residual[fit_idx].std():.2f}  -> standardized by its own scaler "
               f"(fit on {len(fit_idx)} train samples only)")
-        print_metrics('naive baseline alone (train)', y_mw[fit_idx], baseline[fit_idx])
+        print_metrics('naive baseline alone (train)', y_real[fit_idx], baseline[fit_idx])
 
         if is_moe:
             moe.train(X_3d, y_res, mask_3d, timestamps_3d, params, feature_cfg, dataset,
@@ -213,11 +253,11 @@ def make_residual_model(*, name, model_type, filename, feature_cfg, params_defau
         else:
             res_scaled = base_predict(model_path, X_np, params)
         n, h = res_scaled.shape
-        res_mw = res_scaler.inverse_transform(res_scaled.reshape(-1, 1)).reshape(n, h)
-        load_mw = res_mw + sequence_baseline(X_np, seq_scaler, mode)
+        res_real  = res_scaler.inverse_transform(res_scaled.reshape(-1, 1)).reshape(n, h)
+        pred_real = res_real + sequence_baseline(X_np, seq_scaler, mode)
         # back to y-standardized space — the caller inverse-transforms with y_scaler, so the
         # residual plumbing is exactly cancelled and stays invisible.
-        return y_scaler.transform(load_mw.reshape(-1, 1)).reshape(n, h)
+        return y_scaler.transform(pred_real.reshape(-1, 1)).reshape(n, h)
 
     def evaluate(model_path, X_test, y_true_mw, y_scaler, timestamps, result_dir,
                  params=None, X_train=None, y_true_train_mw=None, timestamps_train=None):

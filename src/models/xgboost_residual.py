@@ -20,7 +20,7 @@ import xgboost as xgb
 from tqdm import tqdm
 
 from src.models._eval_utils import EvalUtils
-from src.models._residual import tree_baseline, print_metrics
+from src.models._residual import assert_baseline_available, tree_baseline, print_metrics
 from src.models._utils import _make_run_dir
 from src.config import TREE_FEATURE_CONFIG, XGB_RESIDUAL_PARAMS
 
@@ -38,6 +38,9 @@ def _baseline_mode(params):
 
 def train(X_train, y_train, params=None, feature_cfg=None):
     print("\n--- Training XGBoost (residual target) ---")
+    # The baseline must be in the target's units and its channel must be in this arm's
+    # matrix. Fail here rather than 24 boosters later. See config.residual_baseline_reason.
+    assert_baseline_available(NAME)
     params = {**(params or XGB_RESIDUAL_PARAMS)}
     feature_cfg = feature_cfg or TREE_FEATURE_CONFIG
     mode = params.get('baseline', 'hourly')

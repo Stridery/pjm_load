@@ -1,0 +1,33 @@
+# The whole retrain, as three stages. Submit with:  condor_submit_dag condor/train.dag
+#
+# The one edge that matters is prebuild -> train. Every training job reads a matrix keyed on
+# filename alone (src/feature_engine caches on the path, not the content), so on a cold cache
+# eighteen jobs would each decide to build and each write the same file. One writer, then
+# many readers. Foundation is a second child rather than a grandchild because it needs the
+# same matrices and trains nothing, so it has no reason to wait for the models.
+#
+# DAGMan holds the pieces together: it submits stage 2 only after every stage-1 job has
+# exited 0, and if the run dies halfway it writes train.dag.rescue001 so a resubmit picks up
+# where it stopped instead of redoing the matrices.
+
+JOB prebuild   condor/Prebuild.sub
+JOB train      condor/Train.sub
+JOB foundation condor/Foundation.sub
+
+PARENT prebuild CHILD train foundation
+
+# Stage 1 is cheap and its failure would strand everything downstream, so give it another go
+# as a whole before giving up. Stages 2 retry per-job inside their .sub files instead — one
+# model failing is a result, not a reason to re-run the other 359.
+RETRY prebuild 1
+
+# A node here is a fan-out of independent results, not one job, and DAGMan's default is that
+# one failed proc fails the whole node — after which it stops scheduling that node's remaining
+# procs and condor_rm's them when the DAG winds up. That cost 36 of 40 TimesFM runs on the
+# first full run. A POST script's exit status REPLACES the node's, so node_report.sh prints
+# what failed and returns 0, and the other 359 models are unaffected.
+#
+# prebuild deliberately gets none: if the matrices are not built, every child is meaningless
+# and stopping is the correct outcome.
+SCRIPT POST train      condor/node_report.sh $JOB $RETURN
+SCRIPT POST foundation condor/node_report.sh $JOB $RETURN

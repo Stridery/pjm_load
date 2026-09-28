@@ -144,12 +144,13 @@ def _cutoff_row(ept_dates, ept_hours, today, latest_info_hour):
     """Row index of this sample's cutoff, or -1.
 
     The cutoff is `today` at latest_info_hour (or the previous day when that hour is late),
-    then stepped back TARGET_LAG_DAYS whole days. The step exists for load_met, whose context
-    series is METERED load: PJM publishes it about a day after the preliminary series, so a
-    window that ended where the preliminary one does would be reading values that did not
-    exist at forecast time. Stepping whole DAYS rather than 24 rows keeps it right across DST,
-    where a day is not 24 rows. TARGET_LAG_DAYS is 0 for every other target, so this is the
-    existing behaviour unchanged.
+    then stepped back TARGET_LAG_DAYS whole days.
+
+    TARGET_LAG_DAYS is 0 for every target currently defined, so the step is a no-op today. It
+    is kept because it is the correct handling for any context series that is published LATER
+    than the preliminary load -- a window ending where the preliminary one does would read
+    values that did not exist at forecast time. Stepping whole DAYS rather than 24 rows is
+    what keeps that right across DST, where a day is not 24 rows.
     """
     cut_day = today if latest_info_hour <= 9 else None
     if cut_day is None:

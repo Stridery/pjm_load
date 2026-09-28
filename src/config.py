@@ -61,13 +61,22 @@ from src.lmp_features import LMP_SEQ_COLS       # per-hour price feats (go into 
 #                  hours, a 15x enrichment. For load those days are noise; for price the
 #                  spikes are the signal, so price does not inherit that mask and validity
 #                  becomes "the target hour exists".
-#   residual_ok    the residual models subtract a same-hour-last-week baseline built from
-#                  Load_Estimated. Against a price target that baseline is ~14,000 MW while
-#                  the target is ~59 $/MWh: the subtraction cancels arithmetically at
-#                  inference, so nothing raises, but price is then 0.14% of the residual's
-#                  variance and the network spends its capacity rebuilding the load baseline
-#                  it is about to add back. Measured, not argued. Residual models are refused
-#                  for such targets rather than left to produce plausible noise.
+#   baseline_col   WHICH series the residual models subtract, and it must be in the target's
+#                  own units. The baseline is always the same shape -- the mean of the
+#                  lookback window's days at each clock-hour -- but the channel it is taken
+#                  from is per target:
+#                      load              Load_Estimated          (MW)
+#                      rt_price          RT_Total_slog           ($/MWh, signed-log encoded)
+#                  Reading Load_Estimated for a price target is the failure this field exists
+#                  to prevent: the subtraction cancels arithmetically at inference so nothing
+#                  raises, but measured on dom the price is then 0.14% of the residual's
+#                  variance (baseline std 2637 MW against a price std of 99 $/MWh) and the
+#                  network spends its capacity rebuilding a load baseline it is about to add
+#                  back. baseline_transform undoes any encoding the channel carries before the
+#                  mean is taken, so the baseline comes out in the target's real units.
+#   residual_ok    whether the class HAS such a baseline at all. rt_price does, but only when
+#                  the LMP block is on -- PJM_LMP=0 leaves no price channel in the lookback to
+#                  build it from. residual_baseline_reason() below is the runtime check.
 #   peak_metric    MAPE is meaningful on load (naive baseline 7.7%) and much less so on a
 #                  series with skew 14.7 and kurtosis 398 (naive baseline 53%). Price adds
 #                  wMAPE (sum|e| / sum|y|), which is what the price literature reports.
@@ -80,6 +89,7 @@ TARGET_SPECS = {
         # is pulled back from the standard cutoff.
         'series_col': 'Load_Estimated', 'lag_days': 0,
         'mask_outliers': True, 'residual_ok': True,
+        'baseline_col': 'Load_Estimated', 'baseline_transform': 'none',
         'peak_label': 'load', 'report_wmape': False,
         # Metered load trails ~7 d, so the newest days carry Load_Estimated but no label.
         # data_processor calls those rows "the prediction set" and the matrix deliberately
@@ -90,43 +100,24 @@ TARGET_SPECS = {
     'rt_price': {
         'column': 'LMP_RT_Total', 'unit': '$/MWh', 'tag': '_rtprice',
         'series_col': 'Load_Estimated', 'lag_days': 0,
-        'mask_outliers': False, 'residual_ok': False,
+        'mask_outliers': False, 'residual_ok': True,
+        # The baseline is the PRICE's own recent level, not the load's: for each clock-hour,
+        # the mean of that hour over the lookback window's seven days. The direct models were
+        # measured under-forecasting the test period by 27-41 $/MWh -- a level offset, which
+        # is exactly what a target carried as a deviation from its own recent level removes.
+        #
+        # RT_Total_slog is the lookback channel src/lmp_features writes, sign(x)*log1p(|x|)
+        # of LMP_RT_Total. baseline_transform undoes that BEFORE the mean, so the baseline is
+        # a mean of dollars and not a mean of logs -- with a 120x tail those are not the same
+        # number, and the one that can be added back to a $/MWh target is the first.
+        #
+        # series_col stays Load_Estimated: the lookback's load channel is what DRIVES price
+        # and it is not what the residual is measured against. The two are different jobs.
+        'baseline_col': 'RT_Total_slog', 'baseline_transform': 'signed_log',
         'peak_label': 'price', 'report_wmape': True,
         # RT price is realised within the operating day, so there is no unlabelled tail to
         # preserve. A hole is a fetch gap, and a NaN target would reach the metrics.
         'drop_incomplete_target': True,
-    },
-    'load_met': {
-        # Metered load forecast from METERED history, on TimesFM's information geometry.
-        #
-        # Why it is a separate class and not an arm of 'load': the 16 point models read
-        # PRELIMINARY load, which is current as of the cutoff, while the TimesFM runs read
-        # METERED load, which PJM publishes about a day later. Comparing the two has always
-        # meant comparing models that saw the record at different moments. This class removes
-        # that difference by giving the point models the foundation model's constraint:
-        #
-        #     issue time            (T-1) 00:00      UNCHANGED -- same as every other class
-        #     metered load through  (T-3) 23:00      one day staler than preliminary
-        #     lookback window       (T-9) 00:00 .. (T-3) 23:00      168 h, shifted back a day
-        #     target                day T, 24 hours
-        #
-        # Only the WINDOW moves. The issue time does not, so everything keyed off the target
-        # day rather than the cutoff is untouched and cannot leak:
-        #   * the 31 fc_* features still come from the forecast issued on T-2, which exists
-        #     hours before a (T-1) 00:00 issue time (its latest run is ~18:00 EPT on T-2);
-        #   * congestion and the Day-Ahead price statics still describe day T-1, whose market
-        #     cleared ~13:30 on T-2.
-        # What the shift does cost is one day of observed weather in the window, and the macro
-        # and thermal-static blocks with it -- those are computed at the cutoff. That is the
-        # same cost TimesFM pays: its past_only covariates end where its context does.
-        #
-        # Load_Estimated is dropped entirely, here and from the foundation covariates, so the
-        # class has exactly one load series and it is the one being forecast.
-        'column': 'Load', 'unit': 'MW', 'tag': '_met',
-        'series_col': 'Load', 'lag_days': 1,
-        'mask_outliers': True, 'residual_ok': True,
-        'peak_label': 'load', 'report_wmape': False,
-        'drop_incomplete_target': False,
     },
 }
 if _TARGET not in TARGET_SPECS:
@@ -138,6 +129,8 @@ TARGET_UNIT = TARGET_SPEC['unit']
 TARGET_TAG  = TARGET_SPEC['tag']
 SERIES_COL  = TARGET_SPEC['series_col']   # the sequence's load channel
 TARGET_LAG_DAYS = int(TARGET_SPEC['lag_days'])  # days the lookback window steps back
+BASELINE_COL       = TARGET_SPEC['baseline_col']        # lookback channel the residual subtracts
+BASELINE_TRANSFORM = TARGET_SPEC['baseline_transform']  # encoding to undo before averaging
 
 MODEL_ROOT  = f'models/{DATASET}{TARGET_TAG}'
 RESULT_ROOT = f'results/{DATASET}{TARGET_TAG}'
@@ -221,6 +214,42 @@ LMP_CONFIG = {
 # it depends on the switch above, and the sequence models' n_seq_features reads it.
 N_SEQ_FEATURES = (1 + len(WEATHER_COLS) + len(THERMAL_SEQ_COLS)
                   + (len(LMP_SEQ_COLS) if LMP_CONFIG['lookback'] else 0))
+
+
+def sequence_feature_cols():
+    """The 3D matrix's channel order, and the stems the 2D matrix flattens as `{name}_h*`.
+
+    ONE definition, because three places have to agree on it and two of them cannot check the
+    third: src/feature_engine builds the matrices from this order, and
+    src/models/_residual reads a channel back OUT of a built matrix by index. An extra
+    weather column added to one list and not the other would not raise anywhere -- the
+    residual baseline would quietly start averaging the wrong channel.
+    """
+    return ([SERIES_COL] + list(WEATHER_COLS) + list(THERMAL_SEQ_COLS)
+            + (list(LMP_SEQ_COLS) if LMP_CONFIG['lookback'] else []))
+
+
+def residual_baseline_reason():
+    """None if this run can build a residual baseline, else why it cannot.
+
+    Two ways it cannot, and they need different messages because they need different fixes:
+      * the target has no baseline series at all (nothing here today, but a new target added
+        without a baseline_col would land here rather than misbehave);
+      * the target HAS one but this arm's matrix does not carry the channel. That is rt_price
+        with PJM_LMP=0: the price lookback lives in the LMP block, so with the block off there
+        is no price history in the window to average.
+    """
+    if not TARGET_SPEC.get('residual_ok'):
+        return (f"PJM_TARGET={TARGET!r} has residual_ok=False -- no baseline is defined for "
+                f"{TARGET_COL} ({TARGET_UNIT}).")
+    if BASELINE_COL not in sequence_feature_cols():
+        if BASELINE_COL in LMP_SEQ_COLS:
+            return (f"PJM_TARGET={TARGET!r} builds its baseline from {BASELINE_COL}, which is "
+                    f"part of the LMP lookback block, and this arm has PJM_LMP=0. Re-run the "
+                    f"arm with PJM_LMP=1, or train only the direct models here.")
+        return (f"{BASELINE_COL!r} is not a lookback channel of this arm "
+                f"(channels: {sequence_feature_cols()}).")
+    return None
 
 # Matrix-cache / scaler / model-run-dir tag. Every artifact whose CONTENT depends on the
 # feature set's width carries it, so a cache or a set of weights built under one setting can
@@ -1260,11 +1289,6 @@ FOUNDATION_CONFIG = {
 }
 
 _FOUNDATION_BY_TARGET = {
-    # load_met IS TimesFM's geometry, so the foundation config needs no change beyond the
-    # context length -- metered + day_ahead is already what the point models now do.
-    'load_met': {
-        'context_hours': [168],
-    },
     'rt_price': {
         'series': 'rt_price',
         'context_hours': [168],
