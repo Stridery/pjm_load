@@ -1,6 +1,20 @@
-# Running training on Castle (HTCondor)
+# Running training on the ISyE cluster (HTCondor)
 
 Two machines. You never log into a compute node — condor puts the jobs there for you.
+
+> **The roles are fixed by the ISyE cluster guide and are not interchangeable.**
+>
+> | role | machine | what it is for |
+> |---|---|---|
+> | Gateway Server | `castle`, `keep` | connecting in from outside; SCP/SFTP |
+> | Central Manager | `isye-hps0400` | collector + negotiator |
+> | Submit Server | `compute01` (= `isye-hps0401`) | editing and submitting jobs |
+> | Execution Machines | `condor_status -compact` | condor puts your jobs here |
+>
+> Step 1 below runs on castle because it is **network and filesystem work** — fetching data
+> and unpacking a venv — not computation. A gateway is not an execution machine: anything
+> that would otherwise be a condor job belongs in a condor job. `condor/bench_gf.sh local`
+> enforces this and refuses to run on a gateway or on the submit server.
 
 ---
 

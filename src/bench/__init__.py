@@ -1,11 +1,17 @@
-"""Probabilistic baselines on the three public datasets (spain, ercot, elia).
+"""Baselines and GARCHFormer on the three public datasets (spain, ercot, elia).
 
-Completely separate from the PJM stack. Nothing here imports src.config, src.models or any
-data/{zone}/ path; the only inputs are data/quantile/{name}_config.json and the cleaned CSV
-each one names. The PJM baselines under src/quantile, src/density and src/qrnn are left
-untouched, and the numerical cores of those packages are IMPORTED here rather than copied —
-only the feature assembly, the splitting and the scoring are rewritten, because those are
-what the protocol changes.
+Separate from the PJM stack. Nothing here reads src.config or any data/{zone}/ path; the
+only inputs are data/quantile/{name}_config.json and the cleaned CSV each one names. The
+PJM baselines under src/quantile, src/density and src/qrnn are left untouched, and the
+numerical cores of those packages are IMPORTED here rather than copied — only the feature
+assembly, the splitting and the scoring are rewritten, because those are what the protocol
+changes.
+
+One module breaks the "no src.models" half of that rule. `garchformer.py` imports
+ARCHFormer3 from src/models/_garchformer/, which is Moyi Guo's vendored architecture rather
+than part of this repo's PJM wiring — and importing it executes src/models/__init__.py,
+which pulls in src.config, xgboost and lightgbm as a side effect. That is the whole of the
+coupling: no PJM path is read and no PJM config value is used. See that module's docstring.
 
 Protocol (Chapter 3): every dataset forecasts one whole calendar day at a time from a
 deadline on the preceding day, using a lookback window that ENDS at that deadline. Write

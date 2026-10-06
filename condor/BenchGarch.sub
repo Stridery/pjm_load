@@ -1,0 +1,57 @@
+# GARCHFormer grid search on the three public datasets — one job per grid cell.
+# 192 jobs at one seed (3 datasets x 64 legal cells), 576 at three. CPU only.
+#
+#     ./condor/make_bench_gf_jobs.sh
+#     condor_submit condor/BenchGarch.sub                    # run from the project root
+#     python scripts/bench_garchformer_collect.py             # once the cluster drains
+#
+# NO PREBUILD STAGE, so this is a plain .sub and not a DAG. condor/train.dag exists because
+# the PJM matrices have to be built before the models can read them; here the three datasets
+# under data/quantile/ are fixed inputs that every job reads directly. Nothing is fetched,
+# nothing is cached, and no weights are written — the only artifact is one metrics JSON per
+# cell, named after the cell, so no two jobs share an output path.
+
+universe    = vanilla
+# PORTABLE ON PURPOSE. `initialdir` is the job's working directory on the execute node, and
+# hard-coding one user's path means anyone else's clone submits jobs that chdir into THAT
+# user's tree. Omitting it makes condor_submit resolve it to wherever it was run from, and a
+# relative executable is resolved against the same place. So: submit from the project root.
+executable  = condor/bench_garch_one.sh
+
+request_cpus   = $(CPUS)
+request_memory = $(MEM)
+# The job works directly on the NFS project with should_transfer_files = NO and leaves the
+# execute node's scratch empty, so this is the shell's log lines and nothing else. An
+# oversized request is a pure FILTER — condor only considers slots with that much free — and
+# on the PJM run a 20G request cut the matching slots from 235 to 53.
+request_disk   = 1G
+# request_gpus = 1   # attention runs over SEVEN tokens and the biggest cell is 1.26M
+                     # parameters; measured 1-10 s per epoch on CPU. A GPU would spend more
+                     # time waiting for a slot than it saves. Turn it on only after
+                     # measuring, and only for elia.
+
+environment = "GF_DATASET=$(DATASET) GF_DMODEL=$(DMODEL) GF_HEADS=$(HEADS) GF_LAYERS=$(LAYERS) GF_LAMBDA=$(LAMBDA) GF_SEED=$(SEED) OMP_NUM_THREADS=$(CPUS)"
+getenv      = False
+
+should_transfer_files = NO
+
+output = logs/gf_$(DATASET)_d$(DMODEL)_h$(HEADS)_L$(LAYERS)_lam$(LAMBDA)_s$(SEED).$(Cluster).out
+error  = logs/gf_$(DATASET)_d$(DMODEL)_h$(HEADS)_L$(LAYERS)_lam$(LAMBDA)_s$(SEED).$(Cluster).err
+log    = logs/bench_gf.$(Cluster).log
+
+# An EVICTED job (someone with priority takes the slot) goes back to Idle and re-runs from
+# the start — vanilla jobs hold no checkpoint, and that is the real argument for 192 short
+# jobs over one long one: an eviction costs minutes. A cell that already has its JSON exits 0
+# without retraining, so a resubmission after a partial run is cheap and idempotent.
+# max_retries covers the other case, a job that exits non-zero by itself.
+#
+# Note that an ILLEGAL cell exits 2 deliberately (scripts/bench_garchformer.py), so it will
+# burn its retries and land in the log as a failure. make_bench_gf_jobs.sh does not generate
+# any, so seeing one means the itemdata was hand-edited.
+max_retries = 2
+
+# Be a neighbour: at most this many of the 192 sitting in the queue at once. Removing the
+# line is not faster — the pool hands out what it has either way.
+max_idle = 60
+
+queue DATASET, DMODEL, HEADS, LAYERS, LAMBDA, SEED, CPUS, MEM from condor/jobs_bench_gf.txt

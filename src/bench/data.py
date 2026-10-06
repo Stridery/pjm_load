@@ -27,6 +27,25 @@ CONFIG_DIR = 'data/quantile'
 DATASETS = ('spain', 'ercot', 'elia')
 
 
+def _resolve_csv(csv_path, config_dir, name):
+    """The config's `csv_path`, or the same FILENAME next to the config.
+
+    The three JSONs are Moyi Guo's originals and their `csv_path` is written against the
+    upstream layout (`data/public_cleaned_data/`), which does not exist here. Rather than
+    edit the configs -- they are the record of what the upstream run used, and an edited
+    copy is a copy that can drift -- the basename is retried inside `config_dir`, which is
+    where the CSVs actually live. The configured path still WINS when it exists, so a
+    deliberate override is never second-guessed.
+    """
+    if os.path.exists(csv_path):
+        return csv_path
+    alt = os.path.join(config_dir, os.path.basename(csv_path))
+    if os.path.exists(alt):
+        return alt
+    raise FileNotFoundError(
+        f"{name}: CSV not found at the configured {csv_path!r} nor at {alt!r}")
+
+
 class Dataset:
     """The cleaned record plus everything the protocol derives from its config."""
 
@@ -35,7 +54,8 @@ class Dataset:
         with open(os.path.join(config_dir, f'{name}_config.json')) as fh:
             self.cfg = cfg = json.load(fh)
 
-        df = pd.read_csv(cfg['csv_path'], index_col=0)
+        self.csv_path = _resolve_csv(cfg['csv_path'], config_dir, name)
+        df = pd.read_csv(self.csv_path, index_col=0)
         idx = pd.to_datetime(df.index, utc=True)
         step = pd.Timedelta(minutes=cfg['granularity_minutes'])
         d = np.unique(np.diff(idx.values))
