@@ -23,20 +23,18 @@ HORIZON_DAYS = 2      # forecast reaches this many days past the last complete d
 WINDOW_DAYS  = 8      # how many recent days to (re)forecast each run — self-seeds the store
 
 # Only the residual models are served. The direct ones lost to their residual twins on every
-# zone and every metric in the offline evaluation, so carrying them cost a column each in the
-# store and a line each on the chart to show a strictly worse forecast.
+# WHAT IS SERVED, AND WHY THERE IS NO ARM SUFFIX ANY MORE
+# The store used to carry sixteen columns: eight residual models times two congestion arms,
+# named {model}_{cong|nocong}_pred. That A/B is settled -- _cong wins on every model and every
+# metric -- so the daily job runs ONE arm and the suffix carried no information.
 #
-# What replaced them is the congestion A/B: the SAME eight models trained with and without the
-# Day-Ahead congestion block. The store therefore still holds sixteen prediction columns, but
-# they are now eight models x two feature sets rather than sixteen models x one — which is the
-# comparison actually worth looking at every day, since the congestion block's measured gain
-# (MAE -1.7%, peak MAPE -3.2% on dom) is small enough that it deserves watching in production
-# rather than being taken on a single offline run.
+# What it carries instead is the direct/residual pair: the same six architectures predicting
+# the load itself and predicting the deviation from a same-hour-last-week baseline. Twelve
+# columns per zone, named {model}_pred, where the model name already ends in _residual when it
+# is the residual variant. src.config.SERVING_MODELS is the list; see the note there for what
+# was dropped.
 #
-# One process serves ONE arm: MATRIX_TAG is baked from PJM_CONGESTION at config import, and
-# src/serving/predict refuses weights whose tag disagrees. So the daily job invokes this twice
-# per zone, and table.update merges the two column sets (a run only ever writes its own).
-ARM_SUFFIX = {'_cong': 'cong', '': 'nocong'}
+# One process per zone now, not per (zone, arm).
 
 
 def _complete_days(df):
@@ -75,19 +73,38 @@ def _day_hours(df, target_day):
     return list(zip(e.dt.strftime('%Y-%m-%d %H:%M:%S'), sub.index, e.dt.hour.values))
 
 
+def _serving_models(cfg):
+    """The configured list, direct and residual, restricted to what actually has weights.
+
+    An explicit whitelist rather than a suffix rule: models/ still holds every arm and every
+    variant ever trained, and a rule would quietly put all of it on the page. Missing weights
+    are reported and skipped rather than raised -- one untrained model should cost one line on
+    the chart, not the whole daily run.
+    """
+    have = set(available_models())
+    want, missing = [], []
+    for m in cfg.SERVING_MODELS:
+        for name in (m, f'{m}_residual'):
+            (want if name in have else missing).append(name)
+    if missing:
+        print(f"  no weights, skipped: {', '.join(missing)}")
+    return want
+
+
 def run_zone(zone, keep_days=10):
     import src.config as cfg
-    arm = ARM_SUFFIX.get(cfg.MATRIX_TAG)
-    if arm is None:
-        raise SystemExit(f"No column suffix for MATRIX_TAG {cfg.MATRIX_TAG!r} — add one to "
-                         f"ARM_SUFFIX, or the two arms would overwrite each other in the store.")
+    if cfg.MATRIX_TAG != cfg.SERVING_ARM:
+        raise SystemExit(f"MATRIX_TAG is {cfg.MATRIX_TAG!r} but SERVING_ARM is "
+                         f"{cfg.SERVING_ARM!r}. The daily job runs one arm; set "
+                         f"PJM_CONGESTION/PJM_LMP to match, or change SERVING_ARM.")
     frame, metered = fetch_recent(zone)   # metered = best-available (incl. unverified), for scoring
-    # Residual only — see ARM_SUFFIX above for why the direct models are no longer served.
-    models = [m for m in available_models() if m.endswith('_residual')]
+    models = _serving_models(cfg)
     if not models:
-        raise SystemExit(f"No residual-model weights for arm {arm!r} under models/{zone}/. "
-                         f"Train them, or drop this arm from the daily job.")
-    print(f"  arm {arm} ({cfg.MATRIX_TAG!r}): {len(models)} residual model(s)")
+        raise SystemExit(f"No serving weights under models/{zone}/ for arm "
+                         f"{cfg.MATRIX_TAG!r}. Train them first.")
+    print(f"  arm {cfg.MATRIX_TAG!r}: {len(models)} model(s) — "
+          f"{sum(1 for m in models if m.endswith('_residual'))} residual, "
+          f"{sum(1 for m in models if not m.endswith('_residual'))} direct")
 
     complete = _complete_days(frame)
     if not complete:
@@ -103,14 +120,23 @@ def run_zone(zone, keep_days=10):
         try:
             preds = forecast_day(frame, d, models=models)
         except Exception as e:
-            print(f"  {zone} {d}: skipped ({e})")
-            continue
+            # Retry without the model that failed, so a single stale weight file costs one
+            # column rather than the whole day. Before this, any load error killed the run.
+            print(f"  {zone} {d}: {type(e).__name__}: {e}")
+            preds = {}
+            for one in models:
+                try:
+                    preds.update(forecast_day(frame, d, models=[one]))
+                except Exception as e1:
+                    print(f"    dropped {one}: {type(e1).__name__}: {str(e1).splitlines()[0][:70]}")
+            if not preds:
+                continue
         for local_s, utc, h in _day_hours(frame, d):
             r = {'datetime_utc': utc, 'datetime': local_s,
                  'metered': (float(metered[utc]) if utc in metered.index
                              and pd.notna(metered[utc]) else np.nan)}
             for m, p in preds.items():
-                r[f'{m}_{arm}_pred'] = round(float(p[h]), 1)
+                r[f'{m}_pred'] = round(float(p[h]), 1)
             rows.append(r)
 
     fresh = pd.DataFrame(rows).set_index('datetime_utc').sort_index()
