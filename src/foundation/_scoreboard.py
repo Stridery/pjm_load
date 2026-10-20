@@ -84,6 +84,24 @@ _METRICS = [
 # 2.80:1 on white, under the 3:1 mark bar, which is why the legend is always drawn and the
 # same numbers are printed as a table and written to CSV.
 _C_POINT, _C_FOUNDATION = '#4C72B0', '#DD8452'
+# Two more for the GARCHFormer grid-search ensembles (scripts/grid_archformer_collect.py
+# --emit-eval): the hp wiring (every channel tokenised) and the skip wiring (statics fused at
+# the decoder). Green and purple from the same seaborn-deep family, so the four kinds stay
+# apart from each other at a glance; the legend names them.
+_C_GRID_HP, _C_GRID_SKIP = '#55A868', '#8172B2'
+# A fifth, for the GARCHFormer variants that are NOT grid-search ensembles -- the shipped
+# archformer / _hp / _skip and their residual and 5-seed-ensemble forms. Fourteen of the
+# sixteen GARCHFormer rows were landing in the generic point blue, so the one architecture the
+# project is actually investigating was the hardest to find on its own chart. Seaborn-deep red,
+# the remaining member of the family the other four come from.
+_C_ARCHFORMER = '#C44E52'
+_KIND_COLOR = {'point': _C_POINT, 'foundation': _C_FOUNDATION,
+               'archformer': _C_ARCHFORMER,
+               'grid_hp': _C_GRID_HP, 'grid_skip': _C_GRID_SKIP}
+_KIND_LABEL = {'point': 'trained point model', 'foundation': 'zero-shot foundation',
+               'archformer': 'GARCHFormer',
+               'grid_hp': 'GARCHFormer grid, hp wiring (5-seed ens)',
+               'grid_skip': 'GARCHFormer grid, skip wiring (5-seed ens)'}
 _INK, _MUTED = '#222222', '#888888'
 
 
@@ -139,7 +157,19 @@ def collect(evaluation_root):
         m = _TARGET.search(text)
         row['target'], row['unit'] = (m.group(1), m.group(2)) if m else (None, None)
         # Foundation runs append a block naming their adapter; point models do not.
-        row['kind'] = 'foundation' if '--- foundation run ---' in text else 'point'
+        if '--- foundation run ---' in text:
+            row['kind'] = 'foundation'
+        elif '--- grid search ---' in text:
+            # Grid-search ensembles say which wiring they are; colour them apart.
+            w = re.search(r'^wiring:\s*(\w+)', text, re.M)
+            row['kind'] = f"grid_{w.group(1)}" if w else 'point'
+        elif row['model'].startswith('archformer'):
+            # By directory name, not by a marker in the file: the shipped GARCHFormer runs
+            # write an ordinary metrics.txt with nothing to distinguish them, and adding one
+            # would mean re-running every past evaluation to get the colour.
+            row['kind'] = 'archformer'
+        else:
+            row['kind'] = 'point'
         rows.append(row)
     if not rows:
         return pd.DataFrame()
@@ -188,7 +218,7 @@ def plot_metric(df, zone, key, label, polarity, path, unit='', target=''):
         return None
     d = d.iloc[::-1]                       # matplotlib draws y upward; best ends up on top
     rows = len(d)
-    colors = [_C_FOUNDATION if k == 'foundation' else _C_POINT for k in d['kind']]
+    colors = [_KIND_COLOR.get(k, _C_POINT) for k in d['kind']]
     v = d[key].astype(float)
 
     fig, ax = plt.subplots(figsize=(11, max(4.0, 0.30 * rows + 1.4)))
@@ -229,9 +259,10 @@ def plot_metric(df, zone, key, label, polarity, path, unit='', target=''):
     ax.set_xlabel(f'{axis}  —  {note}', fontsize=9, color=_INK)
     ax.set_title(f'{zone} — {target or "all models"}: {axis}, ranked ({note})',
                  fontsize=12, fontweight='bold', color=_INK)
-    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in (_C_POINT, _C_FOUNDATION)]
-    ax.legend(handles, ['trained point model', 'zero-shot foundation'],
-              loc='lower right', fontsize=8, frameon=False)
+    kinds = [k for k in _KIND_COLOR if k in set(d['kind'])]      # only the kinds present
+    handles = [plt.Rectangle((0, 0), 1, 1, color=_KIND_COLOR[k]) for k in kinds]
+    ax.legend(handles, [_KIND_LABEL[k] for k in kinds], loc='lower right', fontsize=8,
+              frameon=False)
     plt.tight_layout()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     plt.savefig(path, dpi=150, bbox_inches='tight', facecolor='white')
@@ -257,6 +288,91 @@ def plot(df, zone, evaluation_root):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Segmented scoreboards: three load bands, and the most volatile quarter
+# ---------------------------------------------------------------------------
+# A single MAPE ranks models on a weighted average of regimes they are not equally good at.
+# dom's top load band holds 4.3 % of the hours and is where every model is worst; a model that
+# wins overall can be third there. These figures rank each segment on its own.
+
+_SEG_FIGS = [
+    ('load_band', 'low',    'MAPE (%) — low load band'),
+    ('load_band', 'mid',    'MAPE (%) — mid load band'),
+    ('load_band', 'high',   'MAPE (%) — high load band'),
+    ('volatility', 'top25', 'MAPE (%) — most volatile 25% of hours'),
+]
+
+
+def collect_segments(evaluation_root):
+    """Every *_segments.csv under results/{zone}/evaluation/ as one long DataFrame."""
+    rows = []
+    for path in sorted(glob.glob(os.path.join(evaluation_root, '*', '*', '*_segments.csv'))):
+        parts = path.split(os.sep)
+        try:
+            d = pd.read_csv(path)
+        except Exception:
+            continue
+        d['model'] = parts[-3]
+        d['arm'] = arm_label(parts[-2])
+        d['run'] = parts[-2]
+        d['name'] = os.path.basename(path).replace('_segments.csv', '')
+        rows.append(d)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def plot_segment(seg, zone, cut, segment, label, path, kinds=None):
+    """One segment, every model, ranked on that segment's own MAPE."""
+    d = seg[(seg.cut == cut) & (seg.segment == segment)].dropna(subset=['MAPE'])
+    if d.empty:
+        return None
+    # One row per model: its best arm ON THIS SEGMENT. Ranking a segment by the arm that won
+    # overall would report a number the figure does not show.
+    d = d.loc[d.groupby('model')['MAPE'].idxmin()].sort_values('MAPE', ascending=False)
+    kinds = kinds or {}
+    ks = [kinds.get(m, 'archformer' if m.startswith('archformer') else 'point')
+          for m in d['model']]
+    colors = [_KIND_COLOR.get(k, _C_POINT) for k in ks]
+    n = len(d)
+    fig, ax = plt.subplots(figsize=(11, max(4.0, 0.30 * n + 1.6)))
+    ax.barh(range(n), d['MAPE'], height=0.74, color=colors, edgecolor='white', linewidth=0.4)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels([f"{m} [{a}]" for m, a in zip(d['model'], d['arm'])], fontsize=7.5)
+    for i, v in enumerate(d['MAPE']):
+        ax.text(v, i, f'  {v:.2f}', va='center', fontsize=7)
+    ax.set_xlabel(label, fontsize=9)
+    ax.set_xlim(0, d['MAPE'].max() * 1.18)
+    ax.grid(axis='x', linestyle='--', alpha=0.5)
+    npts = int(d['n'].iloc[0])
+    ax.set_title(f'{zone} — {label}   (n = {npts:,} hours, best arm per model)',
+                 fontsize=11, fontweight='bold')
+    # Legend only for the kinds actually drawn, so a load-band chart with no foundation row
+    # does not advertise an absent colour.
+    present = [k for k in _KIND_COLOR if k in set(ks)]
+    if len(present) > 1:
+        ax.legend([plt.Rectangle((0, 0), 1, 1, color=_KIND_COLOR[k]) for k in present],
+                  [_KIND_LABEL[k] for k in present], loc='lower right', fontsize=7.5)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    return path
+
+
+def write_segments(evaluation_root, zone, kinds=None):
+    """The four segmented figures plus one tidy CSV. Returns the paths written."""
+    seg = collect_segments(evaluation_root)
+    if seg.empty:
+        return []
+    csv_path = os.path.join(evaluation_root, '_scoreboard_segments.csv')
+    seg.to_csv(csv_path, index=False)
+    out = [csv_path]
+    for cut, segment, label in _SEG_FIGS:
+        p = os.path.join(evaluation_root, f'_scoreboard_seg_{cut}_{segment}.png')
+        if plot_segment(seg, zone, cut, segment, label, p, kinds):
+            out.append(p)
+    return out
+
+
 def write(evaluation_root, zone):
     df = collect(evaluation_root)
     if df.empty:
@@ -278,5 +394,7 @@ def write(evaluation_root, zone):
     print(df[cols].to_string(index=False, float_format=lambda v: f'{v:.3f}'))
     print(f"\n-> {csv_path}")
     for q in pngs:
+        print(f"-> {q}")
+    for q in write_segments(evaluation_root, zone, dict(zip(df['model'], df['kind']))):
         print(f"-> {q}")
     return df

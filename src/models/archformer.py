@@ -45,11 +45,101 @@ import torch.nn.functional as F
 from src.models._seq_trainer import train_sequence
 from src.models._eval_utils import EvalUtils
 from src.models._garchformer.pointmodels import ARCHFormer3
+from src.models._garchformer.layers import (
+    PatchTokenizer, PositionalEncoding, ARCHEncoder, MLPConnectionBlock,
+    ARCHDecoder, InversePatchTokenizer, FinalProjectionHead,
+)
 from src.config import ARCHFORMER_FEATURE_CONFIG, ARCHFORMER_PARAMS
 
 NAME = 'ARCHFORMER'
 MODEL_TYPE = 'archformer'
 FILENAME = 'archformer_best.pth'
+
+
+
+# ---------------------------------------------------------------------------
+# Static skip: the statics join at the decoder output, not at the tokenizer
+# ---------------------------------------------------------------------------
+
+class _SkipARCHFormer3(nn.Module):
+    """ARCHFormer3 with the broadcast constants routed past the encoder-decoder stack.
+
+    Upstream feeds every channel to the patch tokenizer. On this repo's tensor that means
+    54 of the 76 channels are constants repeated 24 times inside each patch, so 71 % of the
+    tokenizer's 1824 inputs are duplicate copies and the Linear(1824 -> 64) spends most of
+    its 116,800 parameters re-reading them. Here only the n_seq time-varying channels are
+    tokenised, and the statics are concatenated to every decoder token:
+
+        x_dec        (B, N, d_model)
+        static       (B, S)  ->  broadcast  (B, N, S)
+        cat          (B, N, d_model + S)
+        fuse         Linear(d_model + S -> d_model), ReLU, Dropout      <- the nonlinearity
+        inverse tok  Linear(d_model -> patch_len * n_seq)   [vendored, shared with sigma]
+        head         Linear(n_seq -> 1), take the last out_len positions
+
+    The ReLU is load-bearing, and it is easy to leave out. Concatenating into a LINEAR layer
+    is only addition: Linear([h || s]) = W_h h + W_s s + b, so the static contribution would
+    not depend on h at all. Measured on an earlier draft of this class, with the fusion layer
+    linear: perturbing the statics moved the forecast with std 0.22 across the 24 hours (so
+    each static did get its own per-hour weight) but the effect of that perturbation was
+    byte-identical on two samples with different sequences -- no interaction. With the ReLU
+    the same test separates them.
+
+    That is the same failure the PREVIOUS static skip had, one level worse: it emitted its
+    own out_dim vector and added it to the finished y_hat, so 54 features collapsed to one
+    offset per hour and the forecast could be shifted but never modulated. It scored 3.380
+    against 3.242 for the same recipe with no skip at all.
+
+    The variance path skips the fusion layer, so the statics never reach it. sigma^2
+    estimates how volatile an hour is; that is a property of the series, and letting the
+    calendar or a temperature forecast set it directly is a different model. Both paths
+    share the inverse tokenizer and FinalProjectionHead, as upstream does.
+
+    Every component here is the vendored class, unmodified -- only the wiring differs.
+    """
+
+    def __init__(self, seq_length_enc, seq_length_dec, n_seq, n_static, patch_len, d_model,
+                 num_heads, num_encoder_layers, num_decoder_layers, intermediate_dim,
+                 out_len, dropout=0.1):
+        super().__init__()
+        self.n_seq, self.n_static = n_seq, n_static
+        n_patch_enc = seq_length_enc // patch_len
+        n_patch_dec = seq_length_dec // patch_len
+
+        self.tokenizer = PatchTokenizer(patch_len, n_seq, d_model)
+        self.pos_encoder = PositionalEncoding(n_patch_enc, d_model)
+        self.encoder = ARCHEncoder(d_model, num_heads, num_encoder_layers, dropout)
+        self.connection_block = MLPConnectionBlock(n_patch_enc, n_patch_dec, d_model,
+                                                   intermediate_dim)
+        self.decoder = ARCHDecoder(d_model, num_heads, num_decoder_layers, dropout)
+        # Fuse the statics into the day representation, with a nonlinearity, and come back
+        # out at d_model -- so the vendored inverse tokenizer is used at its own width and
+        # the variance path can share it.
+        self.fuse = nn.Sequential(
+            nn.Linear(d_model + n_static, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.inverse_tokenizer = InversePatchTokenizer(patch_len, n_seq, d_model)
+        self.head = FinalProjectionHead(n_seq, out_len)
+
+    def forward(self, x):
+        seq = x[:, :, :self.n_seq]
+        static = x[:, 0, self.n_seq:]                      # constant along t by construction
+
+        h = self.pos_encoder(self.tokenizer(seq))
+        h, mu_list, sigma_list = self.encoder(h)
+        h = self.connection_block(h)
+        h, _, sigma_dec_list = self.decoder(h, mu_list[-1], sigma_list[-1])
+
+        s = static.unsqueeze(1).expand(-1, h.size(1), -1)  # (B, N, S)
+        h_fused = self.fuse(torch.cat([h, s], dim=-1))     # (B, N, d_model)
+        y_hat = self.head(self.inverse_tokenizer(h_fused))
+
+        # sigma^2 skips the fusion entirely, so the statics never reach it.
+        sigma_rec = self.inverse_tokenizer(sigma_dec_list[-1])
+        sigma_sq = torch.abs(self.head(sigma_rec)) + 1e-6
+        return y_hat, sigma_sq
 
 
 # ---------------------------------------------------------------------------
@@ -75,61 +165,50 @@ class ARCHFormerNet(nn.Module):
         self.lambda_cons = float(params.get('lambda_cons', 0.1))
 
         # Static skip, OFF by default so the shipped configuration stays the author's.
-        # n_seq_features splits the tensor the way the other six nets split it: the
-        # time-varying channels go through the patch tokenizer, the broadcast constants go
-        # straight to the head. See _StaticProjectionHead for the measurement behind it.
+        # Setting n_seq_features turns it on: the time-varying channels go through the patch
+        # tokenizer and the broadcast constants join at the decoder output instead
+        # (_SkipARCHFormer3). Without it every channel is tokenised, as upstream does.
         self.n_seq = int(params.get('n_seq_features') or num_features)
         self.n_static = num_features - self.n_seq
-        self.net = ARCHFormer3(
-            seq_length_enc=lookback,
-            seq_length_dec=params.get('seq_length_dec', lookback),
-            num_features=self.n_seq,
-            patch_len=patch_len,
-            d_model=params['d_model'],
-            num_heads=params['num_heads'],
-            num_encoder_layers=params['num_encoder_layers'],
-            num_decoder_layers=params['num_decoder_layers'],
-            intermediate_dim=params['intermediate_dim'],
-            out_len=params['out_dim'],
-            dropout=params['dropout'],
-        )
-        # The static path is a SEPARATE head that emits all out_dim hours, added to the
-        # network's own output. It is not folded into FinalProjectionHead, and that is the
-        # whole point: that head is Linear(C -> 1) applied per position, so a static value
-        # concatenated there contributes the SAME scalar at all 168 positions -- 54 features,
-        # including the 24 hourly forecast-weather departures that carry the target day's
-        # shape, collapse into one number. Measured: with the sequence path zeroed, the
-        # static contribution had std 0.0 across the 24 hours, and the model then underfit
-        # (train loss 0.29 against the baseline's 0.14). Emitting out_dim gives every static
-        # its own weight on every hour, which is what the other six sequence models do.
-        #
-        # Deliberately NOT added to sigma_sq: the variance head stays the author's, and the
-        # vendored FinalProjectionHead is used unmodified for both paths.
         if self.n_static > 0:
-            fc_hidden = params.get('fc_hidden', 128)
-            # Its OWN dropout, defaulting to the main path's. The static head is an additive
-            # SHORTCUT: two layers from the statics straight to the 24 outputs, against ten-odd
-            # transformations on the main path (tokenizer -> 2 encoder layers -> bridge ->
-            # 2 decoder layers -> inverse tokenizer -> head). Gradient descent fits the short
-            # path first, and if it absorbs enough of the signal the GARCH machinery never has
-            # to learn anything -- the variant would score well while measuring nothing about
-            # the architecture under test. Handicapping the shortcut is the cheapest guard.
-            self.static_head = nn.Sequential(
-                nn.Linear(self.n_static, fc_hidden),
-                nn.ReLU(),
-                nn.Dropout(float(params.get('static_dropout', params['dropout']))),
-                nn.Linear(fc_hidden, params['out_dim']),
+            # Statics bypass the tokenizer and join at the decoder output -- see
+            # _SkipARCHFormer3 for why, and for why the previous additive form was wrong.
+            self.net = _SkipARCHFormer3(
+                seq_length_enc=lookback,
+                seq_length_dec=params.get('seq_length_dec', lookback),
+                n_seq=self.n_seq,
+                n_static=self.n_static,
+                patch_len=patch_len,
+                d_model=params['d_model'],
+                num_heads=params['num_heads'],
+                num_encoder_layers=params['num_encoder_layers'],
+                num_decoder_layers=params['num_decoder_layers'],
+                intermediate_dim=params['intermediate_dim'],
+                out_len=params['out_dim'],
+                dropout=params['dropout'],
+            )
+        else:
+            # The author's model, every channel through the tokenizer. This is what
+            # `archformer` and `archformer_hp` run.
+            self.net = ARCHFormer3(
+                seq_length_enc=lookback,
+                seq_length_dec=params.get('seq_length_dec', lookback),
+                num_features=num_features,
+                patch_len=patch_len,
+                d_model=params['d_model'],
+                num_heads=params['num_heads'],
+                num_encoder_layers=params['num_encoder_layers'],
+                num_decoder_layers=params['num_decoder_layers'],
+                intermediate_dim=params['intermediate_dim'],
+                out_len=params['out_dim'],
+                dropout=params['dropout'],
             )
         self._sigma_sq = None
 
     def forward(self, x):
-        static = None
-        if self.n_static > 0:
-            static = x[:, 0, self.n_seq:]          # constant along t by construction
-            x = x[:, :, :self.n_seq]
+        # Both nets take the full tensor and split it themselves (or not, when there is
+        # nothing static to split off), so this wrapper does no slicing.
         y_hat, sigma_sq = self.net(x)
-        if static is not None:
-            y_hat = y_hat + self.static_head(static)
         # Stashed rather than returned: every caller in this repo expects a single
         # tensor, and a tuple would have to be unpacked in the trainer, the
         # evaluator, the residual factory and the serving path alike.

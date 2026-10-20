@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_percentage_error, mean_absolute_error, mean_squared_error
 
 from src.config import TARGET_UNIT, TARGET_SPEC
+from src.models import _segments
 
 
 # ---------------------------------------------------------------------------
@@ -394,9 +395,25 @@ class EvalUtils:
         dom_mape   = detailed_df.groupby('day_of_month')['mape_pct'].mean()
         daily_mape = detailed_df.groupby('date')['mape_pct'].mean().sort_values(ascending=False)
 
+        # Segmented metrics: by load band, and on the most volatile hours. Both cuts are
+        # defined on the TRUE target, so every model is scored on the identical point set.
+        # Only meaningful on a full 24-hour day -- a MoE expert slice is already a subset.
+        seg_rows, seg_cols = ([], {})
+        if full:
+            try:
+                seg_rows, seg_cols = _segments.compute(
+                    detailed_df['datetime'], y_true_np[:, hcols].flatten(),
+                    y_pred_np[:, hcols].flatten())
+                for k, v in seg_cols.items():
+                    detailed_df[k] = v
+            except Exception as exc:                       # never fail a run over a report
+                print(f"  (segmented metrics skipped: {exc})")
+
         csv_path = os.path.join(result_dir, f'{model_name}_detailed_errors.csv')
         detailed_df.drop(columns=['date']).to_csv(csv_path, index=False)
         print(f"Detailed errors saved to: {csv_path}")
+        if seg_rows:
+            print(f"Segment metrics saved to: {_segments.write(seg_rows, result_dir, model_name)}")
 
         # Persist the headline metrics next to the plots so a run's score is a file, not a
         # line that scrolled off the terminal. Peak MAPE (top-10% load hours) + worst/best day
@@ -435,6 +452,8 @@ class EvalUtils:
                 f.write(f"Peak wMAPE (top 10% {plab} hours): {peak_wmape:.3f} %\n")
             f.write(f"Worst day: {daily_mape.index[0]} ({daily_mape.iloc[0]:.2f}%)\n")
             f.write(f"Best day:  {daily_mape.index[-1]} ({daily_mape.iloc[-1]:.2f}%)\n")
+            if seg_rows:
+                f.write(_segments.to_text(seg_rows, U))
         print(f"Metrics summary saved to: {txt_path}")
 
         EvalUtils.plot_error_distributions(model_name, hourly_mape, dow_mape, dom_mape, result_dir, hours=hcols)

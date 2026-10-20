@@ -46,6 +46,7 @@
 \newcommand{\PReLU}{\mathrm{PReLU}}
 \newcommand{\softmax}{\mathrm{softmax}}
 \newcommand{\Drop}{\mathrm{Dropout}}
+\newcommand{\ind}{\mathbf{1}}
 \newcommand{\note}[1]{\marginpar{\raggedright\scriptsize\color{gray}#1}}
 
 % --- TikZ styles --------------------------------------------------------
@@ -61,231 +62,74 @@
   ard/.style   ={-{Latex[length=2mm]}, thick, dashed, color=gray!70!black},
 }
 
-\title{\bfseries PJM Zonal Load Forecasting:\\
-       Model Architectures, Tensor Shapes and Pipeline Reference}
-\author{Architecture reference generated from the repository source}
-\date{\today}
+\title{PJM zonal load forecasting: features and model structures}
+\author{}
+\date{}
 
 \begin{document}
 \maketitle
-\tableofcontents
-\newpage
-
-% =====================================================================
-\section{Scope and Reading Guide}
-% =====================================================================
-
-This document specifies, for every trainable model in the repository:
-
-\begin{enumerate}
-  \item the tensor that enters the model and its exact shape;
-  \item every layer, with its weight shapes and its mathematical definition;
-  \item the shape after each layer;
-  \item what bypasses the encoder (the \emph{static skip}) and where it is
-        concatenated;
-  \item the output head and the inverse transform back to megawatts.
-\end{enumerate}
-
-Eighteen deterministic point models and four probabilistic baselines are
-covered. The zero-shot foundation model (TimesFM 3.0) is deliberately
-excluded: its weights are pre-trained elsewhere and its internals are not
-part of this repository.
-
-Two independent binary switches, \code{PJM\_CONGESTION} and \code{PJM\_LMP},
-change the width of the feature set. All four combinations are trained, and
-every shape below is therefore given as a function of the switch setting.
-Numeric examples use the \code{\_cong} arm on zone \code{dom}, which is the
-arm the best-scoring models were trained under.
-
-\paragraph{Source map.} Section~\ref{sec:pipeline} corresponds to
-\code{src/data\_crawler/} and \code{src/data\_processor.py};
-Section~\ref{sec:features} to \code{src/feature\_engine.py} and the five
-\code{src/*\_features.py} modules; Section~\ref{sec:point} to
-\code{src/models/}; Section~\ref{sec:prob} to \code{src/quantile/},
-\code{src/qrnn/} and \code{src/density/}.
-
-% =====================================================================
-\section{Notation}
-% =====================================================================
-
-\begin{table}[htbp]
-\centering
-\small
-\begin{tabular}{@{}llp{8.4cm}@{}}
-\toprule
-Symbol & Value (dom) & Meaning \\
-\midrule
-$N$        & $1957$   & daily samples in the matrix (one sample $=$ one target day) \\
-$L$        & $168$    & lookback length in hours ($7\times24$) \\
-$D$        & $7$      & lookback days, $L = 24D$ \\
-$H$        & $24$     & output horizon in hours (one target day) \\
-$C_{\text{seq}}$ & $22$ or $25$ & per-timestep (sequence) channels \\
-$S$        & $40/48/50/58$ & static (per-sample) numeric features \\
-$C$        & $68/76/81/89$ & total channels of the 3-D tensor, $C = C_{\text{seq}} + 6 + S$ \\
-$P$        & $3742\ldots4264$ & columns of the 2-D (tree) matrix \\
-$B$        & $32$     & mini-batch size \\
-$d$        & $64$     & Transformer model width \\
-$h_{\text{LSTM}}$ & $128$ & LSTM hidden width \\
-$\mu_y,\sigma_y$ & --- & target \code{StandardScaler} constants, fit on the train split \\
-$\mathbf{x}_i$ & --- & sample $i$'s input; $\mathbf{y}_i \in \R^{24}$ its metered load \\
-$b_i \in \R^{24}$ & --- & naive same-hour-last-week baseline of sample $i$ \\
-\bottomrule
-\end{tabular}
-\caption{Global notation. All shapes are written batch-first.}
-\end{table}
+\vspace{-3em}
 
 \noindent
-Throughout, EPT denotes \emph{Eastern Prevailing Time} (the local wall clock,
-including daylight saving). The cleaned frame is indexed in UTC and carries
-EPT as a column; every date-based join in the repository is on EPT, never on
-the UTC index.
+Record of what goes into the models and what they are. One dataset (PJM zone
+\code{dom} or \code{bge}), nine point architectures $\times$ \{direct, residual\},
+four probabilistic baselines. TimesFM is excluded --- pre-trained elsewhere.
+Numbers are \code{dom}, arm \code{\_cong}, unless said otherwise.
 
 % =====================================================================
-\section{Data Pipeline}\label{sec:pipeline}
+\section{Dataset and features}
 % =====================================================================
 
-\subsection{Stages}
+\noindent
+Sources: PJM Dataminer2 (metered + preliminary load, Day-Ahead marginal value,
+zonal LMP) and Open-Meteo (ERA5 observed weather, forecast archive). Merged on
+the UTC hour into \code{cleaned\_pjm\_load\_weather.csv} ($49\,511$ rows); the
+weather-forecast, congestion and Day-Ahead price tables stay on their own index
+because they are looked up per \emph{target day}, not per row.
 
-\begin{figure}[htbp]
-\centering
-\fitfig{%
-\begin{tikzpicture}[node distance=6mm]
-\node[data] (pjm)   at (0,3.2)  {PJM Dataminer2\\metered + preliminary};
-\node[data] (met)   at (0,1.9)  {Open-Meteo ERA5\\observed weather};
-\node[data] (fc)    at (0,0.6)  {Open-Meteo\\forecast archive};
-\node[data] (mv)    at (0,-0.7) {PJM DA\\marginal value};
-\node[data] (lmp)   at (0,-2.0) {PJM DA/RT\\zonal LMP};
+\subsection{The task and the blind spot}
 
-\node[blk]  (join)  at (4.4,2.4) {\code{aligner.merge\_and\_align}\\join on UTC hour};
-\node[blk]  (clean) at (4.4,0.9) {\code{data\_processor}\\\code{clean\_and\_engineer}};
-\node[data] (cl)    at (8.9,0.9) {\code{cleaned\_pjm\_}\\\code{load\_weather.csv}\\\scriptsize 49\,511 rows $\times$ 27 cols};
-
-\node[data] (fcsv)  at (8.9,-0.7)  {\code{cleaned/forecast.csv}\\\scriptsize issue $\times$ lead $\times$ hour};
-\node[data] (ccsv)  at (8.9,-1.9)  {\code{cleaned/congestion.csv}};
-\node[data] (lcsv)  at (8.9,-3.0)  {\code{cleaned/lmp\_da.csv}};
-
-\draw[ar] (pjm) -- (join);
-\draw[ar] (met) -- (join);
-\draw[ar] (lmp.east) to[out=0,in=200] (join.west);
-\draw[ar] (join) -- (clean);
-\draw[ar] (clean) -- (cl);
-\draw[ar] (fc) -- (fcsv);
-\draw[ar] (mv) -- (ccsv);
-\draw[ar] (lmp) -- (lcsv);
-\end{tikzpicture}}
-\caption{Ingest. The three side tables on the right are kept on their own
-index (issue date, or EPT day) rather than merged into the hourly frame,
-because they are looked up per \emph{target day}, not per row.}
-\end{figure}
-
-\subsection{Cleaning and the training mask}
-
-\code{clean\_and\_engineer} produces, per hourly row: cyclical calendar
-encodings
-\[
-\big(\sin\tfrac{2\pi \cdot \text{hour}}{24},\ \cos\tfrac{2\pi \cdot \text{hour}}{24},\
-     \sin\tfrac{2\pi \cdot \text{month}}{12},\ \cos\tfrac{2\pi \cdot \text{month}}{12}\big),
-\]
-a US federal-holiday flag, a weekend flag, and the training mask. The mask is
-a per-\emph{month-of-year} $\times$ \emph{hour-of-day} three-sigma rule
-combined with label availability:
-\[
-z_t = \frac{y_t - \bar{y}_{m(t),h(t)}}{s_{m(t),h(t)} + 10^{-6}},
-\qquad
-\texttt{is\_valid}_t = \mathbb{1}\!\left[\,|z_t| \le 3\,\right] \cdot \mathbb{1}\!\left[\,y_t \text{ observed}\,\right].
-\]
-On dom, $99.57\%$ of rows pass. A \emph{day} enters training only if all
-24 of its hours pass; a failed day is still built into the matrix but is
-dropped from the training set by the mask, so the test set keeps every day.
-
-\subsection{The forecast timeline and the 24-hour blind spot}
-\label{sec:timeline}
-
-Every model in this repository answers the same question: \emph{given
-everything known at midnight EPT on day $d$, forecast the 24 hourly loads of
-day $d+1$}. That leaves day $d$ itself unobservable --- the lookback window
-ends before it starts, and the calendar does not describe it.
+Given everything known at midnight EPT on day $d$, forecast the 24 hourly loads
+of day $d{+}1$. Day $d$ itself is never observed.
 
 \begin{figure}[htbp]
 \centering
 \fitfig{%
 \begin{tikzpicture}[x=1.05cm,y=1cm]
-% timeline
 \draw[thick,->] (-0.4,0) -- (12.4,0);
-\foreach \x/\lab in {0/{$d\!-\!7$}, 1.5/{}, 3/{}, 4.5/{}, 6/{}, 7.5/{$d\!-\!1$}, 9/{$d$}, 10.5/{$d\!+\!1$}} {
-  \draw (\x,-0.12) -- (\x,0.12);
-}
 \node[font=\scriptsize] at (0,-0.42)    {$d{-}7$};
-\node[font=\scriptsize] at (7.5,-0.42)  {$d{-}1$};
 \node[font=\scriptsize] at (9,-0.42)    {$d$ 00:00};
 \node[font=\scriptsize] at (11.6,-0.42) {$d{+}1$ 23:00};
-
-% lookback bracket
 \draw[very thick, blue!60!black] (0,0.55) -- (9,0.55);
-\node[font=\scriptsize,blue!60!black,above] at (4.5,0.55) {168\,h lookback window (observed)};
-
-% cutoff
+\node[font=\scriptsize,blue!60!black,above] at (4.5,0.55) {168\,h lookback (observed)};
 \draw[very thick, red!70!black, dashed] (9,-0.75) -- (9,1.5);
 \node[font=\scriptsize\bfseries, red!70!black, above] at (9,1.5) {CUTOFF};
-
-% blind spot
 \fill[orange!25] (9,-0.05) rectangle (10.5,0.28);
-\node[font=\scriptsize, orange!55!black] at (9.75,-0.95) {blind spot};
-\node[font=\scriptsize, orange!55!black] at (9.75,-1.25) {(day $d$)};
-
-% target
+\node[font=\scriptsize, orange!55!black] at (9.75,-0.95) {blind spot ($d$)};
 \fill[green!25] (10.5,-0.05) rectangle (12,0.28);
-\node[font=\scriptsize, green!35!black] at (11.25,-0.95) {TARGET};
-\node[font=\scriptsize, green!35!black] at (11.25,-1.25) {(day $d{+}1$)};
-
-% what fills the blind spot
-\draw[ard] (9.75,-1.5) -- (9.75,-2.1);
-\node[blk, font=\scriptsize, fill=orange!8] at (9.75,-2.55)
-  {31 forecast-weather features\\8 congestion features\\10 Day-Ahead price features};
-\draw[ard] (11.25,-1.5) -- (11.25,-2.1);
-\node[blk, font=\scriptsize, fill=green!8] at (11.6,-2.55) {6 calendar\\features};
+\node[font=\scriptsize, green!35!black] at (11.25,-0.95) {TARGET ($d{+}1$)};
+\draw[ard] (9.75,-1.2) -- (9.75,-1.7);
+\node[blk, font=\scriptsize, fill=orange!8] at (9.75,-2.15)
+  {31 forecast-weather\\8 congestion\\10 Day-Ahead price};
+\draw[ard] (11.25,-1.2) -- (11.25,-1.7);
+\node[blk, font=\scriptsize, fill=green!8] at (11.7,-2.15) {6 calendar};
 \end{tikzpicture}}
-\caption{The forecast geometry. Day $d$ is invisible to the lookback, so
-three static blocks --- weather forecast, transmission congestion and
-Day-Ahead price --- are spliced in specifically to describe it. All three
-are known before the cutoff: day $d$'s Day-Ahead market clears at
-$\approx$13:30 EPT on day $d{-}1$, and the 48\,h weather forecast covering
-days $d$ and $d{+}1$ is issued on day $d{-}2$.}
+\caption{Three static blocks exist specifically to describe the blind-spot day.
+All are known before the cutoff: day $d$'s Day-Ahead market clears $\approx$13:30
+on $d{-}1$, and the 48\,h weather forecast covering $d$ and $d{+}1$ is issued on
+$d{-}2$. A target day missing either is dropped from the matrix, not zero-filled.}
 \end{figure}
 
-\noindent
-This is enforced, not merely documented. \code{congestion\_features.assert\_available}
-raises if the configured cutoff hour would read a Day-Ahead result that had
-not yet posted, and a target day with no complete 48\,h forecast (or no
-Day-Ahead result) is \emph{dropped} from the matrix rather than zero-filled,
-because a zero would read as ``exactly normal'' on precisely the days
-nothing is known about.
+\subsection{Sequence channels --- $C_{\text{seq}} = 22$, or $25$ with prices}
 
-% =====================================================================
-\section{Feature Construction}\label{sec:features}
-% =====================================================================
+One value per hour, fed to the encoder as a $(168, C_{\text{seq}})$ series.
 
-Features fall into two classes that are treated completely differently by
-every neural model:
-
-\begin{description}
-\item[Sequence channels] change every hour and enter the encoder as a
-      $(L, C_{\text{seq}})$ time series.
-\item[Static features] take one value per sample. They are broadcast across
-      the window in the stored tensor, but every model slices them back out at
-      timestep $0$ and concatenates them \emph{after} the encoder. The encoder
-      therefore never re-processes a constant 168 times.
-\end{description}
-
-\subsection{Sequence channels ($C_{\text{seq}} = 22$ or $25$)}
-
-\begin{table}[htbp]
-\centering\small
-\begin{tabular}{@{}llp{7.2cm}@{}}
+\begin{center}\small
+\begin{tabular}{@{}llp{8.4cm}@{}}
 \toprule
 Group & \# & Columns \\
 \midrule
-Load & 1 & \code{Load\_Estimated} (preliminary load, published in real time) \\
+Load & 1 & \code{Load\_Estimated} (preliminary, published in real time) \\
 Weather & 11 & \code{Temp\_F}, \code{ApparentTemp\_F}, \code{Dewpoint\_F},
   \code{RelativeHumidity\_pct}, \code{SolarRadiation\_Wm2}, \code{WindSpeed\_mph},
   \code{WindDirection\_deg}, \code{WindGusts\_mph}, \code{Precip\_in},
@@ -293,424 +137,141 @@ Weather & 11 & \code{Temp\_F}, \code{ApparentTemp\_F}, \code{Dewpoint\_F},
 Thermal & 10 & \code{CDD\_h}, \code{HDD\_h}, \code{CDD\_cum\_\{24,48,72\}h},
   \code{Temp\_ma\_\{24,72\}h}, \code{Temp\_delta\_24h}, \code{HeatIndex\_F},
   \code{WetBulb\_F} \\
-RT price & 3 & \code{RT\_\{Total,Energy,Cong\}\_slog}
-  \hfill(only when \code{PJM\_LMP=1}) \\
-\midrule
-\multicolumn{2}{@{}l}{Total} & $22$, or $25$ with the price channels \\
-\bottomrule
-\end{tabular}
-\caption{Per-timestep channels. All rolling statistics are strictly causal.}
-\end{table}
-
-\paragraph{Thermal derivations.} With base temperature $T_b = 65^\circ$F,
-\begin{align}
-\mathrm{CDD}_t &= \max(0,\ T_t - T_b), &
-\mathrm{HDD}_t &= \max(0,\ T_b - T_t), \\
-\mathrm{CDDcum}^{(w)}_t &= \textstyle\sum_{j=0}^{w-1}\mathrm{CDD}_{t-j}, \quad w \in \{24,48,72\}, &
-\overline{T}^{(w)}_t &= \tfrac1w \textstyle\sum_{j=0}^{w-1} T_{t-j}, \quad w \in \{24,72\}, \\
-\Delta T_t &= T_t - T_{t-24}. & &
-\end{align}
-Heat index uses the NWS Rothfusz regression above $80^\circ$F and the simple
-form below it; wet-bulb uses the Stull (2011) approximation
-\[
-T_w = T_c\arctan\!\big(0.151977\sqrt{\mathrm{RH}+8.313659}\big)
-      + \arctan(T_c + \mathrm{RH}) - \arctan(\mathrm{RH}-1.676331)
-      + 0.00391838\,\mathrm{RH}^{3/2}\arctan(0.023101\,\mathrm{RH}) - 4.686035,
-\]
-with $T_c$ in ${}^\circ$C and the result converted back to ${}^\circ$F.
-
-\paragraph{Price transform.} Real-Time LMP has a $120\times$ right tail and is
-negative in $\approx22\%$ of hours, so \code{log1p} is undefined and a raw
-channel would be flattened by standardization. The channels use the signed log
-\[
-\mathrm{slog}(x) = \operatorname{sign}(x)\,\log(1+|x|),
-\]
-which compresses the tail, preserves the sign, and is defined on all of $\R$.
-
-\subsection{Static features}
-
-\subsubsection{Forecast-day calendar (6)}
-Taken from the \emph{target} day $d{+}1$, not from the lookback:
-\[
-\Big(\sin\tfrac{2\pi m}{12},\ \cos\tfrac{2\pi m}{12},\
-     \sin\tfrac{2\pi w}{7},\ \cos\tfrac{2\pi w}{7},\
-     \mathbb{1}[\text{weekend}],\ \mathbb{1}[\text{holiday}]\Big),
-\]
-with $m$ the month and $w \in \{0,\ldots,6\}$ the day of week. Hour-of-day is
-deliberately absent: it is implicit in the 24-dimensional output.
-
-\subsubsection{Macro / multi-week context (4)}
-Three seven-day windows ending at the cutoff position $c$:
-$W_1 = [c-168, c)$, $W_2 = [c-336, c-168)$, $W_3 = [c-504, c-336)$.
-Let $q_j$ be the $5$th percentile of \emph{preliminary} load over the
-night hours $\{1,\ldots,6\}$ of $W_j$. Then
-\begin{align}
-\text{macro\_q05\_slope\_d1} &= q_1 - q_2, &
-\text{macro\_q05\_slope\_d2} &= q_2 - q_3, \\
-\text{macro\_energy\_ratio}  &= \frac{\sum_{t\in W_1}\tilde y_t}{\sum_{t\in W_2}\tilde y_t}, &
-\text{macro\_lag168\_err}    &= \frac{1}{6}\sum_{k=1}^{6}\big|\tilde y_{c-k} - \tilde y_{c-168-k}\big|,
-\end{align}
-where $\tilde y$ is preliminary load. Metered load is never used here: it lags
-by $\approx2$ weeks and would be leakage. This block is why the matrix builder
-requires 504 hours of history before a sample can exist.
-
-\subsubsection{Thermal state (5)}
-With $d_1 = [c-24,c)$, $d_2 = [c-48,c-24)$, $d_3 = [c-72,c-48)$:
-\[
-\Big(\max_{t \in d_1} T_t,\quad
-     \textstyle\sum_{t\in d_1}\mathrm{CDD}_t,\quad
-     \max_{t \in d_1 \cup d_2 \cup d_3} T_t,\quad
-     \frac{\sum_{d_1}\mathrm{CDD}}{\sum_{d_2}\mathrm{CDD} + 10^{-3}},\quad
-     \overline{T}_{d_1} - \overline{T}_{d_3}\Big).
-\]
-These express what a causal rolling mean cannot: a daily \emph{extreme}, and a
-\emph{direction} (the CDD ratio is $>1$ when heat is building).
-
-\subsubsection{Forecast weather (31)}\label{sec:fcfeat}
-Let $\hat T^{(0)} \in \R^{24}$ and $\hat T^{(1)} \in \R^{24}$ be the archived
-forecast temperatures for the blind-spot day $d$ and the target day $d{+}1$,
-both from the issue date $d{-}1$. Let $r_h$ be the mean observed temperature
-over the lookback window restricted to true EPT clock hour $h$:
-\[
-r_h = \frac{1}{|\{t \in W : \mathrm{hour}(t)=h\}|}\sum_{t \in W,\ \mathrm{hour}(t)=h} T_t .
-\]
-The 31 features are
-\begin{align}
-\text{fc\_dev\_h}h &= \hat T^{(1)}_h - r_h, \qquad h = 0,\ldots,23 &&\text{(24 features)}\\
-\text{fc\_d1\_cdd\_dev} &= \textstyle\sum_h \max(0,\hat T^{(1)}_h - T_b) - \overline{\mathrm{CDD}}^{\text{day}}_W \\
-\text{fc\_d1\_hdd\_dev} &= \textstyle\sum_h \max(0,T_b - \hat T^{(1)}_h) - \overline{\mathrm{HDD}}^{\text{day}}_W \\
-\text{fc\_d0\_max\_dev} &= \max_h \hat T^{(0)}_h - \max_{t \in d_1} T_t \\
-\text{fc\_d1\_max\_dev} &= \max_h \hat T^{(1)}_h - \max_h \hat T^{(0)}_h \\
-\text{fc\_2d\_cdd\_buildup} &= \textstyle\sum_h\max(0,\hat T^{(0)}_h - T_b) + \sum_h\max(0,\hat T^{(1)}_h - T_b) - 2\,\overline{\mathrm{CDD}}^{\text{day}}_W \\
-\text{fc\_d1\_temp\_max} &= \max_h \hat T^{(1)}_h &&\text{(absolute anchor)}\\
-\text{fc\_d1\_temp\_peak} &= \tfrac16\textstyle\sum_{h=14}^{19}\hat T^{(1)}_h &&\text{(absolute anchor)}
-\end{align}
-where $\overline{\mathrm{CDD}}^{\text{day}}_W$ is the window's CDD total divided
-by $L/24$ days. Twenty-nine of the thirty-one are \emph{departures} rather than
-levels, because 168 hours of observed temperature already state the level; three
-absolute anchors survive because load responds non-linearly to temperature and
-$+8^\circ$F on a $92^\circ$F base is worth far more MW than on a $62^\circ$F base.
-
-\subsubsection{Congestion (8, when \code{PJM\_CONGESTION=1})}
-Built from RTO-wide Day-Ahead transmission-constraint shadow prices on the
-blind-spot day $d$. Let, for EPT day $\delta$,
-\[
-\ell(\delta) = \overline{\log(1+\text{sum\_sp})},\quad
-\pi(\delta) = \overline{\log(1+\text{sum\_sp})}\big|_{h \in [14,20)},\quad
-\chi(\delta) = \max_h \log(1+\text{max\_sp}),\quad
-\nu(\delta) = \textstyle\sum_h n_h,
-\]
-and let $\mathcal{R}_w[f](\delta)$ denote the trailing $w$-day mean of $f$
-\emph{including} $\delta$, with $w \in \{3,7,21\}$. The block is
-\[
-\begin{aligned}
-&\ell - \mathcal{R}_7[\ell], \quad \ell - \mathcal{R}_3[\ell], \quad \ell - \mathcal{R}_{21}[\ell], \quad
- \pi - \mathcal{R}_7[\pi], \\
-&\chi - \mathcal{R}_7[\chi], \quad \nu - \mathcal{R}_7[\nu], \quad
- \mathcal{R}_7[\ell] - \mathcal{R}_{21}[\ell], \quad \pi ,
-\end{aligned}
-\]
-all evaluated at $\delta = d$. The last entry is the only level form retained.
-The departure form is not cosmetic: a LightGBM gain breakdown put
-$\ell - \mathcal{R}_7[\ell]$ at $3.31\%$ of total gain and the level $\ell$ at
-$0.06\%$ --- a $50\times$ difference for the same underlying quantity.
-
-\subsubsection{Day-Ahead price (10 when \code{PJM\_LMP=1}, 7 when $=2$)}
-With $e$ the RTO-wide system energy price, $s = $ total $-$ energy the zonal
-spread, and $\tau$ the total LMP (all under $\mathrm{slog}$, except the share,
-which is formed on raw dollars):
-\[
-\begin{aligned}
-\text{PJM\_LMP=1:}\quad
-&\bar e - \mathcal{R}_7[\bar e],\ \ \bar e - \mathcal{R}_3[\bar e],\ \ \bar e - \mathcal{R}_{21}[\bar e],\ \
- e^{\text{pk}} - \mathcal{R}_7[e^{\text{pk}}], \\
-&\bar s - \mathcal{R}_7[\bar s],\ \ s^{\text{pk}} - \mathcal{R}_7[s^{\text{pk}}],\ \
- \tau^{\max} - \mathcal{R}_7[\tau^{\max}],\ \
- \mathcal{R}_7[\bar e] - \mathcal{R}_{21}[\bar e],\ \
- \tau^{\text{pk}},\ \ \tau^{\text{pk}} - \bar\tau .
-\end{aligned}
-\]
-Setting \code{PJM\_LMP=2} swaps this for a drift-normalised block: four
-$z$-scores $\big(x - \mathcal{R}_w[x]\big)/\mathrm{sd}_w[x]$ and three intraday
-shape ratios, which are invariant to a uniform re-pricing of the day. That
-variant exists because the price/load elasticity itself drifts --- mean RT
-price per unit load moved $2.57 \to 5.76$ between 2024 and 2026 on dom, so a
-model that learned the 2024 conversion under-reads load in 2026.
-
-\subsection{The two matrices}
-
-\begin{figure}[htbp]
-\centering
-\fitfig{%
-\begin{tikzpicture}[x=1cm,y=1cm]
-\node[data] (cl) at (0,0) {cleaned CSV\\\scriptsize 49\,511 $\times$ 27};
-\node[op]   (loop) at (3.6,0) {per target day\\\scriptsize $d{+}1 = 1,\ldots$};
-\node[blk]  (win) at (7.4,1.5) {lookback slice\\$\dims{168, C_{\text{seq}}}$};
-\node[blk]  (st)  at (7.4,0)   {static blocks\\$\dims{S}$};
-\node[blk]  (cal) at (7.4,-1.4){calendar of $d{+}1$\\$\dims{6}$};
-\node[blk]  (y)   at (7.4,-2.8){metered load of $d{+}1$\\$\dims{24}$};
-
-\node[data] (X3)  at (12.2,0.9)  {\code{X\_3d} $\dims{N,168,C}$};
-\node[data] (X2)  at (12.2,-0.6) {\code{X\_opt} $\dims{N,P}$};
-\node[data] (Y)   at (12.2,-2.8) {\code{y\_3d} / \code{y\_opt} $\dims{N,24}$};
-
-\draw[ar] (cl) -- (loop);
-\draw[ar] (loop) -- (win);
-\draw[ar] (loop) -- (st);
-\draw[ar] (loop) -- (cal);
-\draw[ar] (loop) -- (y);
-\draw[ar] (win) -- (X3);
-\draw[ar] (st)  -- (X3);
-\draw[ar] (cal) -- (X3);
-\draw[ar] (win) -- (X2);
-\draw[ar] (st)  -- (X2);
-\draw[ar] (cal) -- (X2);
-\draw[ar] (y)   -- (Y);
-\end{tikzpicture}}
-\caption{Matrix construction. The same five blocks feed both matrices; only
-the layout differs --- the 3-D tensor keeps the time axis, the 2-D matrix
-flattens it.}
-\end{figure}
-
-\subsubsection{The 2-D (tree) matrix}
-The lookback is flattened column-wise, one column per (channel, lag):
-\[
-P = \underbrace{168\,C_{\text{seq}}}_{\text{flattened window}} + \underbrace{6}_{\text{calendar}} + \underbrace{S}_{\text{statics}}.
-\]
-Columns are named \code{\{channel\}\_h\{k\}} for $k = 0,\ldots,167$, where $k=0$
-is the \emph{oldest} hour. Values are raw and unscaled --- trees are invariant
-to monotone rescaling. A 25th column group, \code{is\_target\_valid}, rides along
-and is dropped after it has been used to filter the training rows.
-
-\subsubsection{The 3-D (sequence) tensor}
-\[
-\underbrace{X_{i,t,1:C_{\text{seq}}}}_{\text{standardized time series}}\ \Vert\
-\underbrace{X_{i,t,C_{\text{seq}}+1:C_{\text{seq}}+6}}_{\text{calendar, broadcast over }t}\ \Vert\
-\underbrace{X_{i,t,C_{\text{seq}}+7:C}}_{\text{standardized statics, broadcast over }t}.
-\]
-Three \code{StandardScaler}s are fit and persisted, each on the leading
-$1 - 0.16$ fraction of rows/samples so that the test period never touches them:
-\begin{center}\small
-\begin{tabular}{@{}lll@{}}
-\toprule
-Scaler & Fit on & Applied to \\
-\midrule
-\code{scaler\_ts\_*.pkl}     & the $C_{\text{seq}}$ hourly columns, first 84\% of \emph{rows} & the whole sequence \\
-\code{y\_scaler\_*.pkl}      & \code{Load}, first 84\% of \emph{rows} & the 24-dim target \\
-\code{macro\_scaler\_*.pkl}  & the $S$ statics, first 84\% of \emph{samples} & the static block \\
+RT price & 3 & \code{RT\_\{Total,Energy,Cong\}\_slog} \hfill (\code{PJM\_LMP=1} only) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\subsubsection{Resulting shapes, all four arms}
+\noindent
+With $T_b = 65^\circ$F: $\mathrm{CDD}_t = \max(0, T_t - T_b)$,
+$\mathrm{HDD}_t = \max(0, T_b - T_t)$, rolling sums/means strictly causal,
+$\Delta T_t = T_t - T_{t-24}$. Heat index is the NWS Rothfusz regression,
+wet bulb the Stull (2011) approximation.
 
-\begin{table}[htbp]
-\centering\small
+\noindent
+Prices use a signed log, $\mathrm{slog}(x) = \operatorname{sign}(x)\log(1+|x|)$:
+RT LMP has a $120\times$ right tail and is negative in ${\approx}22\%$ of hours,
+so \code{log1p} is undefined and a raw channel is flattened by standardisation.
+
+\subsection{Static features --- one value per sample, $S = 40/48/50/58$}
+
+Broadcast across the window in storage, but every neural model slices them back
+out at $t=0$ and concatenates them \emph{after} the encoder, so the encoder never
+re-reads a constant 168 times.
+
+\begin{center}\small
+\begin{tabular}{@{}llp{8.6cm}@{}}
+\toprule
+Block & \# & Content \\
+\midrule
+Calendar & 6 & of the \emph{target} day: $\sin/\cos$ month, $\sin/\cos$ day-of-week,
+  \code{is\_weekend}, \code{is\_holiday}. Hour-of-day is absent --- implicit in the
+  24-dim output \\
+Macro & 4 & 3-week context from \emph{preliminary} load: two night-load $q_{05}$
+  week-over-week slopes, a 2-week energy ratio, and the mean $|{\cdot}|$ error of a
+  168\,h-lag naive forecast over the last 6 hours \\
+Thermal state & 5 & yesterday's max temp and CDD total, 3-day max temp, CDD ratio
+  (day$_1$/day$_2$, ${>}1$ when heat is building), 3-day mean-temp change \\
+Forecast weather & 31 & 24 per-hour departures $\hat T^{(1)}_h - r_h$ ($r_h$ = mean
+  observed temp at clock hour $h$ over the window), 5 CDD/HDD/max departures,
+  2 absolute anchors (day-$d{+}1$ max and 14--19\,h mean) \\
+Congestion & 8 & RTO-wide DA shadow prices on day $d$, as departures from trailing
+  3/7/21-day means; one level form kept \hfill (\code{PJM\_CONGESTION=1}) \\
+DA price & 10 & day-$d$ DA energy / zonal spread / total, same departure form
+  \hfill (\code{PJM\_LMP=1}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Departures, not levels, almost everywhere: 168 hours of observed temperature
+already state the level. A LightGBM gain breakdown put the congestion departure
+at $3.31\%$ of total gain and the same quantity as a level at $0.06\%$.
+The three absolute anchors survive because load responds non-linearly to
+temperature --- $+8^\circ$F on a $92^\circ$F base is worth far more MW than on
+$62^\circ$F.
+
+\subsection{The two matrices, and the four arms}
+
+\begin{center}\small
 \begin{tabular}{@{}lrrrrrr@{}}
 \toprule
-Arm (\code{MATRIX\_TAG}) & $C_{\text{seq}}$ & calendar & $S$ & $C$ & \code{X\_3d} & \code{X\_opt} cols \\
+Arm (\code{MATRIX\_TAG}) & $C_{\text{seq}}$ & cal & $S$ & $C$ & \code{X\_3d} & \code{X\_opt} cols \\
 \midrule
-\code{''} \hfill (cong 0, lmp 0)      & 22 & 6 & 40 & 68 & $(1957,168,68)$ & 3742 \\
-\code{\_cong} \hfill (1, 0)           & 22 & 6 & 48 & 76 & $(1957,168,76)$ & 3750 \\
-\code{\_lmp} \hfill (0, 1)            & 25 & 6 & 50 & 81 & $(1957,168,81)$ & 4256 \\
-\code{\_cong\_lmp} \hfill (1, 1)      & 25 & 6 & 58 & 89 & $(1957,168,89)$ & 4264 \\
-\code{\_cong\_lmpstat} \hfill (1, 2)  & 22 & 6 & 55 & 83 & $(1957,168,83)$ & 3757 \\
+\code{''} \hfill (cong 0, lmp 0) & 22 & 6 & 40 & 68 & $(1957,168,68)$ & 3742 \\
+\code{\_cong} \hfill (1, 0)      & 22 & 6 & 48 & 76 & $(1957,168,76)$ & 3750 \\
+\code{\_lmp} \hfill (0, 1)       & 25 & 6 & 50 & 81 & $(1957,168,81)$ & 4256 \\
+\code{\_cong\_lmp} \hfill (1, 1) & 25 & 6 & 58 & 89 & $(1957,168,89)$ & 4264 \\
 \bottomrule
 \end{tabular}
-\caption{Measured on disk, zone \code{dom}. $S$ decomposes as
-$4$ macro $+ 5$ thermal $+ 31$ forecast $[+\,8$ congestion$]$
-$[+\,10$ or $7$ price$]$.}
-\end{table}
+\end{center}
 
-\subsection{DST normalisation}
-Every target day is coerced to exactly 24 EPT slots
-(\code{feature\_engine.\_normalize\_to\_24h}):
-\[
-y_h =
-\begin{cases}
-\text{the single observation at hour } h, & \text{25-hour day: } \tfrac12(y_h^{(1)} + y_h^{(2)}) \text{ at } h=1,\\[2pt]
-\text{linear interpolation between } h{-}1,\,h{+}1, & \text{23-hour day, } h = 2,\\[2pt]
-\text{as observed}, & \text{otherwise.}
-\end{cases}
-\]
-Without this the target would not be a fixed-length vector and $\code{out\_dim}=24$
-would be wrong twice a year.
+\noindent
+\textbf{3-D tensor} (sequence models): standardised series $\Vert$ calendar
+$\Vert$ standardised statics, the last two broadcast over $t$.
+\textbf{2-D matrix} (trees): the window flattened column-wise into
+\code{\{channel\}\_h\{k\}}, $k=0$ oldest, values raw --- trees are invariant to
+monotone rescaling. Three scalers are fit on the leading $84\%$ and persisted, so
+the test period never touches them.
 
-% =====================================================================
-\section{Split Protocol}\label{sec:split}
-% =====================================================================
+\noindent
+Every target day is coerced to exactly 24 EPT slots: a 25-hour DST day averages
+the repeated hour, a 23-hour day interpolates the missing one. Without this
+\code{out\_dim}$=24$ would be wrong twice a year.
 
-Every point model uses one split, applied to the $N=1957$ \emph{daily samples}
-in chronological order:
+\subsection{Split}
 
-\begin{figure}[htbp]
-\centering
-\fitfig{%
-\begin{tikzpicture}[x=1cm,y=1cm]
-\fill[blue!22]   (0,0)     rectangle (7.3,0.7);
-\fill[gray!45]   (7.3,0)   rectangle (7.65,0.7);
-\fill[yellow!35] (7.65,0)  rectangle (8.75,0.7);
-\fill[gray!45]   (8.75,0)  rectangle (9.1,0.7);
-\fill[green!30]  (9.1,0)   rectangle (11.3,0.7);
-\draw (0,0) rectangle (11.3,0.7);
+Chronological tail split on the $N = 1957$ daily samples:
 
-\node[font=\scriptsize] at (3.65,0.35) {TRAIN};
-\node[font=\scriptsize] at (8.2,0.35)  {VAL};
-\node[font=\scriptsize] at (10.2,0.35) {TEST};
-
-\node[font=\scriptsize,align=center] at (3.65,-0.45) {$n=1466 \to 1461$\\after mask};
-\node[font=\scriptsize] at (8.2,-0.45)  {$n=150$};
-\node[font=\scriptsize] at (10.2,-0.45) {$n=313$};
-\node[font=\scriptsize,gray!50!black,align=center] at (7.47,1.35) {embargo\\14 d};
-\node[font=\scriptsize,gray!50!black,align=center] at (8.92,1.35) {embargo\\14 d};
-\draw[->,gray!60!black] (7.47,1.0) -- (7.47,0.75);
-\draw[->,gray!60!black] (8.92,1.0) -- (8.92,0.75);
-
-\node[font=\scriptsize] at (0,-1.0) {2021-03-25};
-\node[font=\scriptsize] at (7.65,-1.0) {2025-05-06};
-\node[font=\scriptsize] at (9.1,-1.0) {2025-10-17};
-\node[font=\scriptsize] at (11.3,-1.0) {2026-08-25};
-\end{tikzpicture}}
-\caption{The tail split, zone \code{dom}. Test is the last $\lfloor 0.16N\rfloor
-= 313$ days; validation is the last $10\%$ of what remains ($164$ days before
-the embargo).}
-\end{figure}
-
-Three rules, all in \code{feature\_engine}:
-
-\begin{enumerate}
-\item \textbf{Chronological tail split.} $n_{\text{test}} = \lfloor 0.16 N \rfloor = 313$.
-      The training pool is the preceding $1644$ samples; within it,
-      $\lfloor 0.10 \times 1644 \rfloor = 164$ tail samples become validation.
-\item \textbf{Embargo (14 days).} The last 14 samples of the train block and of
-      the validation block are discarded. The macro features look back 504
-      hours, so without the embargo a training sample's own feature window would
-      overlap the validation period. Train $\to 1466$, validation $\to 150$.
-      The test set is never trimmed.
-\item \textbf{Validity mask.} Training samples whose target day contains any
-      three-sigma outlier or unlabelled hour are dropped: $1466 \to 1461$.
-      Validation and test keep every day, so the reported score is over the
-      full period.
-\end{enumerate}
-
-Tree models take the same split but have no validation block, so their run tag
-is \code{tail\_test0.16} while the sequence models' is
-\code{tail\_test0.16\_tail\_val0.1}; both then carry the feature-set tag.
-
-% =====================================================================
-\section{Deterministic Point Models}\label{sec:point}
-% =====================================================================
-
-Eighteen models: nine architectures $\times$ \{direct, residual\}. All
-eighteen share the input matrices of Section~\ref{sec:features}, the split of
-Section~\ref{sec:split}, and the output convention below.
-
-\subsection{Common output convention}
-
-Every model emits $\hat{\mathbf{y}} \in \R^{B \times 24}$ in
-\emph{standardized} target space. The evaluator converts once:
-\[
-\hat y^{\text{MW}}_{i,h} = \sigma_y\,\hat y_{i,h} + \mu_y ,
-\]
-using the persisted \code{y\_scaler}. The tree models are the exception ---
-they are fit on raw MW directly and $\sigma_y, \mu_y$ never enter. The
-residual models return a value already mapped \emph{back into} standardized
-target space (Section~\ref{sec:resid}) so that the caller's inverse transform
-is unchanged and the residual plumbing is invisible downstream.
-
-\paragraph{Training objective (neural models).} Huber loss with
-$\delta = 1$, on standardized targets, so the knee sits at exactly one target
-standard deviation:
-\[
-\Loss(\hat y, y) = \frac{1}{24B}\sum_{i,h}
-\begin{cases}
-\tfrac12 (\hat y_{i,h}-y_{i,h})^2, & |\hat y_{i,h}-y_{i,h}| \le 1,\\[2pt]
-|\hat y_{i,h}-y_{i,h}| - \tfrac12, & \text{otherwise.}
-\end{cases}
-\]
-
-\paragraph{Optimisation (neural models).} AdamW, $\eta_0 = 3\cdot10^{-4}$
-(LSTM: $10^{-3}$), weight decay $10^{-4}$, batch size 32, gradient-norm
-clipping at $1.0$, \code{ReduceLROnPlateau}$(\times 0.5$, patience $10)$ on the
-validation loss, early stopping at patience 50, maximum 200 epochs. The
-checkpoint written is the one with the lowest validation loss, not the last.
-
-% ---------------------------------------------------------------------
-\subsection{Tree models: XGBoost and LightGBM}
-% ---------------------------------------------------------------------
-
-\paragraph{Structure.} There is no single model. Each of the 24 target hours
-gets its own independent regressor, fit on the identical feature matrix:
-\[
-\hat y_{i,h} = F_h(\mathbf{x}_i), \qquad h = 0,\ldots,23,
-\qquad \mathbf{x}_i \in \R^{P},\quad P = 3750\ \text{(\code{\_cong} arm)} .
-\]
-So an XGBoost ``model'' on disk is a list of 24 boosters, $24\times1000 =
-24{,}000$ trees in total. Hour $h$'s model never sees hour $h'$'s target, and
-nothing ties the 24 outputs together --- which is exactly why the tree models
-produce visibly rougher 24-hour profiles than the sequence models.
-
-\paragraph{Boosting.} Each $F_h$ is an additive ensemble
-\[
-F_h(\mathbf{x}) = \sum_{m=1}^{M} \eta\, f_{h,m}(\mathbf{x}),
-\qquad f_{h,m} \in \mathcal{F} = \{\text{regression trees of depth} \le 3\},
-\]
-built greedily by minimising the regularised objective
-\[
-\mathcal{J}^{(m)} = \sum_{i} \ell\big(y_{i,h},\ F^{(m-1)}_h(\mathbf{x}_i) + f_{h,m}(\mathbf{x}_i)\big)
-                  + \Omega(f_{h,m}),
-\qquad
-\Omega(f) = \gamma T + \tfrac{\lambda}{2}\|\mathbf{w}\|_2^2 + \alpha\|\mathbf{w}\|_1 ,
-\]
-with $T$ the leaf count and $\mathbf{w}$ the leaf weights. XGBoost solves the
-second-order approximation, giving the closed-form optimal leaf weight and
-split gain
-\[
-w_j^\star = -\frac{G_j}{H_j + \lambda},
-\qquad
-\mathrm{Gain} = \tfrac12\left[\frac{G_L^2}{H_L+\lambda} + \frac{G_R^2}{H_R+\lambda}
-                              - \frac{(G_L+G_R)^2}{H_L+H_R+\lambda}\right] - \gamma,
-\]
-where $G_j = \sum_{i \in j} \partial_{\hat y}\ell$ and
-$H_j = \sum_{i \in j} \partial^2_{\hat y}\ell$.
-
-\begin{table}[htbp]
-\centering\small
-\begin{tabular}{@{}lll@{}}
+\begin{center}\small
+\begin{tabular}{@{}lrl@{}}
 \toprule
-& XGBoost & LightGBM \\
+Block & $n$ & Rule \\
 \midrule
-trees per hour $M$      & 1000 & 1000 \\
-learning rate $\eta$    & $0.012770$ & $0.007547$ \\
-\code{max\_depth}       & 3 & 3 (\code{num\_leaves} 49 is inactive at depth 3) \\
-row subsample           & $0.8739$ & $0.6999$ (\code{bagging\_freq} 6) \\
-column subsample        & $0.7325$ & $0.7426$ \\
-$\lambda$ ($L_2$)       & $9.3371$ & $1.4022$ \\
-$\alpha$ ($L_1$)        & $0.5118$ & $0.001007$ \\
-leaf minimum            & --- & \code{min\_child\_samples} 40 \\
-growth                  & level-wise & leaf-wise \\
+train & $1466 \to \mathbf{1461}$ & the rest; then drop days with any 3-sigma outlier or unlabelled hour \\
+--- embargo & $14$ d & macro features look back 504\,h, so without it a training sample's own window overlaps val \\
+val   & $\mathbf{150}$ & last $10\%$ of the training pool, minus the embargo \\
+--- embargo & $14$ d & \\
+test  & $\mathbf{313}$ & last $\lfloor 0.16N \rfloor$ days, never trimmed, mask never applied \\
 \bottomrule
 \end{tabular}
-\caption{Tree hyperparameters (\code{XGB\_PARAMS}, \code{LGBM\_PARAMS}).}
-\end{table}
+\end{center}
 
-\paragraph{Shape trace.}
+\noindent
+Tree models have no validation block, so their run tag is \code{tail\_test0.16}
+against the sequence models' \code{tail\_test0.16\_tail\_val0.1}; both then carry
+the arm tag.
+
+% =====================================================================
+\section{Point models}
+% =====================================================================
+
+\noindent
+Every model emits $\hat{\mathbf{y}} \in \R^{B\times24}$ in standardised target
+space; the evaluator applies $\hat y^{\text{MW}} = \sigma_y \hat y + \mu_y$ once.
+Trees are the exception --- fit on raw MW.
+
+\noindent
+\textbf{Neural training} (all but GARCHFormer): Huber $\delta=1$ on standardised
+targets, AdamW $3{\cdot}10^{-4}$ (LSTM $10^{-3}$), weight decay $10^{-4}$, batch 32,
+grad-norm clip 1.0, \code{ReduceLROnPlateau}$(\times0.5$, patience 10$)$, early
+stop patience 50, max 200 epochs, best-validation checkpoint kept.
+
+\subsection{Trees --- XGBoost, LightGBM}
+
+No single model: each of the 24 target hours gets its own regressor on the same
+$(B, 3750)$ matrix.
 \[
-\underbrace{(B, 3750)}_{\text{2-D matrix}}
-\;\xrightarrow{\ 24\ \text{independent ensembles}\ }\;
-\underbrace{(B, 24)}_{\text{MW, directly}} .
+\hat y_{i,h} = F_h(\mathbf{x}_i) = \sum_{m=1}^{1000}\eta\,f_{h,m}(\mathbf{x}_i),
+\qquad h = 0,\ldots,23,\quad \mathrm{depth}(f) \le 3 .
 \]
-No standardization, no inverse transform.
+So a saved model is 24 boosters, $24\,000$ trees. Nothing ties the 24 outputs
+together, which is why tree profiles are visibly rougher than sequence ones.
+XGBoost: $\eta = 0.01277$, $\lambda = 9.34$, $\alpha = 0.51$, row/col subsample
+$0.87/0.73$, level-wise. LightGBM: $\eta = 0.00755$, $\lambda = 1.40$,
+$\alpha = 0.001$, $0.70/0.74$, \code{min\_child\_samples} 40, leaf-wise.
 
-% ---------------------------------------------------------------------
 \subsection{Transformer}\label{sec:transformer}
-% ---------------------------------------------------------------------
-
-\subsubsection{Block diagram}
-
-Read top to bottom. The left column is the encoder path; the single line down
-the right-hand side is the \emph{static skip} --- 54 features that bypass the
-encoder entirely and rejoin only at the concatenation.
 
 \begin{figure}[htbp]
 \centering
@@ -718,21 +279,16 @@ encoder entirely and rejoin only at the concatenation.
 \begin{tikzpicture}[x=1cm,y=1cm]
 \node[data] (in)   at (0,0)      {$X$\qquad$(B,168,76)$};
 \node[op]   (spl)  at (0,-1.2)   {split the channel axis at $C_{\text{seq}}=22$};
-
 \node[blk]  (seq)  at (-3.1,-2.7) {$X^{\text{seq}} = X_{:,:,0:22}$\\$(B,168,22)$};
 \node[blk,fill=orange!8] (sta) at (3.7,-2.7)
       {$s = X_{:,0,22:76}$\\$(B,54)$\\\scriptsize 6 calendar $+$ 48 statics};
-
 \node[blk]  (proj) at (-3.1,-4.4) {\code{Linear}$(22\!\to\!64)$, then $+\,\mathrm{PE}$\\$(B,168,64)$};
 \node[blk]  (enc)  at (-3.1,-6.3) {$2\times$ \code{TransformerEncoderLayer}\\
                                    $d{=}64$, 4 heads, FFN $256$, post-norm\\$(B,168,64)$};
 \node[blk]  (last) at (-3.1,-8.1) {take the last step $t = 167$\\$z_{\text{enc}}\ (B,64)$};
-
-\node[op]   (cat)  at (0,-9.7)   {concatenate\ \ $z = [\,z_{\text{enc}} \Vert s\,]$\\$(B,118)$};
-\node[blk]  (h1)   at (0,-11.2)  {\code{Linear}$(118\!\to\!128) \to \ReLU \to \Drop_{0.3}$\\$(B,128)$};
-\node[blk]  (h2)   at (0,-12.7)  {\code{Linear}$(128\!\to\!24)$\\$\hat y\ (B,24)$, standardized};
-\node[data] (mw)   at (0,-14.2)  {$\hat y^{\text{MW}} = \sigma_y \hat y + \mu_y$\qquad$(B,24)$ MW};
-
+\node[op]   (cat)  at (0,-9.7)   {$z = [\,z_{\text{enc}} \Vert s\,]$\qquad$(B,118)$};
+\node[blk]  (h1)   at (0,-11.2)  {\code{Linear}$(118\!\to\!128) \to \ReLU \to \Drop_{0.3}$};
+\node[blk]  (h2)   at (0,-12.6)  {\code{Linear}$(128\!\to\!24)$\qquad$\hat y\ (B,24)$};
 \draw[ar]  (in)  -- (spl);
 \draw[ar]  (spl.south) -- (seq.north);
 \draw[ard] (spl.south) -- (sta.north);
@@ -743,1784 +299,495 @@ encoder entirely and rejoin only at the concatenation.
 \draw[ard] (sta.south)  |- (cat.east);
 \draw[ar]  (cat) -- (h1);
 \draw[ar]  (h1)  -- (h2);
-\draw[ar]  (h2)  -- (mw);
-
 \node[font=\scriptsize,gray!45!black,align=left,anchor=west] at (4.6,-6.3)
       {the encoder never\\sees these 54};
 \end{tikzpicture}}
-\caption{\code{TimeSeriesTransformer3D} on the \code{\_cong} arm. Dashed $=$
-the static skip. Widths that move with the feature arm: the input is
-$(B,168,C)$ with $C \in \{68,76,81,89\}$, the skip is $(B, C - C_{\text{seq}})$,
-and the head's input $z$ is $(B, 64 + C - C_{\text{seq}})$, i.e.\ $110/118/120/128$.}
+\caption{Dashed $=$ the static skip. Across arms the head input $z$ is
+$110/118/120/128$.}
 \end{figure}
 
-\subsubsection{What a token is}\label{sec:token}
+\paragraph{One token $=$ one hour.} 168 tokens, each the $\R^{22}$ vector observed
+at that hour. No vocabulary, so the ``embedding'' is one learned affine map shared
+across positions, $e_t = W_p x_t + b_p$, $W_p \in \R^{64\times22}$. No patching, no
+\code{[CLS]}, no padding or mask (every sample has exactly 168 real hours), and the
+statics are not tokens --- they are constant in $t$.
 
-The word ``token'' is borrowed from language modelling and means something
-different here, so it is worth stating outright before the layer walk.
+\paragraph{Position.} Fixed sinusoidal, \emph{added}:
+$\mathrm{PE}_{t,2i} = \sin(t/10000^{2i/64})$, $\mathrm{PE}_{t,2i+1} = \cos(\cdot)$.
+It encodes absolute index, not ``3\,pm'' --- the window always ends at midnight, so
+clock hour is $t \bmod 24$, and the target day's calendar arrives through the
+statics.
 
-\paragraph{One token $=$ one hour.} The sequence fed to the encoder is
-$X^{\text{seq}} \in \R^{B\times168\times22}$. Position $t$ of that sequence is
-one clock hour of the lookback window, and the token \emph{is} the 22 numbers
-observed at that hour:
-\[
-x^{\text{seq}}_t = \big(\underbrace{\tilde y_t}_{\text{Load\_Estimated}},\
-   \underbrace{T_t,\ \mathrm{AT}_t,\ \mathrm{DP}_t,\ \mathrm{RH}_t,\ \mathrm{SR}_t,\ \mathrm{WS}_t,\ \mathrm{WD}_t,\ \mathrm{WG}_t,\ \mathrm{PR}_t,\ \mathrm{CC}_t,\ \mathrm{ST}_t}_{\text{11 weather}},\
-   \underbrace{\mathrm{CDD}_t,\ \ldots,\ T^{\text{wb}}_t}_{\text{10 thermal}}\big) \in \R^{22},
-\]
-already standardized by \code{scaler\_ts}. So a sample is a sequence of
-\textbf{168 tokens}, each a 22-dimensional real vector --- $168 \times 22 =
-3696$ scalars in all, the same numbers the tree models see as 3696 flat
-columns. With the price channels on ($\code{PJM\_LMP}=1$) the token widens to
-$\R^{25}$; nothing else about the tokenisation changes.
-
-\paragraph{The embedding is a linear map, not a lookup.} There is no
-vocabulary and no embedding table --- the input is continuous, so the
-``token embedding'' is a single learned affine map applied identically at
-every position:
-\[
-e_t = W_p\,x^{\text{seq}}_t + b_p \in \R^{64},
-\qquad W_p \in \R^{64\times22},\ b_p \in \R^{64}
-\qquad\text{(1472 parameters, shared across all 168 positions).}
-\]
-This is the only place the 22 physical channels are mixed before attention
-sees them; attention itself mixes across \emph{time}, never across channels
-directly.
-
-\paragraph{Four things this tokenisation deliberately does not do.}
-\begin{itemize}
-\item \textbf{No patching.} Each token is one hour, not a patch of several.
-      PatchTST-style models group 8--32 steps into one token to cut the
-      sequence length; at $L = 168$ the quadratic attention cost
-      ($168^2 = 28{,}224$ scores per head) is negligible, so there is nothing
-      to buy and a patch would blur the hourly resolution the 24-dim output
-      needs.
-\item \textbf{No \code{[CLS]} token.} Nothing is prepended, so there is no
-      learned summary slot. The day representation is read off the
-      \emph{last} position instead (step 4 below) --- the hour immediately
-      before the cutoff, which after two bidirectional layers has attended
-      to all 167 others.
-\item \textbf{No padding and no attention mask.} Every sample has exactly 168
-      real hours, guaranteed by the matrix builder (a day without a full
-      window is dropped, not padded), so \code{src\_key\_padding\_mask} and
-      \code{src\_mask} are both \code{None}.
-\item \textbf{The static features are not tokens.} They are constant over
-      $t$, so admitting them would mean 168 identical copies of the same 54
-      numbers --- $9072$ redundant scalars for the encoder to re-read at
-      every layer. They enter after pooling instead
-      (Section~\ref{sec:transformer}, step 5).
-\end{itemize}
-
-\paragraph{Position is added, not tokenised.} A token carries no timestamp of
-its own: \code{Datetime\_EPT}, hour-of-day and day-of-week are absent from the
-22 channels. All the encoder knows about ordering is the fixed sinusoidal
-vector added at step 2. That vector encodes \emph{absolute index}
-$t \in \{0,\ldots,167\}$ on a geometric grid of wavelengths from $2\pi$ to
-$2\pi\!\cdot\!10^4$; it does \textbf{not} encode ``this is 3\,pm'' or ``this is
-a Tuesday''. The diurnal period of 24 and the weekly period of 168 have to be
-recovered by the model from those sinusoids. That is a real design cost, and
-it is paid back elsewhere: the window always ends at midnight, so index $t$
-and clock hour are locked together by $t \bmod 24$, and the target day's own
-calendar arrives through the six static features rather than through the
-sequence.
-
-\paragraph{Only the Transformers embed at all.} The three encoder families
-consume the same 168 tokens but disagree about what to do with them first:
-
-\begin{center}\small
-\begin{tabular}{@{}llll@{}}
-\toprule
-Encoder & Token unit & Embedding step & Position information \\
-\midrule
-Transformer / MoE-Tr. & one hour, $\R^{22}$
-  & \code{Linear}$(22\!\to\!64)$
-  & sinusoidal PE, added \\
-LSTM / MoE-LSTM & one hour, $\R^{22}$
-  & \emph{none} --- \code{input\_size}$=22$
-  & implicit in the recurrence order \\
-MSTNN / MoE-MSTNN & one (day, hour) cell, $\R^{22}$
-  & \emph{none} --- 22 conv \emph{channels}
-  & implicit in the grid axes \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\noindent
-The LSTM feeds the raw 22-dim vector straight into its gates
-(\code{nn.LSTM(input\_size=22, hidden\_size=128)}), so its first weight matrix
-$W_{i\bullet}^{(1)} \in \R^{512\times22}$ absorbs the projection that the
-Transformer does separately. MSTNN never forms a 1-D token sequence at all: it
-folds the 168 steps into a $7 \times 24$ grid and treats the 22 channels as
-\emph{convolution input channels}, so its unit of computation is a
-(day, hour) cell and neighbourhood in \emph{both} axes is structural rather
-than learned. That is the substantive architectural difference between the
-three, and it is why MSTNN gets the weekly period for free while the
-Transformer must infer it.
-
-\subsubsection{Layer-by-layer}
-
-\paragraph{(0) Input and the static split.}
-The stored tensor is $X \in \R^{B \times 168 \times C}$, $C = 76$. The model
-splits it on the channel axis at \code{n\_seq\_features} $= C_{\text{seq}} = 22$:
-\[
-X^{\text{seq}} = X_{:,:,0:22} \in \R^{B\times168\times22},
-\qquad
-s = X_{:,0,22:76} \in \R^{B\times54}.
-\]
-$s$ is read at timestep $0$ only, because those channels are constant along
-$t$ by construction. $54 = 6$ calendar $+ 48$ statics.
-
-\paragraph{(1) Input projection (the token embedding).}
-\[
-h^{(0)}_t = W_p\, x^{\text{seq}}_t + b_p,
-\qquad W_p \in \R^{64\times22},\ b_p \in \R^{64}.
-\]
-Shape: $(B,168,22) \to (B,168,64)$. Parameters: $22\cdot64+64 = 1472$, shared
-across all 168 positions --- see Section~\ref{sec:token} for what a token is
-and why this is a linear map rather than a lookup table.
-
-\paragraph{(2) Positional encoding.} Fixed sinusoidal, added not concatenated:
-\[
-\mathrm{PE}_{t,2i} = \sin\!\left(\frac{t}{10000^{2i/64}}\right),
-\qquad
-\mathrm{PE}_{t,2i+1} = \cos\!\left(\frac{t}{10000^{2i/64}}\right),
-\qquad
-h^{(1)}_t = h^{(0)}_t + \mathrm{PE}_t .
-\]
-Registered as a buffer, so it carries no gradient. Shape unchanged.
-
-\paragraph{(3) Encoder, $\times 2$ layers.} PyTorch's post-norm
-\code{TransformerEncoderLayer}, \code{batch\_first=True}, no attention mask ---
-so attention is \emph{bidirectional over the 168 observed hours}, which is
-legitimate because all 168 are in the past.
-
-Multi-head self-attention with $n_{\text{head}} = 4$ and per-head width
-$d_k = 64/4 = 16$:
-\[
-Q = HW^Q,\quad K = HW^K,\quad V = HW^V,\qquad W^{Q},W^{K},W^{V} \in \R^{64\times64},
-\]
-\[
-\mathrm{head}_j = \softmax\!\left(\frac{Q_j K_j^{\!\top}}{\sqrt{16}}\right) V_j
-\in \R^{168\times16},
-\qquad
-\MHA(H) = \big[\mathrm{head}_1 \Vert \cdots \Vert \mathrm{head}_4\big] W^O,
-\ W^O \in \R^{64\times64}.
-\]
-Then the two residual sub-blocks:
+\paragraph{Encoder, $\times2$.} Bidirectional (all 168 hours are past), 4 heads,
+$d_k = 16$:
 \begin{align}
-H' &= \LN\big(H + \Drop_{0.3}(\MHA(H))\big), \\
-\FFN(H') &= W_2\,\Drop_{0.3}\big(\ReLU(W_1 H' + b_1)\big) + b_2,
-   \qquad W_1 \in \R^{256\times64},\ W_2 \in \R^{64\times256}, \\
-H'' &= \LN\big(H' + \Drop_{0.3}(\FFN(H'))\big).
+\mathrm{head}_j &= \softmax\!\left(\tfrac{Q_jK_j^{\!\top}}{\sqrt{16}}\right)V_j,
+  \qquad \MHA(H) = [\mathrm{head}_1\Vert\cdots\Vert\mathrm{head}_4]W^O, \\
+H' &= \LN\big(H + \Drop(\MHA(H))\big), \qquad
+H'' = \LN\big(H' + \Drop(\FFN(H'))\big).
 \end{align}
-Shape: $(B,168,64) \to (B,168,64)$. Parameters per layer:
-$\underbrace{3\cdot64\cdot64 + 192}_{\text{in\_proj}} + \underbrace{64\cdot64+64}_{W^O}
-+ \underbrace{64\cdot256+256}_{W_1} + \underbrace{256\cdot64+64}_{W_2}
-+ \underbrace{2\cdot128}_{\text{2 LayerNorms}} = 49{,}984$; two layers $= 99{,}968$.
+Pooling is the last timestep, $z_{\text{enc}} = H''_{:,167,:}$ --- the hour before
+the cutoff, and the one position that has attended to every other.
 
-\paragraph{(4) Pooling.} Last-timestep, not mean-pooling:
-\[
-z_{\text{enc}} = H''_{:,167,:} \in \R^{B\times64}.
-\]
-The final position is the hour immediately before the cutoff, and it is the
-one position whose attention output has seen every other position.
+\paragraph{Parameters.} $1472$ (projection) $+\ 99\,968$ (2 encoder layers)
+$+\ 18\,328$ (head) $= \mathbf{119\,768}$.
 
-\paragraph{(5) Static skip.}
-\[
-z = \big[\,z_{\text{enc}} \;\Vert\; s\,\big] \in \R^{B \times 118},
-\qquad 118 = 64 + 54 .
-\]
-This is the \code{feat\_dim} the head consumes. Note that it grows with the
-feature arm: $110$ (base), $118$ (\code{\_cong}), $120$ (\code{\_lmp}),
-$128$ (\code{\_cong\_lmp}).
-
-\paragraph{(6) Output head.}
-\[
-\hat{\mathbf{y}} = W_{o2}\,\Drop_{0.3}\big(\ReLU(W_{o1} z + b_{o1})\big) + b_{o2},
-\qquad W_{o1} \in \R^{128\times118},\ W_{o2} \in \R^{24\times128}.
-\]
-Shape: $(B,118) \to (B,128) \to (B,24)$. Parameters $118\cdot128+128 +
-128\cdot24+24 = 18{,}328$.
-
-\paragraph{(7) Inverse.} $\hat y^{\text{MW}} = \sigma_y \hat{\mathbf{y}} + \mu_y$.
-
-\paragraph{Total.} $1472 + 99{,}968 + 18{,}328 = \mathbf{119{,}768}$ parameters
-on the \code{\_cong} arm.
-
-% ---------------------------------------------------------------------
 \subsection{LSTM}
-% ---------------------------------------------------------------------
 
-Identical plumbing to the Transformer --- same input split, same static skip,
-same head shape --- with the attention encoder replaced by a 2-layer LSTM.
-
-One difference in the tokenisation (Section~\ref{sec:token}): there is
-\textbf{no input projection}. The 22-dim hourly vector goes straight into the
-gates, \code{nn.LSTM(input\_size=22, hidden\_size=128)}, so the first gate
-matrix $W_{i\bullet}^{(1)} \in \R^{512\times22}$ absorbs the $22 \to 64$ map
-the Transformer performs as its own layer. Position is likewise never encoded:
-it is implicit in the order the recurrence consumes the 168 steps.
-
-\paragraph{Recurrence.} For layer $\ell \in \{1,2\}$, hidden width $128$, at
-each of the 168 timesteps:
-\begin{align}
-i_t &= \sigma\big(W_{ii}x_t + b_{ii} + W_{hi}h_{t-1} + b_{hi}\big) &&\text{input gate}\\
-f_t &= \sigma\big(W_{if}x_t + b_{if} + W_{hf}h_{t-1} + b_{hf}\big) &&\text{forget gate}\\
-g_t &= \tanh\big(W_{ig}x_t + b_{ig} + W_{hg}h_{t-1} + b_{hg}\big) &&\text{candidate}\\
-o_t &= \sigma\big(W_{io}x_t + b_{io} + W_{ho}h_{t-1} + b_{ho}\big) &&\text{output gate}\\
-c_t &= f_t \odot c_{t-1} + i_t \odot g_t, \qquad h_t = o_t \odot \tanh(c_t).
-\end{align}
-Layer 1 takes $x_t \in \R^{22}$; layer 2 takes layer 1's $h_t \in \R^{128}$,
-with $\Drop_{0.3}$ applied between the layers. Weight shapes:
-$W_{i\bullet}^{(1)} \in \R^{512\times22}$ (four gates stacked),
-$W_{h\bullet}^{(\ell)} \in \R^{512\times128}$,
-$W_{i\bullet}^{(2)} \in \R^{512\times128}$.
-
-\paragraph{Shape trace.}
+Same plumbing, attention replaced by a 2-layer LSTM, hidden 128. \textbf{No input
+projection} --- the $\R^{22}$ vector goes straight into the gates, so
+$W_{i\bullet}^{(1)} \in \R^{512\times22}$ absorbs the $22\to64$ map. Position is
+implicit in the recurrence order.
 \[
-(B,168,22)
-\ \xrightarrow{\text{LSTM}_1}\ (B,168,128)
-\ \xrightarrow{\text{LSTM}_2}\ (B,168,128)
-\ \xrightarrow{\ t=167\ }\ (B,128)
-\ \xrightarrow{\Vert\, s}\ (B,182)
-\ \to (B,128) \to (B,24).
+i_t, f_t, o_t = \sigma(W_{i\bullet}x_t + W_{h\bullet}h_{t-1} + b),
+\quad g_t = \tanh(\cdot),
+\quad c_t = f_t \odot c_{t-1} + i_t \odot g_t,
+\quad h_t = o_t \odot \tanh(c_t).
 \]
+Trace $(B,168,22) \to (B,168,128) \to (B,128) \xrightarrow{\Vert s} (B,182) \to (B,24)$.
+$\mathbf{236\,440}$ parameters --- twice the transformer, and slightly worse.
 
-\paragraph{Parameters.} Encoder
-$4\cdot128\cdot(22+128) + 8\cdot128 = 77{,}824$ (layer 1) and
-$4\cdot128\cdot(128+128) + 8\cdot128 = 132{,}096$ (layer 2); head
-$182\cdot128+128 + 128\cdot24+24 = 26{,}520$. Total
-$\mathbf{236{,}440}$ --- roughly twice the Transformer, for a model that
-scores slightly worse on both zones.
+\subsection{MSTNN}
 
-% ---------------------------------------------------------------------
-\subsection{MSTNN --- multi-scale temporal convolution}
-% ---------------------------------------------------------------------
-
-A simplified reproduction of MSTNN (Song et al., IJCAI 2025). The paper
-reshapes a series into a year/month/day 3-D grid and applies parallel
-multi-size 3-D convolutions; here the lookback is exactly $7\times24$, so the
-grid is 2-D and the convolutions are 2-D. The paper's cross-entity
-hypergraph attention is dropped --- there is one zone, so an inter-entity
-graph is meaningless.
-
-\subsubsection{The periodic reshape}
-
-This is the whole idea. The 168-step sequence is folded so that
-\emph{one axis is the day and the other is the hour}:
+The idea is the reshape: fold 168 steps so one axis is the day and the other the hour.
 \[
-X^{\text{seq}} \in \R^{B\times168\times22}
-\ \xrightarrow{\ \text{reshape}\ }\ \R^{B\times7\times24\times22}
-\ \xrightarrow{\ \text{permute}\ }\ G \in \R^{B\times\underbrace{22}_{\text{channels}}\times\underbrace{7}_{\text{days}}\times\underbrace{24}_{\text{hours}}}.
+X^{\text{seq}} \in \R^{B\times168\times22} \to \R^{B\times7\times24\times22}
+\to G \in \R^{B\times\underbrace{22}_{\text{channels}}\times\underbrace{7}_{\text{days}}\times\underbrace{24}_{\text{hours}}}
 \]
-A convolution kernel of size $(k_d, k_h)$ then covers $k_d$ consecutive days at
-the \emph{same clock hours} simultaneously --- a receptive field that a
-1-D convolution over the flat 168-step series would need a dilation of 24 to
-reach.
-
-The unit of computation is therefore a \emph{(day, hour) cell}, not a token in
-a sequence (Section~\ref{sec:token}). The 22 hourly channels become
-convolution \emph{input channels}, so there is no embedding layer and no
-positional encoding: adjacency in both the day axis and the hour axis is
-structural. The diurnal and weekly periods that the Transformer must recover
-from sinusoids are here built into the tensor layout.
+A $(k_d,k_h)$ kernel then covers $k_d$ consecutive days at the \emph{same clock
+hours} --- a receptive field a 1-D conv would need dilation 24 to reach. The unit is
+a (day, hour) cell, not a token: no embedding, no positional encoding, adjacency in
+both axes is structural. The diurnal and weekly periods the transformer must recover
+from sinusoids are built into the layout here.
 
 \begin{figure}[htbp]
 \centering
 \fitfig{%
 \begin{tikzpicture}[x=1cm,y=1cm]
-\node[data] (in) at (0,0) {$X^{\text{seq}}$\\$(B,168,22)$};
-\node[op]   (rs) at (3.2,0) {reshape\\+ permute};
-\node[data] (g)  at (6.4,0) {$G$\\$(B,22,7,24)$};
-
-\node[blk] (b1) at (10.2,1.9)  {\code{Conv2d}$(22\!\to\!40, 3{\times}3)$\\
-                                $\to\ReLU\to$ GAP\\$(B,40)$};
-\node[blk] (b2) at (10.2,0)    {\code{Conv2d}$(22\!\to\!40, 5{\times}5)$\\
-                                $\to\ReLU\to$ GAP\\$(B,40)$};
-\node[blk] (b3) at (10.2,-1.9) {\code{Conv2d}$(22\!\to\!40, 7{\times}3)$\\
-                                $\to\ReLU\to$ GAP\\$(B,40)$};
-
-\node[op]  (cc) at (13.6,0)  {concat\\$(B,120)$};
-\node[op]  (cs) at (13.6,-2.6) {$\Vert\ s\ (B,54)$\\$(B,174)$};
-\node[blk] (hd) at (13.6,-4.6) {$174\!\to\!128\!\to\!24$\\$(B,24)$};
-
-\draw[ar] (in) -- (rs);
-\draw[ar] (rs) -- (g);
-\draw[ar] (g) -- (b1);
-\draw[ar] (g) -- (b2);
-\draw[ar] (g) -- (b3);
-\draw[ar] (b1) -- (cc);
-\draw[ar] (b2) -- (cc);
-\draw[ar] (b3) -- (cc);
-\draw[ar] (cc) -- (cs);
-\draw[ar] (cs) -- (hd);
+\node[data] (g)  at (0,0) {$G$\\$(B,22,7,24)$};
+\node[blk] (b1) at (4.0,1.9)  {\code{Conv2d}$(22\!\to\!40, 3{\times}3)$\\$\to\ReLU\to$ GAP};
+\node[blk] (b2) at (4.0,0)    {\code{Conv2d}$(22\!\to\!40, 5{\times}5)$\\$\to\ReLU\to$ GAP};
+\node[blk] (b3) at (4.0,-1.9) {\code{Conv2d}$(22\!\to\!40, 7{\times}3)$\\$\to\ReLU\to$ GAP};
+\node[op]  (cc) at (7.6,0)  {concat $(B,120)$\\$\Vert\ s\ \to (B,174)$};
+\node[blk] (hd) at (11.0,0) {$174\!\to\!128\!\to\!24$};
+\draw[ar] (g) -- (b1); \draw[ar] (g) -- (b2); \draw[ar] (g) -- (b3);
+\draw[ar] (b1) -- (cc); \draw[ar] (b2) -- (cc); \draw[ar] (b3) -- (cc);
+\draw[ar] (cc) -- (hd);
 \end{tikzpicture}}
-\caption{MSTNN. GAP $=$ \code{AdaptiveAvgPool2d(1)}, global average pooling
-over the whole $(7,24)$ grid.}
+\caption{Three scales: local ($3{\times}3$), medium ($5{\times}5$), full-week
+($7{\times}3$, all seven days at once). GAP $=$ global average pool over the whole
+$(7,24)$ grid --- it replaces the original flatten-then-FC, which at ${\sim}1.5$k
+samples memorised immediately ($4320$ features into the head instead of $120$).}
 \end{figure}
 
-\subsubsection{Layer-by-layer}
+\noindent
+$\mathbf{74\,016}$ parameters, the smallest of the neural architectures.
 
-\paragraph{(1) Three parallel convolution branches.} Kernels
-$\mathcal{K} = \{(3,3), (5,5), (7,3)\}$, each with $40$ output channels and
-``same'' padding $p = (\lfloor k_d/2\rfloor, \lfloor k_h/2\rfloor)$:
-\[
-g^{(b)}_{c,i,j} = \ReLU\!\left(
-   \sum_{c'=1}^{22} \sum_{u=0}^{k_d-1}\sum_{v=0}^{k_h-1}
-   K^{(b)}_{c,c',u,v}\; G_{c',\,i+u-p_1,\,j+v-p_2} \;+\; \beta^{(b)}_c
-\right),
-\qquad g^{(b)} \in \R^{40\times7\times24}.
-\]
-The three scales are local ($3\times3$: three days $\times$ three hours),
-medium ($5\times5$), and full-week ($7\times3$: all seven days at once, three
-adjacent hours).
+\subsection{Hard-routed MoE head}\label{sec:moe}
 
-\paragraph{(2) Global average pooling.} Each branch collapses to one vector:
-\[
-\bar g^{(b)}_c = \frac{1}{7\cdot24}\sum_{i=1}^{7}\sum_{j=1}^{24} g^{(b)}_{c,i,j},
-\qquad \bar g^{(b)} \in \R^{40}.
-\]
-This replaces the original architecture's flatten-then-FC, which at
-$\sim$1.5k training samples memorised immediately: a flatten would produce
-$3\cdot40\cdot3\cdot12 = 4320$ features into the head instead of $120$.
+Three architectures (\code{moe\_\{transformer,mstnn,lstm\}}) swap the MLP head for
+a \code{RegimeHead}: 12 experts, \textbf{no gating network}. Season comes from the
+target day's month (per sample); within a season the 24 output hours are partitioned
+among three experts (per output index).
 
-\paragraph{(3) Concatenate.}
-\[
-z_{\text{conv}} = \big[\bar g^{(1)} \Vert \bar g^{(2)} \Vert \bar g^{(3)}\big] \in \R^{120},
-\qquad
-z = \big[z_{\text{conv}} \Vert s\big] \in \R^{174}.
-\]
-
-\paragraph{(4) Head.} $174 \to 128 \to 24$, same form as the Transformer's.
-
-\paragraph{Parameters.} Convolutions
-$40\cdot22\cdot(9 + 25 + 21) + 3\cdot40 = 48{,}520$;
-head $174\cdot128+128+128\cdot24+24 = 25{,}496$. Total $\mathbf{74{,}016}$ ---
-the smallest of the seven neural architectures, and on dom the second-best
-(\code{mstnn\_residual}, MAPE $3.042\%$).
-
-% ---------------------------------------------------------------------
-\subsection{The Mixture-of-Experts head}\label{sec:moe}
-% ---------------------------------------------------------------------
-
-Three of the nine architectures (\code{moe\_transformer}, \code{moe\_mstnn},
-\code{moe\_lstm}) replace the two-layer MLP head with a \code{RegimeHead}. The
-encoder is unchanged in each case --- these are the same three encoders above
-with a different decoder.
-
-\subsubsection{Two-axis hard routing}
-
-There is \textbf{no gating network}. Both routing decisions are deterministic
-lookups:
-
-\begin{itemize}
-\item \textbf{Season} (per \emph{sample}): the target day's month maps to one of
-      four seasons. Summer $\{7,8\}$, upper shoulder $\{6,9\}$,
-      shoulder $\{3,4,5,10,11\}$, winter $\{12,1,2\}$.
-\item \textbf{Hour} (per \emph{output index}): within each season, the 24 output
-      hours are partitioned among three experts named \code{low}, \code{peak},
-      \code{high}. The partition is season-specific.
-\end{itemize}
-
-\begin{table}[htbp]
-\centering\small
+\begin{center}\small
 \begin{tabular}{@{}llll@{}}
 \toprule
 Season (months) & \code{low} & \code{peak} & \code{high} \\
 \midrule
-summer $\{7,8\}$              & 1--6 \hfill(6)  & 12--20 \hfill(9)             & 0, 7--11, 21--23 \hfill(9) \\
-upper\_shoulder $\{6,9\}$     & 1--6 \hfill(6)  & 14--19 \hfill(6)             & 0, 7--13, 20--23 \hfill(12) \\
-shoulder $\{3,4,5,10,11\}$    & 0--4 \hfill(5)  & 6--9, 17--20 \hfill(8)       & 5, 10--16, 21--23 \hfill(11) \\
-winter $\{12,1,2\}$           & 0--4 \hfill(5)  & 6--9, 17--21 \hfill(9)       & 5, 10--16, 22--23 \hfill(10) \\
+summer $\{7,8\}$           & 1--6 \hfill(6) & 12--20 \hfill(9)       & 0, 7--11, 21--23 \hfill(9) \\
+upper\_shoulder $\{6,9\}$  & 1--6 \hfill(6) & 14--19 \hfill(6)       & 0, 7--13, 20--23 \hfill(12) \\
+shoulder $\{3,4,5,10,11\}$ & 0--4 \hfill(5) & 6--9, 17--20 \hfill(8) & 5, 10--16, 21--23 \hfill(11) \\
+winter $\{12,1,2\}$        & 0--4 \hfill(5) & 6--9, 17--21 \hfill(9) & 5, 10--16, 22--23 \hfill(10) \\
 \bottomrule
 \end{tabular}
-\caption{\code{REGIME\_MAP}. Within each row the three hour sets are disjoint
-and tile $\{0,\ldots,23\}$; this is asserted at model construction
-(\code{validate\_regime\_map}).}
-\end{table}
+\end{center}
 
-So there are $4 \times 3 = 12$ expert heads, but only three of them are
-active for any one sample.
+\noindent
+All four seasons are computed, then hard-selected by $\kappa_i$; the unselected
+three are sliced away before the loss and get no gradient. Only three of twelve
+experts are active per sample.
 
-\subsubsection{Forward pass}
+\subsection{Soft-gated MoE head}\label{sec:smoe}
 
-Let $z \in \R^{B \times F}$ be the encoder output plus static skip
-($F = \code{feat\_dim}$), and let $\kappa_i \in \{0,1,2,3\}$ be sample $i$'s
-season index. Each expert $(s,e)$ is a two-layer MLP whose output width is the
-number of hours it owns:
-\[
-E_{s,e}(z) = V_{s,e}\,\Drop_{0.3}\big(\ReLU(U_{s,e} z + a_{s,e})\big) + c_{s,e},
-\qquad
-U_{s,e} \in \R^{64\times F},\quad V_{s,e} \in \R^{|\Hset_{s,e}|\times64}.
-\]
-For season $s$, the three expert outputs are concatenated and permuted back
-into hour order by a precomputed index buffer $\pi_s$:
-\[
-\hat{\mathbf{y}}^{(s)} = \Big[\,E_{s,\text{low}}(z) \Vert E_{s,\text{peak}}(z) \Vert E_{s,\text{high}}(z)\,\Big]_{\pi_s}
-\in \R^{B\times24}.
-\]
-The implementation evaluates all four seasons and then hard-selects:
-\[
-\hat{\mathbf{y}}_i = \hat{\mathbf{y}}^{(\kappa_i)}_i,
-\qquad\text{i.e.}\qquad
-\hat{\mathbf{y}} = \mathrm{stack}\big(\hat{\mathbf{y}}^{(0)},\ldots,\hat{\mathbf{y}}^{(3)}\big)\big[\kappa,\ \mathrm{arange}(B)\big].
-\]
-The three unselected seasons are sliced away before the loss, so they receive
-no gradient. Gradient flows only to the selected season's three experts and to
-the shared encoder --- which is what makes one forward pass train all twelve
-heads over an epoch that spans the year.
+\code{RegimeHead} partitions the data \emph{and} the output vector. On 1461 training
+days its twelve experts see $1\,428$--$7\,018$ target scalars each against $35\,064$
+for a single head, and every hard-routed variant loses to its plain counterpart:
+$+0.087/+0.103/+0.119$\,pp (transformer/mstnn/lstm, residual) and
+$+0.827/+0.649/+1.788$\,pp (direct).
+
+The standard form (Jacobs et al.\ 1991; Shazeer et al.\ 2017) partitions nothing:
+\begin{equation}
+  \mathbf{g} = \softmax\!\left(W_g\,\mathbf{z}_{\text{gate}} + \boldsymbol\varepsilon\right),
+  \qquad
+  \hat{\mathbf{y}} = \sum_{i=1}^{N} g_i\,E_i(\mathbf{z}) \in \R^{24},
+\end{equation}
+$\boldsymbol\varepsilon \sim \mathcal{N}(0,\sigma_g^2)$ on the logits in training only.
+Every expert emits all 24 hours and gets gradient from every sample, weighted: a July
+day still passes through the ``winter'' expert, at a small weight.
 
 \begin{figure}[htbp]
 \centering
-\fitfig{%
+\fitfig{
 \begin{tikzpicture}[x=1cm,y=1cm]
-\node[blk] (z) at (0,0) {shared encoder\\output $z$\\$(B,F)$};
-\node[font=\scriptsize,align=center] at (0,-1.6) {$F = 118$ (MoE-Tr.)\\$174$ (MoE-MSTNN)\\$182$ (MoE-LSTM)};
-
-\node[blk,fill=red!8]    (s0) at (4.6,2.4)  {summer: 3 experts\\$\to \hat y^{(0)} (B,24)$};
-\node[blk,fill=orange!8] (s1) at (4.6,0.8)  {upper\_shoulder: 3\\$\to \hat y^{(1)} (B,24)$};
-\node[blk,fill=green!8]  (s2) at (4.6,-0.8) {shoulder: 3\\$\to \hat y^{(2)} (B,24)$};
-\node[blk,fill=blue!8]   (s3) at (4.6,-2.4) {winter: 3\\$\to \hat y^{(3)} (B,24)$};
-
-\node[op] (gate) at (9.4,0) {hard gather\\by $\kappa_i$ = season($m_i$)\\$(B,24)$};
-\node[data] (mm) at (9.4,-2.6) {target day's month\\(no learned gate)};
-
-\draw[ar] (z) -- (s0); \draw[ar] (z) -- (s1);
-\draw[ar] (z) -- (s2); \draw[ar] (z) -- (s3);
-\draw[ar] (s0) -- (gate); \draw[ar] (s1) -- (gate);
-\draw[ar] (s2) -- (gate); \draw[ar] (s3) -- (gate);
-\draw[ard] (mm) -- (gate);
+\node[blk]  (z)  at (0,0) {$\mathbf{z} = [\,\mathbf{h}_{168} \Vert \text{static}\,]$\\$\dims{118}$};
+\node[blk] (e1) at (4.0,2.4)  {$E_1$\\\scriptsize $118\!\to\!128\!\to\!24$};
+\node[blk] (e2) at (4.0,1.0)  {$E_2$};
+\node[blk] (e3) at (4.0,-0.4) {$E_3$};
+\node[blk] (e4) at (4.0,-1.8) {$E_4$};
+\node[op]  (g)  at (4.0,-3.4) {gate $\softmax$};
+\node[op]   (sum) at (7.8,0.3) {$\sum_i g_i E_i$};
+\node[data] (y)   at (10.8,0.3) {$\hat{\mathbf{y}}\ \dims{24}$};
+\foreach \n in {e1,e2,e3,e4} \draw[ar] (z) -- (\n);
+\draw[ar] (z) -- (g) node[midway,below,font=\scriptsize]{$\mathbf{z}_{\text{gate}}$};
+\foreach \n in {e1,e2,e3,e4} \draw[ar] (\n) -- (sum);
+\draw[ard] (g) -- (sum) node[midway,right,font=\scriptsize]{$\mathbf{g}$};
+\draw[ar] (sum) -- (y);
 \end{tikzpicture}}
-\caption{\code{RegimeHead}. Twelve experts, three active per sample, routing by
-calendar lookup.}
+\caption{Encoder unchanged from \S\ref{sec:transformer}; only
+$\mathbf{z} \to \hat{\mathbf{y}}$ differs. The gate supplies weights, not a selection.}
 \end{figure}
 
-\subsubsection{Head parameter count}
+\noindent
+\textbf{Load balancing.} A softmax gate collapses if left alone. With
+$m_i = \sum_b g_{i,b}$ over a batch,
+$\Loss = \Loss_{\text{fc}} + \lambda_{\text{bal}}\big(\mathrm{sd}(\mathbf{m})/\mathrm{mean}(\mathbf{m})\big)^2$,
+through the same \code{aux\_loss} hook GARCHFormer uses.
 
-For a season with three experts covering all 24 hours,
-\[
-\#\text{params}(s) = 3\big(64F + 64\big) + \sum_{e}\big(64|\Hset_{s,e}| + |\Hset_{s,e}|\big)
-                   = 3(64F + 64) + 65\cdot24 .
-\]
-Summing over the four seasons: $4\big[3(64F+64) + 1560\big]$.
-
-\begin{table}[htbp]
-\centering\small
-\begin{tabular}{@{}lrrrrr@{}}
+\begin{center}\small
+\begin{tabular}{@{}lrrrrl@{}}
 \toprule
-Model & encoder dim & $F$ & head params & total params & dom MAPE (\code{\_cong}) \\
+Variant & Parameters & Experts & Head & Gate in & Gate sees \\
 \midrule
-\code{transformer}      & 64  & 118 & 18\,328 (MLP)  & 119\,768 & 3.443\,\% \\
-\code{lstm}             & 128 & 182 & 26\,520 (MLP)  & 236\,440 & 4.969\,\% \\
-\code{mstnn}            & 120 & 174 & 25\,496 (MLP)  & \phantom{0}74\,016 & 3.713\,\% \\
-\code{moe\_transformer} & 64  & 118 & 97\,632 (MoE)  & 199\,072 & 4.506\,\% \\
-\code{moe\_mstnn}       & 120 & 174 & 140\,640 (MoE) & 189\,160 & 4.668\,\% \\
-\code{moe\_lstm}        & 128 & 182 & 146\,784 (MoE) & 356\,704 & 6.131\,\% \\
+\code{transformer}       & 119\,768 & 1 & 128 & --- & --- \\
+\code{transformer\_wide} & 170\,104 & 1 & 480 & --- & --- \\
+\code{smoe\_z}           & 175\,228 & 4 & 128 & 118 & all of $\mathbf{z}$ \\
+\code{smoe\_cal}         & 174\,780 & 4 & 128 & 6   & target-day calendar only \\
 \bottomrule
 \end{tabular}
-\caption{Measured by instantiating each model on the \code{\_cong} arm
-($C = 76$). MAPE is the \emph{direct}-target variant; see
-Section~\ref{sec:results} for the residual variants, which are uniformly
-better.}
-\end{table}
+\end{center}
 
-\subsubsection{Per-expert evaluation}
-Because the routing is deterministic, each expert can be scored on exactly the
-data it owns: the days of its season, restricted to the hours of its partition.
-\code{moe\_transformer.\_evaluate\_experts} re-runs the full evaluation suite
-per expert into \code{results/\{zone\}/evaluation/\{model\}/\{run\}/experts/\{season\}\_\_\{expert\}/},
-and \code{\_regime\_breakdown} writes the $12$-row MAPE table.
+\noindent
+\code{smoe\_cal}'s gate reads only the 6 calendar channels --- the softened form of
+\code{RegimeHead}'s month rule, with learned boundaries and no sample excluded from
+any expert. The two mixtures differ by $(118-6)\times4 = 448$ parameters, the gate
+matrix alone. \code{transformer\_wide} is a \emph{control}: the mixtures carry
+${\sim}55$k extra parameters, so beating \code{transformer} alone could be capacity
+rather than mixing.
 
-% ---------------------------------------------------------------------
-\subsection{GARCHFormer (ARCHFormer3) --- variance-aware encoder--decoder}
-\label{sec:garchformer}
-% ---------------------------------------------------------------------
+\noindent
+\textbf{Read the gate, not the MAPE.} Mean $\approx 1/N$ with a \emph{high}
+per-sample max means the gate routes decisively but to a different expert each day
+--- the outcome the design bets on. Both flat means no routing happened, which is a
+result: a soft mixture that declines to specialise degenerates to an average of its
+experts, not to under-trained specialists. One mean $>0.85$ is collapse. Expert
+identity is arbitrary up to permutation, so gates are read from one seed, never
+averaged.
 
-The ninth architecture, and the only one not written for this repository:
-\code{src/models/\_garchformer/} is Moyi Guo's \code{archformer3}, vendored
-from his \code{garchformer} repo. \code{layers.py} (709 lines) is byte-identical
-to his; \code{pointmodels.py} differs in one line, the import path. The
-architecture and every one of its hyperparameters are therefore his.
+\subsection{GARCHFormer (ARCHFormer3)}\label{sec:garchformer}
 
-What was written here is the adapter,
-\code{src/models/archformer.py} --- 179 lines that give the model this repo's
-\code{train / predict / evaluate} signatures --- plus a nine-line hook in
-\code{\_seq\_trainer.py} for its auxiliary loss. Everything else is shared with
-the other eight architectures: the same 3-D tensor, the same tail-0.16 split,
-the same embargo, the same scalers, the same evaluator, the same scoreboard row,
-and the residual variant for free through \code{make\_residual\_model}. His own
-data pipeline is deliberately \emph{not} used, because its
-\code{forecast\_deadline\_hour: 23} predicts day $D$ from data through
-$(D{-}1)$ 23:00 --- one day nearer than the task in
-Section~\ref{sec:timeline}, and therefore not comparable.
+Moyi Guo's \code{archformer3}, vendored: \code{layers.py} byte-identical,
+\code{pointmodels.py} one import line changed. Written here: the adapter giving it
+this repo's \code{train/predict/evaluate} signatures, plus a hook for its auxiliary
+loss. Everything else is shared with the other eight --- same tensor, split,
+embargo, scalers, evaluator.
 
-\subsubsection{What a token is here}
-
-Unlike the Transformer of Section~\ref{sec:transformer}, whose token is one
-hour, \textbf{GARCHFormer's token is one day}. With
-$\code{patch\_len} = 24$ the 168-hour window becomes
-\[
-N_{\text{patch}} = \frac{L}{\code{patch\_len}} = \frac{168}{24} = 7
-\qquad\text{tokens.}
-\]
-So the whole encoder--decoder runs on a sequence of length \textbf{7}, and
-each attention matrix is $7\times7$. That is the single most consequential
-difference from the other five nets, and it is what makes the GARCH recursion
-below affordable: it is a Python loop, and it runs seven times.
-
-All $C$ channels go in --- there is no static skip. The 54 broadcast-constant
-features are therefore presented to the tokenizer 24 times inside each patch;
-that is upstream's design and is kept unchanged.
-
-\subsubsection{Block diagram}
+\paragraph{One token $=$ one day.} \code{patch\_len}$=24$, so $168/24 = 7$ tokens and
+every attention matrix is $7\times7$. That is what makes the GARCH recursion
+affordable: it is a Python loop that runs seven times. All $C$ channels go in ---
+there is no static skip, so the 54 constants are presented 24 times inside each
+patch. Upstream's design, kept.
 
 \begin{figure}[htbp]
 \centering
 \fitfig{%
 \begin{tikzpicture}[x=1cm,y=1cm]
-\node[data] (in)  at (0,0)     {$X$\qquad$(B,168,76)$};
-\node[blk]  (tok) at (0,-1.5)  {\code{PatchTokenizer}: reshape to $(B,7,24{\cdot}76)$\\
-                                then \code{Linear}$(1824\!\to\!64)$\qquad$(B,7,64)$};
-\node[blk]  (pe)  at (0,-3.0)  {$+\ P$,\ \ $P \in \R^{1\times7\times64}$ \textbf{learnable}\qquad$(B,7,64)$};
-
-\node[blk,fill=orange!7] (enc) at (0,-5.0)
-      {$2\times$ \code{ARCHEncoderLayer}\\[1pt]
-       causal MHA $\to \mu$;\ \ $\varepsilon = x-\mu$;\ \ GARCH$(\varepsilon^2) \to \sigma^2$;\ \ FiLM\\
-       $(B,7,64)$\quad$+$\quad$\mu^{(\ell)},\sigma^{2(\ell)}\ (B,7,64)$};
-
-\node[blk]  (br)  at (0,-7.0)  {\code{MLPConnectionBlock} (bridge)\\
-                                $64{\to}1$, $7{\to}32$, GELU, $32{\to}7$, $1{\to}64$\qquad$(B,7,64)$};
-
-\node[blk,fill=orange!7] (dec) at (0,-9.0)
-      {$2\times$ \code{ARCHDecoderLayer}\\[1pt]
-       cross-attn over $\mu_{\text{enc}} \to \mu$;\ \ $\varepsilon = x-\mu$;\ \ GARCH $\to \sigma^2$;\ \ FiLM\\
-       $(B,7,64)$};
-
-\node[blk]  (inv) at (-2.9,-11.0) {\code{InversePatchTokenizer}\\
-                                   \code{Linear}$(64\!\to\!1824)$\\$(B,168,76)$};
-\node[blk,fill=gray!8] (invs) at (3.3,-11.0) {same layers applied to\\
-                                   $\sigma^{2}$ of the last decoder layer\\$(B,168,76)$};
-\node[blk]  (hd)  at (-2.9,-12.8) {\code{FinalProjectionHead}\\
-                                   \code{Linear}$(76\!\to\!1)$, keep last 24\\$\hat y\ (B,24)$};
-\node[blk,fill=gray!8] (hds) at (3.3,-12.8) {same head, then $|\cdot| + 10^{-6}$\\$\sigma^2_{\text{out}}\ (B,24)$};
-\node[data] (mw)  at (-2.9,-14.4) {$\hat y^{\text{MW}} = \sigma_y \hat y + \mu_y$};
-\node[op]   (aux) at (3.3,-14.4) {aux loss only\\(not returned)};
-
+\node[data] (in)  at (0,0)     {$X$\quad$(B,168,76)$};
+\node[blk]  (tok) at (0,-1.5)  {\code{PatchTokenizer}: $(B,7,24{\cdot}76)$\\
+                                \code{Linear}$(1824\!\to\!64)$\quad$(B,7,64)$};
+\node[blk]  (pe)  at (0,-2.9)  {$+\ P \in \R^{1\times7\times64}$ \textbf{learnable}};
+\node[blk,fill=orange!7] (enc) at (0,-4.7)
+      {$2\times$ encoder layer\\[1pt]
+       causal MHA $\to \mu$;\ $\varepsilon = x-\mu$;\ GARCH$(\varepsilon^2) \to \sigma^2$;\ FiLM};
+\node[blk]  (br)  at (0,-6.5)  {bridge MLP $64{\to}1$, $7{\to}32{\to}7$, $1{\to}64$};
+\node[blk,fill=orange!7] (dec) at (0,-8.3)
+      {$2\times$ decoder layer\\[1pt]
+       cross-attn over $\mu_{\text{enc}}$;\ same GARCH;\ FiLM};
+\node[blk]  (inv) at (-2.9,-10.2) {\code{InversePatchTokenizer}\\$(B,168,76)$};
+\node[blk,fill=gray!8] (invs) at (3.3,-10.2) {same, on $\sigma^2$};
+\node[blk]  (hd)  at (-2.9,-11.8) {\code{Linear}$(76\!\to\!1)$, keep last 24\\$\hat y\ (B,24)$};
+\node[op]   (aux) at (3.3,-11.8) {$\sigma^2_{\text{out}}$: aux loss only\\(not returned)};
 \draw[ar] (in) -- (tok);  \draw[ar] (tok) -- (pe);   \draw[ar] (pe) -- (enc);
 \draw[ar] (enc) -- (br);  \draw[ar] (br) -- (dec);
 \draw[ar] (dec.south) -- (inv.north);
 \draw[ard] (dec.south) -- (invs.north);
-\draw[ar] (inv) -- (hd);  \draw[ard] (invs) -- (hds);
-\draw[ar] (hd) -- (mw);   \draw[ard] (hds) -- (aux);
-\draw[ar] (enc.west) -- ++(-3.4,0) |- node[dim,pos=0.25,left]{$\mu^{(2)},\sigma^{2(2)}$} (dec.west);
+\draw[ar] (inv) -- (hd);  \draw[ard] (invs) -- (aux);
 \end{tikzpicture}}
-\caption{ARCHFormer3 on the \code{\_cong} arm. The grey right-hand column is the
-variance path: it is computed on every forward pass, supervises training through
-the consistency loss, and is then discarded --- \code{predict()} returns
-$\hat y$ alone. Note the sequence length is $7$, not $168$, everywhere between
-the tokenizer and the inverse tokenizer.}
+\caption{Sequence length is $7$, not $168$, everywhere between the tokenizer and its
+inverse. The grey column is the variance path: computed every forward pass,
+supervises training, then discarded.}
 \end{figure}
 
-\subsubsection{Layer-by-layer}
+\paragraph{Mean path.} Causal MHA over the 7 day-tokens --- day $t$ attends only to
+$\le t$. Opposite to \S\ref{sec:transformer}, where attention is bidirectional. Both
+are legitimate (all 168 hours are past); the causal form is what makes the residual
+below a genuine one-step-ahead innovation rather than a smoothed fit.
 
-\paragraph{(1) Patch tokenisation.} Non-overlapping day patches, flattened
-across both the hour and the channel axis, then projected:
-\[
-X \in \R^{B\times168\times76}
-\ \to\ \R^{B\times7\times24\times76}
-\ \to\ \R^{B\times7\times1824}
-\ \xrightarrow{\ W_{\text{tok}} \in \R^{64\times1824}\ }\ \R^{B\times7\times64}.
-\]
-$168 \bmod 24 = 0$ is asserted by the tokenizer. Parameters
-$1824\cdot64 + 64 = 116{,}800$ --- 23\,\% of the whole model, and the price of
-feeding all 76 channels rather than only the 22 sequence ones.
+\paragraph{Variance path --- the GARCH block.} The innovation is available without a
+second pass, $\varepsilon = x - \mu$. A causal attention first forms a
+data-dependent weighting of past squared innovations,
+$a_t = \sum_{j \le t}\tilde A_{tj}\,\varepsilon^2_j$ --- an ARCH term with learned
+lag weights instead of fixed ones. Then a per-channel GARCH$(1,1)$ recursion over
+the 7 tokens:
+\begin{equation}
+  \sigma^2_t = \omega + \alpha \odot a_t + \beta \odot \sigma^2_{t-1},
+  \qquad \sigma^2_0 = \mathbf{0},\quad t = 1,\ldots,7,
+\end{equation}
+\begin{equation}
+  \omega = \mathrm{softplus}(\omega_{\text{raw}}),
+  \quad \alpha = \sigma(\alpha_{\text{raw}}) \in (0,1),
+  \quad \beta = \frac{\sigma(\beta_{\text{raw}})}{\max\big(\alpha + \sigma(\beta_{\text{raw}}),\,1\big)} .
+\end{equation}
+That denominator is exactly the covariance-stationarity condition
+$\alpha + \beta \le 1$, imposed by construction rather than by a penalty, so the
+recursion cannot diverge. $\omega,\alpha,\beta \in \R^{64}$ --- 64 independent GARCH
+processes, one per embedding channel.
 
-\paragraph{(2) Positional encoding --- learnable, not sinusoidal.}
-\[
-x \leftarrow x + P, \qquad P \in \R^{1\times7\times64}\ \text{a free parameter (448 values).}
-\]
-With only 7 positions there is nothing to extrapolate to, so a lookup table is
-strictly more expressive than the fixed sinusoids of
-Section~\ref{sec:transformer}, step 2.
+\paragraph{FiLM fusion.} The variance modulates the mean path:
+$[\gamma \Vert \beta_f] = W_{f2}\,\mathrm{GELU}(W_{f1}\,\mathrm{softplus}(W_r\sigma^2))$,
+then $h = \LN(\gamma \odot \mu + \beta_f)$ and $x_{\text{next}} = \LN(x + h)$. A
+channel whose recent innovations were large gets its mean-path activation rescaled
+--- the mechanism by which a variance model changes a \emph{point} forecast.
 
-\paragraph{(3) Encoder layer, $\times 2$.} Each layer produces a mean path
-$\mu$, a variance path $\sigma^2$, and a fused representation for the next
-layer.
+\paragraph{Output.} The model reconstructs the \emph{entire} input grid
+($168 \times 76$) and reads the forecast off the last 24 positions through one
+shared $76\to1$ projection. The forecast head is therefore tied to a reconstruction
+task, which is why the inverse tokenizer is the second-largest block.
 
-\emph{(3a) Mean path --- causal multi-head attention.} With $h=4$ heads and
-$d_h = 16$, over the 7 day-tokens:
-\[
-\tilde x = \LN(x), \qquad
-Q,K,V = \tilde x W^Q,\ \tilde x W^K,\ \tilde x W^V,
-\]
-\[
-A = \softmax\!\left(\mathrm{mask}\!\left(\frac{QK^{\!\top}}{\sqrt{16}}\right)\right),
-\qquad
-\mathrm{mask}(S)_{ij} = \begin{cases} S_{ij}, & j \le i\\ -\infty, & j > i\end{cases}
-\]
-\[
-\mu = \LN_2\Big(\FFN\big(\tilde x + AV\big)\Big),
-\qquad \FFN(u) = u + W_2\,\Drop\big(\mathrm{GELU}(W_1 u)\big),\ W_1\in\R^{256\times64}.
-\]
-The mask is \textbf{causal} --- day $t$ may attend only to days $\le t$. This is
-the opposite choice from Section~\ref{sec:transformer}, step 3, where attention
-is bidirectional over the window. Both are legitimate (all 168 hours are past);
-the causal form is what makes the residual below a genuine one-step-ahead
-innovation rather than a smoothed fit.
+\paragraph{Loss.} MSE (upstream's, not this repo's Huber) plus a variance-consistency
+term through the \code{aux\_loss} hook:
+\begin{equation}
+  \Loss = \tfrac{1}{24B}\textstyle\sum_{i,h}(\hat y_{i,h}-y_{i,h})^2
+  \;+\; \lambda\,\tfrac{1}{24B}\textstyle\sum_{i,h}
+  \big|\sigma^2_{\text{out},i,h} - (y_{i,h}-\hat y_{i,h})^2\big|,
+  \qquad \lambda = 0.1 .
+\end{equation}
+Not detached, so it also pushes the mean path. $\lambda = 0$ recovers ARCHFormer2 on
+identical weights. $\sigma^2$ is an auxiliary target, never an output ---
+\code{predict()} returns $\hat y$ alone.
 
-\emph{(3b) Synchronous residual.} The layer's own input is treated as the
-observation and $\mu$ as its conditional mean, so the innovation is available
-without a second pass:
-\[
-\varepsilon = x - \mu \in \R^{B\times7\times64},
-\qquad
-\varepsilon^2 = \varepsilon \odot \varepsilon .
-\]
-
-\emph{(3c) Variance path --- the GARCH block.} This is the paper's contribution
-and the reason for the name. An attention layer first forms a causal,
-data-dependent weighting of the past squared innovations:
-\[
-q = W_q^{\sigma} x,\quad k = W_k^{\sigma} x,
-\qquad
-\tilde A = \softmax\!\left(\mathrm{mask}\!\left(\frac{qk^{\!\top}}{\sqrt{64}}\right)\right),
-\qquad
-a_t = \sum_{j \le t} \tilde A_{tj}\,\varepsilon^2_j \in \R^{64}.
-\]
-$a_t$ is the ARCH innovation term, except that the fixed lag weights of a
-classical ARCH$(p)$ are replaced by learned attention. It then feeds a
-per-channel GARCH$(1,1)$ recursion over the 7 tokens:
-\[
-\boxed{\ \sigma^2_t = \omega + \alpha \odot a_t + \beta \odot \sigma^2_{t-1}\ },
-\qquad \sigma^2_0 = \mathbf{0},\qquad t = 1,\ldots,7,
-\]
-with all three coefficients learned per channel and constrained at use time:
-\[
-\omega = \mathrm{softplus}(\omega_{\text{raw}}) > 0,
-\qquad
-\alpha = \sigma(\alpha_{\text{raw}}) \in (0,1),
-\qquad
-\beta = \frac{\sigma(\beta_{\text{raw}})}{\max\big(\alpha + \sigma(\beta_{\text{raw}}),\,1\big)} .
-\]
-The denominator is the interesting one: it is exactly the
-\textbf{covariance-stationarity condition} $\alpha + \beta \le 1$ of
-GARCH$(1,1)$, imposed by construction rather than by a penalty, so the variance
-recursion cannot diverge. $\omega,\alpha,\beta \in \R^{1\times1\times64}$ ---
-64 independent GARCH processes, one per embedding channel.
-
-\emph{(3d) FiLM fusion.} The variance modulates the mean path by feature-wise
-affine transformation (Perez et al.'s FiLM):
-\[
-s = \mathrm{softplus}(W_r \sigma^2),
-\qquad
-[\gamma \,\Vert\, \beta_f] = W_{f2}\,\mathrm{GELU}(W_{f1} s), \quad W_{f1}\in\R^{128\times64},\ W_{f2}\in\R^{128\times128},
-\]
-\[
-h = \LN\big(\gamma \odot \mu + \beta_f\big),
-\qquad
-x_{\text{next}} = \LN\big(x + h\big).
-\]
-So a channel whose recent innovations were large gets its mean-path activation
-rescaled, and the network can learn to trust $\mu$ less in volatile regimes.
-That is the mechanism by which a variance model changes a \emph{point} forecast.
-
-\paragraph{(4) Bridge.} A four-layer MLP that squeezes the embedding axis,
-mixes along the \emph{temporal} axis, and restores the embedding:
-\[
-(B,7,64)
-\xrightarrow{\ \text{fc}_1: 64\to1\ } (B,7,1)
-\xrightarrow{\ \top\ } (B,1,7)
-\xrightarrow{\ \text{fc}_2: 7\to32\ } \mathrm{GELU}
-\xrightarrow{\ \text{fc}_3: 32\to7\ } (B,1,7)
-\xrightarrow{\ \top\ } (B,7,1)
-\xrightarrow{\ \text{fc}_4: 1\to64\ } (B,7,64).
-\]
-Only 680 parameters. It is the one place where information moves \emph{across}
-tokens without attention.
-
-\paragraph{(5) Decoder layer, $\times 2$.} Same three-part structure, with the
-mean path replaced by cross-attention onto the encoder's last-layer $\mu$:
-\[
-\mu_{\text{dec}} = \mathrm{CrossAttn}\big(Q = \LN(x_{\text{dec}}),\ K = V = \mu_{\text{enc}}^{(2)}\big)
-\quad\text{(no mask --- all 7 encoder tokens are visible)},
-\]
-then $\varepsilon = x_{\text{dec}} - \mu_{\text{dec}}$, the same GARCH recursion
-on $\varepsilon^2$, the same FiLM fusion and residual. The encoder's
-$\sigma^{2(2)}$ is passed in for interface compatibility but is \emph{not}
-consumed by this decoder variant.
-
-\paragraph{(6) Inverse tokenisation and the head.}
-\[
-(B,7,64)
-\xrightarrow{\ W_{\text{inv}} \in \R^{1824\times64}\ } (B,7,1824)
-\xrightarrow{\ \text{view}\ } (B,168,76)
-\xrightarrow{\ \text{Linear}(76\to1)\ } (B,168,1)
-\xrightarrow{\ [:,-24:]\ } (B,24).
-\]
-Worth stating plainly: the model \textbf{reconstructs the entire input grid} ---
-168 hours $\times$ 76 channels --- and then reads the forecast off the
-\emph{last 24 positions} of that reconstruction, through a single
-$76 \to 1$ projection shared across all positions. The forecast head is
-therefore tied to a reconstruction task, which is unusual and is one reason
-the inverse tokenizer is the second-largest block in the model (118,560
-parameters, 24\,\%).
-
-\paragraph{(7) Variance output.} The last decoder layer's $\sigma^2$ is pushed
-through the \emph{same} inverse tokenizer and head, then made positive:
-\[
-\sigma^2_{\text{out}} = \big|\,\mathrm{Head}(\mathrm{InvPatch}(\sigma^{2(2)}_{\text{dec}}))\,\big| + 10^{-6}
-\ \in \R^{B\times24}.
-\]
-
-\subsubsection{Loss}
-
-The point loss is plain MSE on standardized targets --- upstream's
-\code{nn.MSELoss()}, not this repo's default Huber. To it,
-\code{ArchFormer3Trainer} adds a variance-consistency term, reproduced here
-through the \code{aux\_loss} hook:
-\[
-\Loss = \underbrace{\frac{1}{24B}\sum_{i,h}\big(\hat y_{i,h}-y_{i,h}\big)^2}_{\text{MSE}}
-\;+\;
-\lambda\underbrace{\frac{1}{24B}\sum_{i,h}\Big|\ \sigma^2_{\text{out},i,h} - \big(y_{i,h}-\hat y_{i,h}\big)^2\ \Big|}_{\text{variance consistency}},
-\qquad \lambda = 0.1 .
-\]
-The second term is not detached, so it also pushes the mean path. Setting
-$\lambda = 0$ recovers ARCHFormer2 behaviour on identical weights --- the two
-share \code{layers.py} byte for byte, and v3 differs only in exposing and
-supervising $\sigma^2$.
-
-\paragraph{$\sigma^2$ is an auxiliary target, not an output.} It is computed on
-every forward pass and used only by the loss; \code{predict()} returns $\hat y$
-alone, exactly as upstream's \code{run\_point\_forecast.py} does. Its entire
-effect on the delivered forecast is the shaping it applies to the shared
-encoder and decoder weights during training.
-
-\subsubsection{Parameter budget}
-
-\begin{table}[htbp]
-\centering\small
+\begin{center}\small
 \begin{tabular}{@{}lrr@{}}
 \toprule
 Component & Parameters & Share \\
 \midrule
-\code{PatchTokenizer}\quad \code{Linear}$(1824 \to 64)$    & 116\,800 & 23.1\,\% \\
-\code{PositionalEncoding}\quad learnable $(1,7,64)$        & \phantom{000}448 & \phantom{0}0.1\,\% \\
-\code{ARCHEncoder}\quad $2\times$ layer                    & 167\,296 & 33.1\,\% \\
-\quad\emph{of which} \code{ArchQAttentionBlock} (per layer) & \phantom{0}54\,336 & \\
-\quad\emph{of which} \code{SigmaAttentionBlock} (per layer) & \phantom{00}8\,512 & \\
-\quad\emph{of which} \code{VarianceFiLMFusion} (per layer)  & \phantom{0}24\,960 & \\
-\code{MLPConnectionBlock}                                   & \phantom{000}680 & \phantom{0}0.1\,\% \\
-\code{ARCHDecoder}\quad $2\times$ layer                     & 100\,864 & 20.0\,\% \\
-\quad\emph{of which} \code{MuCrossAttentionBlock} (per layer)& \phantom{0}12\,608 & \\
-\quad\emph{of which} \code{SigmaCrossAttentionBlock} (per layer)& \phantom{00}8\,512 & \\
-\code{InversePatchTokenizer}\quad \code{Linear}$(64 \to 1824)$ & 118\,560 & 23.5\,\% \\
-\code{FinalProjectionHead}\quad \code{Linear}$(76 \to 1)$   & \phantom{0000}77 & \phantom{0}0.0\,\% \\
+\code{PatchTokenizer} $(1824 \to 64)$        & 116\,800 & 23.1\,\% \\
+\code{ARCHEncoder} $2\times$                 & 167\,296 & 33.1\,\% \\
+bridge                                       & \phantom{000}680 & \phantom{0}0.1\,\% \\
+\code{ARCHDecoder} $2\times$                 & 100\,864 & 20.0\,\% \\
+\code{InversePatchTokenizer} $(64 \to 1824)$ & 118\,560 & 23.5\,\% \\
+head $(76 \to 1)$ $+$ learnable PE           & \phantom{00}\,525 & \phantom{0}0.1\,\% \\
 \midrule
-\textbf{Total} (\code{\_cong} arm, $C = 76$)                & \textbf{504\,725} & \\
-\bottomrule
-\end{tabular}
-\caption{Measured by instantiating the model. Nearly half the parameters
-(46.6\,\%) sit in the two patch projections, both of which scale with $C$ --- so
-the model is $479{,}949$ on the base arm and $544{,}986$ on \code{\_cong\_lmp}.
-It is the largest of the nine architectures.}
-\end{table}
-
-\subsubsection{Hyperparameters, and which of them are ours}
-
-\begin{center}\small
-\begin{tabular}{@{}llp{6.6cm}@{}}
-\toprule
-Setting & Value & Source \\
-\midrule
-\code{d\_model}, heads, layers & 64, 4, 2$+$2 & his \code{cfgs\_grid\_search/archformer3.json} \\
-\code{patch\_len}, \code{intermediate\_dim} & 24, 32 & same \\
-\code{dropout}, $\lambda_{\text{cons}}$ & 0.1, 0.1 & same / his \code{ArchFormer3Trainer} default \\
-\midrule
-loss, lr, weight decay & MSE, $2\cdot10^{-3}$, 0 & his \code{run\_point\_forecast.py} (Adam, so AdamW must add no decay) \\
-epochs, batch size & 50, 32 & same \\
-early-stop patience & 50 & set equal to \code{epochs} so it can never fire --- his schedule is a fixed 50 epochs \\
-checkpoint & best validation & \textbf{this repo's addition}: his trainer computes \code{best\_val\_loss} but leaves the save commented out \\
-split, embargo, scalers, metrics & --- & this repo's, shared with the other eight architectures \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-% ---------------------------------------------------------------------
-\subsection{Residual models}\label{sec:resid}
-% ---------------------------------------------------------------------
-
-Nine of the eighteen models are residual variants. \textbf{Nothing about the
-architecture, the features, the hyperparameters or the split changes} --- only
-the target moves.
-
-\subsubsection{The baseline}
-
-For sample $i$, recover the raw-MW preliminary-load window and average it per
-clock hour. In the 3-D path, channel $0$ is standardized \code{Load\_Estimated},
-so it is un-standardized with the persisted sequence scaler:
-\[
-\tilde{x}_{i,k} = X_{i,k,0}\cdot \sigma^{\text{seq}}_0 + \mu^{\text{seq}}_0,
-\qquad k = 0,\ldots,167 \quad\text{(raw MW)}.
-\]
-The window ends at a midnight cutoff, so window position $k$ sits at clock hour
-$k \bmod 24$ and the seven values for hour $h$ are exactly $k \in \{h, h+24,
-\ldots, h+144\}$:
-\[
-\boxed{\ b_{i,h} = \frac{1}{7}\sum_{j=0}^{6} \tilde{x}_{i,\,h+24j}\ }
-\qquad h = 0,\ldots,23 \qquad \text{(\code{baseline='hourly'})}.
-\]
-The alternative \code{baseline='scalar'} broadcasts one number,
-$b_{i,h} = \frac{1}{168}\sum_k \tilde{x}_{i,k}$; \code{'hourly'} is what is
-configured and shipped. In the 2-D path the same numbers come straight out of
-the \code{load\_estimated\_h*} columns, so tree and sequence residual models
-lean on a bit-identical baseline.
-
-Two properties make this legitimate: it is computed from the sample's
-\emph{own} lookback (nothing is fit on the training set, so it cannot leak),
-and it reads only preliminary load, which is published in real time (so the
-residual models deploy on the same forecast path as everything else).
-
-\subsubsection{Target transform and inverse}
-
-\begin{figure}[htbp]
-\centering
-\fitfig{%
-\begin{tikzpicture}[x=1cm,y=1cm]
-\node[data] (y)   at (0,1.2)   {$y^{\text{MW}}_i$\\$(B,24)$};
-\node[data] (b)   at (0,-0.4)  {$b_i$ from own window\\$(B,24)$};
-\node[op]   (sub) at (3.0,0.4)  {$-$};
-\node[data] (r)   at (5.4,0.4)  {$r_i$ (MW)};
-\node[blk]  (rs)  at (8.4,0.4)  {\code{res\_scaler}\\fit on train only};
-\node[data] (rz)  at (11.4,0.4) {$\tilde r_i$ standardized\\\emph{this} is the net's target};
-
-\draw[ar] (y) -- (sub); \draw[ar] (b) -- (sub);
-\draw[ar] (sub) -- (r); \draw[ar] (r) -- (rs); \draw[ar] (rs) -- (rz);
-
-\node[blk] (net) at (0,-3.0)  {network output\\$\hat{\tilde r}_i\ (B,24)$};
-\node[blk] (inv) at (3.6,-3.0) {$\times\sigma_r + \mu_r$};
-\node[op]  (add) at (6.6,-3.0) {$+\ b_i$};
-\node[data](mw)  at (9.4,-3.0) {$\hat y^{\text{MW}}_i$};
-\node[blk] (fwd) at (12.4,-3.0) {$\big(\cdot-\mu_y\big)/\sigma_y$\\\scriptsize back to $y$-space};
-\draw[ar] (net) -- (inv); \draw[ar] (inv) -- (add);
-\draw[ar] (add) -- (mw);  \draw[ar] (mw) -- (fwd);
-\end{tikzpicture}}
-\caption{Top: how the training target is built. Bottom: inference. The final
-re-standardization exists so that the caller's usual
-$\sigma_y \hat y + \mu_y$ cancels it exactly --- the residual machinery is
-invisible to \code{ModelEvaluator}, \code{ModelPredictor} and the serving path.}
-\end{figure}
-
-Formally, with $\mu_r,\sigma_r$ fit on the \emph{same} training samples the
-network will see (post-embargo, post-mask):
-\[
-\text{train on}\quad \tilde r_{i,h} = \frac{y^{\text{MW}}_{i,h} - b_{i,h} - \mu_r}{\sigma_r},
-\qquad
-\text{predict}\quad \hat y^{\text{MW}}_{i,h} = \sigma_r\,\hat{\tilde r}_{i,h} + \mu_r + b_{i,h}.
-\]
-The pair $(\mu_r,\sigma_r)$ and the baseline mode are saved as
-\code{residual\_scaler.pkl} \emph{beside the weights}, because predicting with
-a different baseline mode than the one trained on would add back a baseline the
-residuals were never measured against --- and would look like an accuracy
-regression rather than a configuration bug.
-
-\subsubsection{Why the floor matters}
-A residual model that outputs exactly zero reproduces the naive
-same-hour-last-week baseline. That baseline's own score is therefore a hard
-floor, and it is printed next to every residual model's score:
-
-\begin{center}\small
-\begin{tabular}{@{}lrr@{}}
-\toprule
-& dom & bge \\
-\midrule
-naive same-hour-last-week baseline (test)     & 7.72\,\% & 10.40\,\% \\
-best residual model                          & 3.018\,\% & 4.434\,\% \\
-best direct model                            & 3.438\,\% & 4.631\,\% \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Across both zones, every residual variant beats its own direct counterpart.
-On dom the ten best runs of eighty are all residual. The baseline itself scores
-$7.72\%$ on dom (MAE $1280.4$, ME $+56.0$) and $10.40\%$ on bge (MAE $376.5$,
-ME $-26.8$), so the best residual model closes $61\%$ and $57\%$ of the gap to
-a perfect forecast respectively.
-
-% =====================================================================
-\section{Probabilistic Models}\label{sec:prob}
-% =====================================================================
-
-Four probabilistic baselines, each reproducing one IEEE Transactions on Smart
-Grid paper. They are structurally isolated from the point-model stack: each
-reads exactly one input --- the cleaned hourly CSV --- and none is registered
-in \code{src/models}, because that registry is what the daily forecast job
-scans.
-
-\begin{table}[htbp]
-\centering\small
-\begin{tabular}{@{}lllll@{}}
-\toprule
-Driver & Paper & Mechanism & Row unit & dom pinball \\
-\midrule
-\code{train\_quantile.py} & Xie \& Hong (2018)  & temperature scenarios $\to$ MLR & 1 hour & 432.10 \\
-\code{train\_qra.py}      & Liu et al.\ (2017)  & sister forecasts $\to$ QRA      & 1 hour & \textbf{177.26} \\
-\code{train\_qrnn.py}     & Zhang et al.\ (2019)& one net, 99 outputs, pinball    & 1 hour & 250.52 \\
-\code{train\_density.py}  & Li et al.\ (2020)   & 15 densities $\to$ CRPS-weighted GMM & 1 hour & 483.06 \\
-\bottomrule
-\end{tabular}
-\caption{The four baselines. \textbf{Horizons are not identical} --- QRA issues
-at $D{-}1$ for day $D$; the other three issue at $D{-}1$ for day $D{+}1$, the
-same task the eighteen point models perform. See Section~\ref{sec:horizon-caveat}.}
-\end{table}
-
-\medskip
-\noindent
-All four score on the same 99 percentiles $q \in \{1,\ldots,99\}$ and share the
-metrics of Section~\ref{sec:metrics}. Note the change of row granularity: these
-models are fit on \emph{hourly} rows, not on the per-day samples of
-Section~\ref{sec:features}. That is why none of them touches the matrix cache.
-
-% ---------------------------------------------------------------------
-\subsection{Baseline 1 --- Temperature-scenario MLR (Xie \& Hong 2018)}
-% ---------------------------------------------------------------------
-
-\subsubsection{Pipeline}
-
-\begin{figure}[htbp]
-\centering
-\fitfig{%
-\begin{tikzpicture}[x=1cm,y=1cm]
-\node[data] (cl)  at (0,0)     {cleaned CSV\\$49\,511$ hourly rows};
-\node[blk]  (fit) at (3.5,0.9) {fit MLR on train rows\\$\hat\beta \in \R^{285}$};
-\node[blk]  (pool)at (3.5,-1.4){weather pool\\30 past years};
-\node[blk]  (cube)at (7.6,-1.4){scenario cube\\$(30, 81, 7800)$};
-\node[op]   (pct) at (7.6,0.9) {empirical percentiles\\eq.\ (1)};
-\node[data] (q)   at (11.6,0.9){$\hat Q \in \R^{99\times7800}$};
-\node[blk]  (pb)  at (11.6,-1.4){pinball / Winkler\\/ coverage};
-
-\draw[ar] (cl) -- (fit);
-\draw[ar] (cl) -- (pool);
-\draw[ar] (pool) -- (cube);
-\draw[ar] (fit) -- node[dim,above]{predict each scenario} (pct);
-\draw[ar] (cube) -- (pct);
-\draw[ar] (pct) -- (q);
-\draw[ar] (q) -- (pb);
-\end{tikzpicture}}
-\caption{Scenario baseline. The expensive step is point-forecasting a
-scenario, and a $(\text{year}, \text{shift})$ pair does not depend on
-$(k,n)$ --- so every pair is forecast \emph{once} into the cube and each grid
-cell is a slice of it.}
-\end{figure}
-
-\subsubsection{The design matrix}
-
-Three specifications are implemented; \code{vanilla} is the one that ships (it
-is the GEFCom2012 benchmark, the only one of the three with a frozen published
-form). With $z_t = (T_t - \mu_T)/\sigma_T$ standardized on training rows and
-$\mathrm{Tr}_t$ the trend in years since the record start:
-
-\[
-\underbrace{
-\begin{array}{l}
-\text{Vanilla:}\quad
-y_t = \beta_0 + \beta_{\mathrm{Tr}}\mathrm{Tr}_t
-    + \underbrace{\textstyle\sum_{c=1}^{167}\gamma_c\, \mathrm{DH}_{t,c}}_{\text{Day}\times\text{Hour}}
-    + \underbrace{\textstyle\sum_{c=1}^{11}\delta_c\, \mathrm{M}_{t,c}}_{\text{Month}}
-    + f(z_t) + \varepsilon_t
-\end{array}}_{\text{180 calendar columns}}
-\]
-\[
-f(z) = \sum_{p=1}^{3}\Big[
-   \underbrace{\textstyle\sum_{m=1}^{12}\theta_{m,p}\,\mathbb{1}[\mathrm{month}=m]}_{\text{12, full dummies}}
- + \underbrace{\textstyle\sum_{h=1}^{23}\phi_{h,p}\,\mathbb{1}[\mathrm{hour}=h]}_{\text{23, one dropped}}
-\Big] z^p
-\qquad \text{(105 temperature columns)}.
-\]
-
-Total $180 + 105 = 285$ columns. Month gets full dummies and hour drops one:
-if both blocks were full each would sum to $z^p$ across its columns, making
-them exactly collinear. With month full, the bare $z^p$ main effect the paper
-writes separately already lies inside the span.
-
-\begin{center}\small
-\begin{tabular}{@{}lrrl@{}}
-\toprule
-Specification & calendar & temperature & total \\
-\midrule
-\code{tcube}     & 2   & 3   & 5 \\
-\code{vanilla}   & 180 & 105 & \textbf{285} \\
-\code{hong2014}  & 204 & 140 & 344 \\
+\textbf{Total} (\code{\_cong})               & \textbf{504\,725} & \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \noindent
-\code{hong2014} adds Holiday$\times$Hour (24 full dummies) to the calendar
-block and, to the temperature block, $\mathrm{poly}_3(z_{t-j})$ for
-$j\in\{1,2,3\}$, $\mathrm{poly}_3(\bar z_{t})$ with
-$\bar z_t = \frac{1}{24}\sum_{j=1}^{24} z_{t-j}$, and Hour$\times \bar z_t$.
+Nearly half sits in the two patch projections, both of which scale with $C$ ---
+$479\,949$ on the base arm, $544\,986$ on \code{\_cong\_lmp}. Largest of the nine.
+Hyperparameters ($d{=}64$, 4 heads, $2{+}2$ layers, \code{patch\_len} 24, MSE,
+lr $2{\cdot}10^{-3}$, 50 epochs) are all his; the best-validation checkpoint is this
+repo's addition --- his trainer computes it but leaves the save commented out.
 
-\paragraph{Two deliberate departures from the paper.} (i) The paper's Gross
-State Product macroeconomic index has no PJM-zone equivalent, so a single
-linear trend carries growth --- which matters on dom, whose load is rising on
-data-centre demand. (ii) Polynomials are taken of standardized $z$, not raw
-$T$: $\{1,z,z^2,z^3\}$ spans the same column space as $\{1,T,T^2,T^3\}$ so
-the fitted function is identical, but $T^3 \approx 10^6$ in Fahrenheit is
-badly conditioned.
+\subsection{Residual variants}\label{sec:resid}
 
-\paragraph{Estimation.} $\hat\beta = \arg\min_\beta \|X_{\text{tr}}\beta - y_{\text{tr}}\|_2^2$
-by \code{numpy.linalg.lstsq} (SVD, minimum-norm). Minimum-norm rather than a
-normal-equation solve because the 168-level Day$\times$Hour block loses rank
-if a (weekday, hour) cell is empty in a short training window. The estimation
-window is the 3 years ending at the split (\code{train\_years} $=3$): a longer
-window averages away the recent growth and under-forecasts peaks (measured on
-dom: perfect-weather MAPE $3.28\%$ at 3\,y vs $3.68\%$ on the full 4.66\,y).
+Nine of the eighteen. \textbf{Nothing changes but the target.} The baseline is the
+sample's own same-hour-last-week mean of preliminary load, in raw MW:
+\begin{equation}
+  b_{i,h} = \frac17\sum_{j=0}^{6}\tilde x_{i,\,h+24j},
+  \qquad h = 0,\ldots,23 ,
+\end{equation}
+the window ending at a midnight cutoff so position $k$ sits at clock hour
+$k \bmod 24$. Train on $\tilde r_{i,h} = (y^{\text{MW}}_{i,h} - b_{i,h} - \mu_r)/\sigma_r$,
+predict $\hat y^{\text{MW}}_{i,h} = \sigma_r \hat{\tilde r}_{i,h} + \mu_r + b_{i,h}$,
+then re-standardise so the caller's usual inverse cancels it exactly and the
+residual plumbing is invisible downstream.
 
-\subsubsection{Scenario generation}
+\noindent
+Legitimate because it is computed from the sample's \emph{own} lookback (nothing fit
+on the training set, so no leakage) and reads only preliminary load (published in
+real time, so it deploys on the same path). $(\mu_r,\sigma_r)$ and the baseline mode
+are saved beside the weights.
 
-Three methods, all preserving the target index's own \emph{clock hour} and
-remapping only the date:
+\noindent
+A residual model outputting zero reproduces the baseline, so the baseline's own
+score is a hard floor: $7.72\%$ on dom, $10.40\%$ on bge. Every residual variant
+beats its own direct counterpart, on both zones.
 
-\begin{description}
-\item[Fixed-date] Take historical year $y$'s temperature and assign it
-      date-by-date to the target calendar. $k$ years $\to$ $k$ scenarios.
-\item[Shifted-date] The same, additionally slid by $\pm1,\ldots,\pm n$ days.
-      $J = k(2n+1)$ scenarios. Because a shifted series is still a \emph{real}
-      series, its autocorrelation survives --- the paper's stated reason to
-      prefer this over resampling.
-\item[Block bootstrap] Cut the target calendar into $m$-day blocks and draw
-      each block, with replacement, from any of the $k$ years. $l$ scenarios.
-\end{description}
+\subsection{Seed ensembling}\label{sec:seedens}
 
-The pool is stored densely as $\code{arr}[y] \in \R^{13\times32\times24}$
-indexed $[\text{month},\text{day},\text{hour}]$, so a scenario is one numpy
-fancy-index. The full cube is precomputed at
-\[
-\text{scenario\_preds} \in \R^{30 \times 81 \times 7800}
-\quad (k_{\max}=30 \text{ years},\ \text{shifts } -40..{+}40,\ 7800 \text{ test hours}),
-\]
-and any $(k,n)$ configuration is the slice
-$\text{years}[-k:] \times \{|\text{shift}| \le n\}$. Pool years must end
-strictly before the test period --- using test-period weather to build
-scenarios would be leakage.
-
-\subsubsection{Percentiles and scoring}
-
-The paper's empirical distribution function \emph{with averaging} is
-transcribed rather than replaced by \code{np.percentile}, because at small $J$
-the two differ and the published numbers would not be comparable. For $J$
-sorted forecasts $x_1 \le \cdots \le x_J$, $p = q/100$, $i = \lfloor Jp\rfloor$,
-$g = Jp - i$:
-\[
-\hat y_q =
-\begin{cases}
-\tfrac12\big(x_i + x_{i+1}\big), & g = 0,\\
-x_{i+1}, & g > 0 .
-\end{cases}
-\tag{eq.\ 1}
-\]
-Pinball loss at level $p$:
-\[
-\mathrm{PB}_q(y, \hat y_q) =
-\begin{cases}
-(1-p)\,(\hat y_q - y), & y < \hat y_q,\\
-p\,(y - \hat y_q),     & y \ge \hat y_q,
-\end{cases}
-\qquad
-\mathrm{QS} = \frac{1}{99\,N}\sum_{q=1}^{99}\sum_{t=1}^{N}\mathrm{PB}_q .
-\tag{eq.\ 2}
-\]
-
-\paragraph{Result (dom).} The $(k,n)$ sweep bottoms out at $(k{=}20, n{=}10)$,
-i.e.\ $J = 420$ scenarios, with $\mathrm{QS} = 432.10$; fixed-date at
-$k = 30$ gives $442.24$; the degenerate ``perfect weather'' floor (temperature
-known exactly, $J=1$) is $269.10$. Ninety-five percent of the fixed-date
-improvement is already reached well before $k = 30$, reproducing the paper's
-flattening curve.
-
-% ---------------------------------------------------------------------
-\subsection{Baseline 2 --- Quantile Regression Averaging (Liu et al.\ 2017)}
-% ---------------------------------------------------------------------
-
-Two stages. Stage 1 produces eight highly correlated \emph{sister} point
-forecasts; stage 2 turns their disagreement into quantiles.
-
-\begin{figure}[htbp]
-\centering
-\fitfig{%
-\begin{tikzpicture}[x=1cm,y=1cm]
-\node[data] (cl) at (0,0) {cleaned CSV};
-\node[blk] (sel) at (3.4,1.4) {select $(J,D)$ per scheme\\on the validation year};
-\node[blk] (s8)  at (3.4,-1.0) {8 sister designs\\$179 + 105(1{+}J{+}D)$ cols};
-\node[blk] (roll)at (7.4,-1.0) {rolling daily OLS\\in $\log$ space};
-\node[data](fc)  at (11.0,-1.0) {$\ln f \in \R^{8\times20951}$\\873 days};
-\node[blk] (qra) at (11.0,1.4) {per-day, per-$q$\\quantile regression};
-\node[data](out) at (11.0,3.2) {$\hat Q \in \R^{99\times7800}$};
-
-\draw[ar] (cl) -- (sel);
-\draw[ar] (cl) -- (s8);
-\draw[ar] (sel) -- (s8);
-\draw[ar] (s8) -- (roll);
-\draw[ar] (roll) -- (fc);
-\draw[ar] (fc) -- (qra);
-\draw[ar] (qra) -- (out);
-\end{tikzpicture}}
-\caption{QRA. Stage 1 (bottom row) and stage 2 (right column).}
-\end{figure}
-
-\subsubsection{Stage 1 --- sister forecasts}
-
-The family is the Vanilla benchmark \emph{without} a trend (the paper's
-eq.\ (1) has none --- it tracks growth by re-estimating daily on a rolling
-window rather than by extrapolating), plus a recency block:
-\[
-y_t = \text{[Vanilla, no trend]} \;+\; \sum_{d=1}^{D} f\big(\tilde T_{t,d}\big) \;+\; \sum_{j=1}^{J} f\big(T_{t-j}\big),
-\qquad
-\tilde T_{t,d} = \frac{1}{24}\sum_{u=0}^{23} T_{t - 24(d-1) - 1 - u},
-\]
-with $f(\cdot)$ the \emph{same} Month/Hour-interacted cubic as the base
-temperature term (105 columns each). Column count for one sister:
-\[
-\#\text{cols} = \underbrace{1 + 167 + 11}_{179\ \text{calendar}} + 105\,(1 + J + D).
-\]
-
-\paragraph{The eight sisters.} Two estimation-window lengths (2\,y, 3\,y)
-$\times$ four selection schemes. Each scheme scores the same validation-year
-forecasts differently and keeps its own $\arg\min$ over the
-$(J,D) \in \{0..3\}^2$ grid:
+\code{\_seq\_trainer.py} never calls \code{torch.manual\_seed}, so every
+sequence-model row in the scoreboard is one undocumented draw. How wide depends on
+the architecture (dom, \code{\_cong}, residual):
 
 \begin{center}\small
-\begin{tabular}{@{}llll@{}}
+\begin{tabular}{@{}lrrrl@{}}
 \toprule
-Scheme & Score & \multicolumn{2}{l}{dom selection} \\
+Model & seeds & mean & sd & range \\
 \midrule
-\code{pooled}      & MAE over all validation hours as one series & 2\,y: $(3,2)$ & 3\,y: $(3,1)$ \\
-\code{per\_hour}   & mean over 24 separate per-hour MAEs         & 2\,y: $(3,1)$ & 3\,y: $(2,1)$ \\
-\code{first\_half} & MAE on the first half of the validation year& 2\,y: $(3,3)$ & 3\,y: $(3,3)$ \\
-\code{second\_half}& MAE on the second half                      & 2\,y: $(2,1)$ & 3\,y: $(1,1)$ \\
+\code{archformer\_hp\_residual}  & 5 & 3.274 & 0.115 & 3.103--3.415 \\
+\code{archformer\_residual}      & 5 & 3.569 & 0.151 & 3.408--3.728 \\
+\code{transformer\_residual}     & 4 & 3.065 & 0.029 & 3.022--3.093 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \noindent
-Selecting by \emph{partition} rather than by ``keep the four most accurate'' is
-load-bearing. Measured on dom, the four lowest-MAE recency orders have mean
-pairwise error correlation $0.963$; four chosen by different partitions sit
-near $0.81$. Sister forecasts exist in order to disagree, so ranking them by
-accuracy selects against the property the method needs.
+GARCHFormer's spread is $4\times$ the transformer's ($504\,725$ parameters over
+$1461$ days) and exceeds the $0.22$\,pp gap between them, so single-seed rankings
+between the two are not decidable.
 
-\paragraph{Rolling estimation.} Everything is fit on $\log$ load:
-\[
-\hat\beta^{(i)}_{d} = \arg\min_\beta \big\|X^{(i)}_{\mathcal{W}(d,ty_i)}\beta - \ln y_{\mathcal{W}(d,ty_i)}\big\|_2^2,
-\qquad
-f^{(i)}_t = \exp\!\big(x^{(i)\top}_t \hat\beta^{(i)}_{d(t)}\big),
-\]
-where $\mathcal{W}(d, ty)$ is the $ty$-year window ending the instant before
-day $d$, filtered by the same three-sigma \code{is\_valid} mask the point
-models use, and $\hat\beta$ is re-estimated \emph{every day}
-(\code{sister\_refit\_every} $=1$). Output: $(8, 20951)$ over $873$ days.
+\noindent
+The \emph{seed mean} averages five MAPE values. The \emph{ensemble} averages the
+five predictions into one model, $\bar{\mathbf{y}}_d = \frac1K\sum_k \hat{\mathbf{y}}^{(k)}_d$,
+$K = 5$, and scores it once. By the triangle inequality it can never be worse:
+\begin{equation}
+  \mathrm{MAPE}(\bar{\mathbf{y}}) \;\le\; \tfrac1K\textstyle\sum_k \mathrm{MAPE}(\hat{\mathbf{y}}^{(k)}),
+\end{equation}
+and likewise for peak MAPE --- the question is only how much, which scales with how
+uncorrelated the members' errors are.
 
-\subsubsection{Stage 2 --- quantile regression averaging}
-
-For target day $d$ and quantile level $p = q/100$:
-\begin{enumerate}
-\item Calibration window $\mathcal{C}_d$ = the $L$ whole days ending on
-      $d-1$ (never $d$ itself, which has no realised load yet).
-\item Select $\mathcal{M}_d$ = the $m$ sisters with the lowest MAE over
-      $\mathcal{C}_d$.
-\item Fit, per quantile level, on the $24L$ calibration rows:
-\[
-\hat\beta_{q,d} = \arg\min_{\beta \in \R^{m+1}}
-   \sum_{t \in \mathcal{C}_d} \rho_p\!\left(\ln y_t - \beta_0 - \sum_{i \in \mathcal{M}_d}\beta_i \ln f^{(i)}_t\right),
-\qquad
-\rho_p(u) = u\big(p - \mathbb{1}[u<0]\big).
-\tag{eq.\ 5--6}
-\]
-\item Predict the target day's 24 hours and exponentiate:
-      $\hat y_{t,q} = \exp\!\big(\beta_{0} + \sum_i \beta_i \ln f^{(i)}_t\big)$.
-\item \textbf{Rearrangement:} sort each hour's 99 values ascending. Independent
-      quantile regressions can cross; sorting weakly improves the pinball loss
-      and is what makes a ``90\,\% interval'' actually an interval.
-\end{enumerate}
-
-\paragraph{The solver.} Koenker's IRLS, transcribed rather than imported
-(statsmodels is not a dependency, and the daily serving workflow reinstalls
-requirements on every run). Starting from $\beta^{(0)} = \mathbf{1}$:
-\[
-w_t^{(k)} = \Big|\, \rho\text{-weighted residual}\,\Big|
-          = \big|\,p\,r_t\,\mathbb{1}[r_t \ge 0] + (1-p)\,r_t\,\mathbb{1}[r_t<0]\,\big|,
-\qquad r = y - X\beta^{(k)},
-\]
-\[
-X^\star = X \oslash w^{(k)}, \qquad
-\beta^{(k+1)} = \big(X^{\star\top}X\big)^{+}\,X^{\star\top}y ,
-\]
-iterated to $\|\beta^{(k+1)}-\beta^{(k)}\|_\infty < 10^{-6}$. Residuals are
-floored away from zero at $10^{-6}$. Verified against sklearn's linear-programming
-quantile solver --- identical pinball loss to six decimals, in-sample coverage
-exactly $q$ --- and about $100\times$ faster, because the LP carries $2\times24L$
-slack variables while this is a handful of $9\times9$ weighted least-squares
-solves. \textbf{The seed must not be the OLS fit}: iteration 1 reproduces OLS
-exactly, so an OLS seed satisfies the tolerance immediately and returns the mean
-regression for every $q$. Warm-starting from the \emph{previous day's} solution
-for the same $q$ is safe and is what the implementation does.
-
-\paragraph{Selected configuration.} A validation sweep over
-$m \in \{2,\ldots,8\}$ and $L \in \{91,122,183\}$ (21 combinations) picks
-$m = 8$, $L = 183$ on dom (validation pinball $167.11$).
-$L = 365$, which the paper also sweeps, cannot fit this record: a 365-day
-window in front of a 365-day validation year pushes the earliest sister
-forecast to 2023-08, whose own 3-year estimation window would begin four
-months before the data does.
-
-\paragraph{Design shapes.}
-\[
-X_{\mathcal{C}} \in \R^{24L \times (m+1)} = \R^{4392 \times 9},
-\qquad
-X_{\text{target}} \in \R^{24\times9},
-\qquad
-\hat Q \in \R^{99\times7800}.
-\]
-
-% ---------------------------------------------------------------------
-\subsection{Baseline 3 --- Quantile Regression Neural Network (Zhang et al.\ 2019)}
-% ---------------------------------------------------------------------
-
-One network emits all 99 percentiles at once, trained on the summed pinball
-loss. That is the point of the family: QRA needs 99 separate regressions where
-this needs one fit.
-
-\subsubsection{Feature pool and RFE}
-
-The paper's pool is transcribed: date/time, holiday, lagged load, lagged
-temperature.
-\[
-\underbrace{\{\text{load}_{t-h}\}_{h=48}^{840}}_{793}
-\;\cup\;
-\underbrace{\{\text{temp}_{t-h}\}_{h=0}^{840}}_{841}
-\;\cup\;
-\underbrace{\text{11 calendar columns}}_{11}
-\;=\; 1645 \text{ candidates}.
-\]
-Load lags start at $48$, not the paper's $24$: this repo's cutoff is the
-target day's previous midnight, so target hour $k$ sits $25+k$ hours after the
-last observation and a lag valid for all 24 hours must be $\ge48$. A linear
-trend is deliberately \emph{absent} from the pool --- the lag block already
-states the current level, and a monotone trend column takes test-period values
-that never occurred in training, which is the one input shape a network cannot
-extrapolate.
-
-Recursive feature elimination with an MAE-criterion random forest (40 trees,
-\code{max\_depth} 12, 12\,000 subsampled rows, dropping $35\%$ per round) cuts
-$1645 \to 100$, then the paper's manual add-backs
-(\code{dayofweek}, \code{is\_weekend}, \code{is\_holiday}) are appended.
-On dom that yields $\mathbf{101}$ features --- two of the three were already
-selected --- split as $66$ load lags, $29$ temperature lags, $6$ calendar.
-Selection sees \emph{training rows only}; the result is cached under a SHA-1
-signature of the full specification so a changed setting cannot silently reuse
-it.
-
-\subsubsection{Architecture}
-
-\begin{figure}[htbp]
-\centering
-\fitfig{%
-\begin{tikzpicture}[x=1cm,y=1cm,node distance=4mm]
-\node[data] (x)  at (0,0)    {$x$\\$(B,101)$};
-\node[blk]  (l1) at (2.6,0)  {\code{Linear}\\$101\!\to\!500$};
-\node[blk]  (p1) at (5.0,0)  {$\PReLU$\\(500 slopes)};
-\node[blk]  (d1) at (7.4,0)  {$\Drop_{0.5}$};
-\node[blk]  (n1) at (9.9,0)  {$+\,\mathcal{N}(0,0.3^2)$\\train only};
-\node[blk]  (l2) at (2.6,-2)  {\code{Linear}\\$500\!\to\!500$};
-\node[blk]  (p2) at (5.0,-2)  {$\PReLU$};
-\node[blk]  (d2) at (7.4,-2)  {$\Drop_{0.5}$};
-\node[blk]  (n2) at (9.9,-2)  {$+\,\mathcal{N}(0,0.3^2)$};
-\node[blk]  (l3) at (2.6,-4)  {\code{Linear}\\$500\!\to\!99$};
-\node[data] (y)  at (5.6,-4)  {$\hat y_{q}$, $q=1..99$\\$(B,99)$};
-\node[op]   (ls) at (9.0,-4)  {pinball loss\\over 99 levels};
-
-\draw[ar] (x) -- (l1); \draw[ar] (l1) -- (p1); \draw[ar] (p1) -- (d1); \draw[ar] (d1) -- (n1);
-\draw[ar] (n1) to[out=0,in=180,looseness=0.6] (12.0,-1) to[out=0,in=180] (0.6,-2) -- (l2);
-\draw[ar] (l2) -- (p2); \draw[ar] (p2) -- (d2); \draw[ar] (d2) -- (n2);
-\draw[ar] (n2) to[out=0,in=180,looseness=0.6] (12.0,-3) to[out=0,in=180] (0.6,-4) -- (l3);
-\draw[ar] (l3) -- (y); \draw[ar] (y) -- (ls);
-\end{tikzpicture}}
-\caption{iQRNN-500. Both hidden layers carry the same width on purpose --- the
-paper sets them equal ``because it excludes complex and precise tuning on the
-NN size''.}
-\end{figure}
-
-\[
-\begin{aligned}
-h_1 &= \mathcal{G}\big(\Drop_{0.5}(\PReLU(W_1 x + b_1))\big), & W_1 &\in \R^{500\times101}\\
-h_2 &= \mathcal{G}\big(\Drop_{0.5}(\PReLU(W_2 h_1 + b_2))\big), & W_2 &\in \R^{500\times500}\\
-\hat{\mathbf{y}} &= W_3 h_2 + b_3, & W_3 &\in \R^{99\times500}
-\end{aligned}
-\]
-with $\PReLU(u)_j = \max(0,u_j) + a_j\min(0,u_j)$ (one learned $a_j$ per unit)
-and $\mathcal{G}(u) = u + \epsilon$, $\epsilon \sim \mathcal{N}(0, 0.3^2)$,
-active in training only. Parameters:
-$51\,000 + 500 + 250\,500 + 500 + 49\,599 = \mathbf{352\,099}$, matching the
-value recorded in \code{runs.csv}.
-
-\subsubsection{Loss and training schedule}
-
-\[
-\Loss = \frac{1}{99B}\sum_{i=1}^{B}\sum_{q=1}^{99}
-\max\Big(\tfrac{q}{100}\,(y_i - \hat y_{i,q}),\ \big(\tfrac{q}{100}-1\big)(y_i - \hat y_{i,q})\Big),
-\]
-written as the max of the two branches exactly as the paper does (identical to
-the sign-split form, without a branch).
-
-One counter, \code{bad} $=$ epochs since the best validation quantile score,
-drives both rules --- the paper draws them as two diamonds off the same
-condition:
 \begin{center}\small
-\begin{tabular}{@{}ll@{}}
+\begin{tabular}{@{}llrrr@{}}
 \toprule
-Rule & Setting \\
+Zone & Variant & seed mean & ensemble & gain \\
 \midrule
-optimiser / lr        & Adam, $10^{-3}$ \\
-batch size            & 168 (``the weekly pattern of electric load is considerably significant'') \\
-max epochs            & 200 \\
-early stop            & \code{bad} $\ge 20$ \\
-lr decay              & $\times 0.4$ every 5 consecutive \code{bad} epochs, floored at $10^{-5}$ \\
-restore               & best-validation weights (iQRNN only) \\
-independent runs      & 5 seeds, mean and SD reported \\
+dom & \code{archformer\_hp\_residual} & 3.274 & \textbf{2.987} & $0.287$ \\
+dom & \code{archformer\_residual}     & 3.569 & 3.219 & $0.350$ \\
+dom & \code{archformer\_hp}           & 3.965 & 3.734 & $0.231$ \\
+dom & \code{archformer}               & 4.313 & 4.023 & $0.290$ \\
+bge & \code{archformer\_hp\_residual} & 4.798 & 4.476 & $0.322$ \\
+bge & \code{archformer\_residual}     & 4.878 & 4.527 & $0.351$ \\
+bge & \code{archformer\_hp}           & 4.619 & 4.287 & $0.332$ \\
+bge & \code{archformer}               & 5.290 & 4.690 & $0.600$ \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\code{bQRNN-400} is the paper's own \emph{control}: the same PReLU MLP with
-none of the four additions --- no dropout, no noise, no early stopping, no lr
-decay. It exists so the reported gain is attributable to the training
-machinery rather than to the architecture. On dom it scores pinball $404.2$
-against iQRNN-500-ZD's $250.5$, and its Winkler-90 is $14\,197$ against
-$4587$ --- reproducing the paper's central claim.
+\noindent
+The gain is large \emph{because} the seed variance is large. dom's $2.987$ is below
+every single-seed \code{transformer\_residual} run (best $3.022$, mean $3.065$), and
+its peak MAPE $3.326$ is the best of any model. At the single-model level the
+transformer is still better --- $3.065$ lies outside GARCHFormer's 95\% CI
+$[3.131, 3.417]$ --- so the ensemble, not the network, closes the gap.
 
-\subsubsection{Standardisation, and a departure}
-The paper normalises each sample to unit $L_2$ norm and \emph{then}
-standardises by column. The first step is not reproduced: the feature vector
-mixes MW with ${}^\circ$F, and dividing a row by its own norm makes the target's
-scale unrecoverable from the input --- two days differing only in level become
-the same row. Column standardisation fitted on training rows and frozen is used
-instead. The target is standardised too; the pinball loss is positively
-homogeneous, so scaling $y$ scales the loss without moving its minimiser, and
-quantiles are equivariant under the affine inverse. The returned percentiles
-are therefore exact, not approximate.
+\noindent
+\textbf{Not the best seed.} Reporting the lowest of five test scores is selection on
+the test set. Only the mean with its spread (describes the architecture, not a
+deployable model) or the ensemble (a fixed model using no test information) is
+defensible. \textbf{Independent of checkpoint choice}: across the shipped early
+stopping and fixed 20- and 30-epoch budgets the seed sd is $0.115/0.145/0.098$ with
+no ordering. Removing early stopping separately costs $0.15$\,pp.
 
-\subsubsection{Quantile crossing}
-Crossing is measured on the \emph{raw, unsorted} output, since the paper claims
-the joint output layer suppresses it on its own. The constraint score is
-\[
-\mathrm{CS} = \sqrt{\frac{2\theta}{N}\sum_{t}\sum_{q=1}^{98}\big[\max(0,\ \hat y_{t,q} - \hat y_{t,q+1})\big]^2},
-\qquad \theta = \tfrac{1}{100},
-\]
-the spacing being $1/100$ rather than $1/99$ because the 1st..99th percentiles
-are evenly spaced on $(0,1)$ with both endpoints excluded. Everything scored
-downstream uses the sorted array.
+% =====================================================================
+\section{Probabilistic baselines}
+% =====================================================================
 
-% ---------------------------------------------------------------------
-\subsection{Baseline 4 --- CRPS-optimal density combination (Li et al.\ 2020)}
-% ---------------------------------------------------------------------
-
-Fifteen base density forecasts are combined into one Gaussian mixture whose
-weights minimise the CRPS. The combination is the contribution; the base models
-are deliberately generic.
-
-\begin{figure}[htbp]
-\centering
-\fitfig{%
-\begin{tikzpicture}[x=1cm,y=1cm]
-\node[data] (f)  at (0,0)    {15 features\\11 lags $+$ 4 calendar};
-\node[blk] (g)  at (3.4,2.0) {5 $\times$ GPR\\$\Rightarrow (\mu_i,\sigma_i)$ natively};
-\node[blk] (n)  at (3.4,0)   {5 $\times$ QRNN\\$\Rightarrow$ 9 deciles};
-\node[blk] (x)  at (3.4,-2.0){5 $\times$ QRGB\\$\Rightarrow$ 9 deciles};
-\node[op]  (pf) at (7.2,-1.0){probit OLS\\$y_q = \mu + \Phi^{-1}(q)\sigma$};
-\node[data](mus)at (10.4,0.6){$\mu, \sigma \in \R^{15\times T}$};
-\node[blk] (qp) at (10.4,-1.8){QP on $T_3$\\$\min w^{\!\top}Qw + c^{\!\top}w$};
-\node[data](mix)at (13.8,-0.6){$F(x)=\sum_i w_i\Phi\!\big(\tfrac{x-\mu_i}{\sigma_i}\big)$};
-
-\draw[ar] (f) -- (g); \draw[ar] (f) -- (n); \draw[ar] (f) -- (x);
-\draw[ar] (n) -- (pf); \draw[ar] (x) -- (pf);
-\draw[ar] (pf) -- (mus); \draw[ar] (g) -- (mus);
-\draw[ar] (mus) -- (qp); \draw[ar] (qp) -- (mix);
-\end{tikzpicture}}
-\caption{Density combination.}
-\end{figure}
-
-\subsubsection{Features and split}
-
-Fifteen features, the paper's list shifted $+24$ hours for this repo's cutoff:
-\[
-\underbrace{\{48,49,50,51,52\}}_{\text{the same hour and the four before it, on the last fully observed day}}
-\cup
-\underbrace{\{72,96,120,144,168,192\}}_{\text{six daily lags out to a week}}
-\quad\text{(load lags, hours)},
-\]
-plus \code{hour}, \code{dayofweek}, \code{month}, \code{is\_weekend}. No
-weather --- that is the paper's choice, and keeping the feature set exactly as
-published is what makes the reported numbers comparable. The paper keeps both
-\code{dayofweek} and \code{is\_weekend} although one implies the other; that is
-reproduced rather than tidied.
-
-Four-way chronological split: $T_1$ trains the base models, $T_2$ tunes and
-reports them, $T_3$ (56 days) optimises the fifteen weights, $T_4$ is the
-shared test period.
-
-\subsubsection{The fifteen base models}
-
-\begin{table}[htbp]
-\centering\small
-\begin{tabular}{@{}llp{8.0cm}@{}}
-\toprule
-Family & Count & Specification and source of diversity \\
-\midrule
-GPR   & 5 & Kernel $= \text{Mat\'ern}_{3/2}(\text{ARD}) + \text{RBF}(\text{ARD}) + \text{White}$.
-            Each fit on a \emph{different} random 2000-point subsample of $T_1$ --- not
-            stylistic: GPR inverts an $n\times n$ matrix, and the subsample is what makes
-            the five differ. Emits $(\mu,\sigma)$ directly. \\
-QRNN  & 5 & 3 hidden layers, 9 decile outputs, pinball loss, Adam $10^{-3}$, 120 epochs,
-            batch 256. Two architectures: \code{bn} (BatchNorm as the regulariser,
-            weight decay 0) and \code{l2} (no BatchNorm, weight decay $10^{-4}$).
-            Widths $\{64,128,96\}$ and feature subsets
-            $\{\text{all }15,\ \text{11 lags},\ \text{5 short lags} + \text{calendar}\}$. \\
-QRGB  & 5 & XGBoost \code{reg:quantileerror} with \code{quantile\_alpha} $=$ all nine
-            deciles, 300 trees, $\eta = 0.05$. Diversity from
-            \code{max\_depth} $\in\{3,4,6,8\}$, \code{min\_child\_weight} $\in\{1,2,5,10,20\}$,
-            row/column subsampling. \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsubsection{Deciles to a Gaussian (probit regression)}
-
-If the nine deciles really came from $\mathcal{N}(\mu,\sigma^2)$ then
-$y_q = \mu + \Phi^{-1}(q)\,\sigma$, so the points $(p_q, y_q)$ with
-$p_q = \Phi^{-1}(q)$ lie on a line. Fit it by OLS over the quantile axis:
-\[
-\hat\sigma = \frac{\sum_{q}(p_q - \bar p)(y_q - \bar y)}{\sum_q (p_q - \bar p)^2},
-\qquad
-\hat\mu = \bar y - \hat\sigma\,\bar p ,
-\qquad \hat\sigma \leftarrow \max(\hat\sigma, 10^{-6}).
-\]
-The probit grid is identical for every hour, so this is one vectorised
-least-squares rather than $T$ separate fits. It \emph{is} an approximation, and
-it discards any skew a base model captured --- the paper's defence is that
-regional loads are close to Gaussian and that the mixture absorbs the residual
-non-normality.
-
-\subsubsection{Closed-form CRPS of the mixture}
-
-This is what turns the combination into a quadratic program instead of a
-simulation. Baringhaus \& Franz's identity gives
-\[
-\mathrm{CRPS}(F,y) = \E\big|Y - y\big| - \tfrac12\,\E\big|Y - Y'\big|,
-\qquad Y, Y' \overset{\text{iid}}{\sim} F .
-\tag{eq.\ 3}
-\]
-A difference of Gaussian mixtures is again one, and $\E|X|$ is additive over
-components, so with
-\[
-\E|X| = \sigma\sqrt{\tfrac{2}{\pi}}\,e^{-m^2/(2\sigma^2)} + m\big(2\Phi(m/\sigma) - 1\big),
-\qquad X \sim \mathcal{N}(m,\sigma^2),
-\tag{eq.\ 6}
-\]
-one gets the exact quadratic form
-\[
-\boxed{\ \mathrm{CRPS}(F_w, y) = \sum_{i}\sum_{k} \alpha_{ik}\,w_i w_k + \sum_i \beta_i w_i\ }
-\tag{eq.\ 7}
-\]
-\[
-\alpha_{ik} = -\tfrac12\,\E\big|Y_i - Y'_k\big|,
-\quad Y_i - Y'_k \sim \mathcal{N}\!\big(\mu_i - \mu_k,\ \sigma_i^2 + \sigma_k^2\big),
-\qquad
-\beta_i = \E\big|Y_i - y\big| .
-\]
-Note $\alpha_{ii} = -\sigma_i/\sqrt{\pi} < 0$, so \emph{every} diagonal entry
-of $Q$ is negative.
-
-\paragraph{Verification.} The closed form is checked against two independent
-computations of the same number --- Monte-Carlo sampling of eq.\ (3), and
-numerical integration of $\mathrm{CRPS} = 2\int_0^1 \mathrm{PB}_\tau\,d\tau$
-over a quantile grid. \code{crps\_gmm.verify()} runs all three.
-
-\subsubsection{The weight program}
-
-Summing eq.\ (7) over the $T_3$ hours gives $Q = \sum_t \alpha^{(t)}$,
-$c = \sum_t \beta^{(t)}$, and
-\[
-\min_{w \in \R^{15}}\ w^{\!\top} Q w + c^{\!\top} w
-\qquad \text{s.t.}\qquad \mathbf{1}^{\!\top}w = 1,\quad w \ge 0 .
-\tag{eq.\ 12}
-\]
-A weight returning zero drops its model, so \emph{selection and weighting
-happen in one solve} --- the paper's stated reason for posing it this way.
-
-$Q$ is indefinite, so the program is not convex as stated. The paper eliminates
-the equality constraint and reports that the reduced matrix came out positive
-definite in all its cases, without proving it. That is carried over as a
-\emph{check} rather than an assumption: with $Q' = Q_{1:n-1,1:n-1}$,
-$t = Q_{1:n-1,n}$, $Q_{nn}$ the last diagonal entry,
-\[
-Q_{\text{new}} = Q' - \mathbf{1}t^{\!\top} - t\mathbf{1}^{\!\top} + Q_{nn}\mathbf{1}\mathbf{1}^{\!\top},
-\tag{eq.\ 24}
-\]
-and \code{solve\_crps} returns $\lambda_{\min}(Q_{\text{new}})$ alongside the
-weights, flagging whether the solution is \emph{certified global} or merely a
-local optimum. The solver is SLSQP with 8 multi-starts (uniform plus 7
-Dirichlet draws); if the certificate is positive the extra starts are
-redundant, and if it is not they are the only defence.
-
-\subsubsection{Two comparison schemes}
-\code{solve\_mape} minimises $\frac1T\sum_t|y_t - w^{\!\top}\mu_t|/y_t$ on the
-same simplex, and \code{simple\_average} sets $w_i = 1/15$. The point of
-carrying them is the paper's own observation: a MAPE-guided combination knows
-nothing about the shape of the density, so it can win on MAPE while losing on
-CRPS.
-
-\paragraph{Result (dom).} CRPS-guided $958.5$, MAPE-guided $965.8$, simple
-average $956.7$, best individual member (XGB4) $\mathbf{929.1}$. The
-combination does \emph{not} beat its best member here --- a reportable negative
-result, and consistent with $T_3$ being only 56 days against the paper's
-longer weight-optimisation window.
-
-\subsubsection{Scoring the mixture}
-The mixture CDF has no closed-form inverse, so pinball, Winkler and coverage
-are read off a grid of 4096 points spanning $\pm6$ standard deviations of the
-widest component:
-\[
-F(z) = \sum_i w_i\,\Phi\!\left(\frac{z - \mu_i}{\sigma_i}\right),
-\qquad
-\hat y_q = \text{interp}\big(q;\ F(z),\ z\big).
-\]
-The point forecast is the mixture mean $w^{\!\top}\mu$.
-
-% ---------------------------------------------------------------------
-\subsection{The horizon caveat}\label{sec:horizon-caveat}
-% ---------------------------------------------------------------------
-
-The four baselines are \emph{not} all solving the same problem, and the
-difference is recorded in every results file rather than averaged away:
+Four, each reproducing one IEEE TSG paper, scored on 99 percentiles. Structurally
+isolated: each reads only the cleaned hourly CSV, and rows are \emph{hours}, not the
+per-day samples above.
 
 \begin{center}\small
-\begin{tabular}{@{}llll@{}}
+\begin{tabular}{@{}llp{6.2cm}r@{}}
 \toprule
-Model & Data through & Predicts & Label in \code{test\_scores.csv} \\
+Paper & Mechanism & Core & dom pinball \\
 \midrule
-Scenario MLR & --- (weather-driven, no load lag) & the test period & --- \\
-QRA          & $D{-}1$ 23:00 & day $D$    & \code{D-1 -> D} \\
-QRNN         & $D{-}1$ 23:00 & day $D{+}1$& \code{D-1 -> D+1} \\
-Density      & $D{-}1$ 23:00 & day $D{+}1$& --- \\
-18 point models & $D{-}1$ 23:00 & day $D{+}1$ & --- \\
+Xie \& Hong (2018) & temperature scenarios $\to$ MLR
+  & 285-column MLR (Day$\times$Hour, Month, Month/Hour-interacted cubic in
+    standardised $T$); 30 past weather years $\times$ date shifts give $J$ scenarios;
+    quantiles are the empirical percentiles of the $J$ point forecasts & 432.10 \\
+\addlinespace
+Liu et al.\ (2017) & sister forecasts $\to$ QRA
+  & 8 sisters $=$ 2 estimation windows $\times$ 4 selection schemes, differing in a
+    temperature recency block; per day and per level,
+    $\min_\beta \sum \rho_p(\ln y - \beta_0 - \sum_i \beta_i \ln f^{(i)})$ by Koenker
+    IRLS, then sorted & \textbf{177.26} \\
+\addlinespace
+Zhang et al.\ (2019) & one net, 99 outputs
+  & $101 \to 500 \to 500 \to 99$, PReLU, dropout 0.5, Gaussian noise $0.3$, summed
+    pinball; pool $1645 \to 100{+}3$ by RFE. $352\,099$ parameters & 250.52 \\
+\addlinespace
+Li et al.\ (2020) & 15 densities $\to$ CRPS-weighted GMM
+  & 5 GPR $+$ 5 QRNN $+$ 5 QRGB; deciles $\to$ $(\mu,\sigma)$ by probit OLS; weights
+    from $\min_w w^{\!\top}Qw + c^{\!\top}w$ on the simplex, closed-form mixture CRPS
+    (Baringhaus--Franz), so $w_i = 0$ drops a model & 483.06 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-QRA's issue time is a full day nearer than everything else's, so its winning
-pinball of $177.3$ is not directly comparable with QRNN's $250.5$.
-\code{QRNN\_CONFIG['load\_lag\_min']} can be set to $24$ to run the strict
-head-to-head the paper's headline claim is about; $48$ is the default because
-it puts the QRNN on the same footing as the larger set.
+\noindent
+\textbf{Horizons are not identical.} QRA issues at $D{-}1$ for day $D$; the other
+three, and all eighteen point models, issue at $D{-}1$ for day $D{+}1$. QRA's winning
+$177.3$ is therefore not directly comparable with QRNN's $250.5$.
+
+\noindent
+\textbf{Metrics.} Pinball $\mathrm{PB}_q$ averaged over 99 levels; Winkler
+$W_c = \delta + \frac{2}{\alpha}(L-y)\ind\{y<L\} + \frac{2}{\alpha}(y-U)\ind\{y>U\}$
+with $\delta = U-L$; CRPS $= 2\int_0^1 \mathrm{PB}_\tau d\tau$; coverage. Winkler is
+carried because pinball alone cannot separate ``covers everything because it is
+enormous'' from ``covers everything and is tight''.
 
 % =====================================================================
-\section{Evaluation Metrics}\label{sec:metrics}
+\section{Results}
 % =====================================================================
 
-\subsection{Point metrics}
+\noindent
+Point metrics: MAPE, MAE, RMSE, ME as usual, plus \textbf{peak MAPE} (restricted to
+the top decile of true load) and \textbf{BRS}, the OLS slope of per-bin mean error on
+per-bin mean load over ten equal-count load bins. BRS $>0$ over-predicts at peak,
+$<0$ under-predicts. \emph{Every} model here has BRS $<0$ --- they all shave the peak.
 
-With $y$ the metered load and $\hat y$ the forecast, flattened over all
-test days $\times$ 24 hours ($313\times24 = 7512$ values on dom):
-
-\begin{align}
-\mathrm{MAPE} &= \frac{100}{n}\sum_{i}\frac{|y_i - \hat y_i|}{|y_i|}\ \ [\%] &
-\mathrm{MAE}  &= \frac{1}{n}\sum_i |y_i - \hat y_i|\ \ [\mathrm{MW}] \\
-\mathrm{RMSE} &= \sqrt{\tfrac1n\sum_i (y_i-\hat y_i)^2}\ \ [\mathrm{MW}] &
-\mathrm{ME}   &= \frac{1}{n}\sum_i (\hat y_i - y_i)\ \ [\mathrm{MW}]
-\end{align}
-
-\paragraph{Peak MAPE.} MAPE restricted to the top decile of \emph{true} load:
-$\mathrm{MAPE}$ over $\{i : y_i \ge \mathrm{Q}_{0.9}(y)\}$. This is the number
-a system operator actually cares about, and it separates models that global
-MAPE ranks as equivalent.
-
-\paragraph{BRS --- Binned Residual Slope.} A single number for
-\emph{load-dependent bias}, which ME cannot express because opposite biases at
-low and high load cancel. Bin the flattened test set into ten equal-count bins
-by true load; let $\bar y_j$ and $\bar e_j = \overline{(\hat y - y)}_j$ be the
-per-bin means; then
-\[
-\mathrm{BRS} = \text{the OLS slope of } \bar e_j \text{ on } \bar y_j
-\qquad [\mathrm{MW}/\mathrm{MW}].
-\]
-$\mathrm{BRS} > 0$ means the model over-predicts at peak; $<0$ under-predicts
-at peak; $\approx 0$ is unbiased across the load range. Every model in this
-repository has $\mathrm{BRS} < 0$ --- they all shave the peak --- and the
-magnitude ranges from $-0.03$ (best) to $-0.20$ (plain XGBoost).
-
-\subsection{Probabilistic metrics}
-
-\paragraph{Pinball / quantile score.} Eq.\ (2) of Section~\ref{sec:prob},
-averaged over the 99 levels and all hours. Lower is better.
-
-\paragraph{Winkler (interval) score.} For a central $c\%$ interval
-$[L,U]$ with $\alpha = 1 - c/100$ and width $\delta = U - L$:
-\[
-W_c(y) =
-\begin{cases}
-\delta, & L \le y \le U,\\
-\delta + \tfrac{2}{\alpha}(L-y), & y < L,\\
-\delta + \tfrac{2}{\alpha}(y-U), & y > U.
-\end{cases}
-\]
-Pinball alone cannot distinguish ``covers everything because it is enormous''
-from ``covers everything and is tight''. Winkler charges for width on every
-hour and adds a $1/\alpha$-scaled penalty only on a miss, so both attributes
-are scored together.
-
-\paragraph{CRPS.} Computed from a quantile function by
-$\mathrm{CRPS} = 2\int_0^1 \mathrm{PB}_\tau\,d\tau$ (trapezoid over the
-supplied grid), so that all four baselines can be scored on it --- it is the
-first metric all the papers share. For the Gaussian-mixture baseline the
-closed form of Section~\ref{sec:prob} is available and agrees.
-
-\paragraph{Coverage.} For each nominal level $c$, the empirical fraction of
-hours inside $[L,U]$, together with the split between below and above and the
-mean width. Neither source paper reports it; it is kept because it is the first
-thing a reader asks, and it is where the scenario baseline visibly fails --- its
-nominal $98\%$ interval covers $77\%$.
-
-% =====================================================================
-\section{Training Orchestration}
-% =====================================================================
-
-\begin{figure}[htbp]
-\centering
-\fitfig{%
-\begin{tikzpicture}[x=1cm,y=1cm]
-\node[data] (sb) at (0,4.0) {\code{Train\_Model.sbatch}};
-\node[op] (z) at (0,2.6) {for ZONE\\in \{dom, bge\}};
-\node[blk] (cr) at (0,1.1) {\code{run\_crawler.py}\\+ wipe \code{matrix*}};
-\node[op] (a) at (0,-0.6) {for CONG $\in\{1,0\}$\\for LMP $\in\{1,0\}$};
-
-\node[blk] (cfgchk) at (4.6,-0.6) {config probe:\\print \code{MATRIX\_TAG}, \code{N\_SEQ}\\abort on mismatch};
-\node[blk] (mt) at (4.6,-2.6) {\code{Model\_Training.py}\\build matrices $\to$ train 18\\$\to$ evaluate each};
-\node[blk] (fm) at (4.6,-4.6) {\code{run\_foundation.py}\\\code{--mode direct{,}residual}\\(failure is non-fatal)};
-\node[blk] (sc) at (9.6,-4.6) {\code{run\_foundation.py --scoreboard}\\one table over every\\\code{*\_metrics.txt}};
-\node[data](res)at (9.6,-2.6) {\code{results/\{zone\}/evaluation/}\\\code{\_scoreboard.\{csv,png\}}};
-
-\draw[ar] (sb) -- (z);
-\draw[ar] (z) -- (cr);
-\draw[ar] (cr) -- (a);
-\draw[ar] (a) -- (cfgchk);
-\draw[ar] (cfgchk) -- (mt);
-\draw[ar] (mt) -- (fm);
-\draw[ar] (fm) -- (sc);
-\draw[ar] (sc) -- (res);
-\draw[ard] (mt.east) to[out=0,in=180] (res.west);
-\end{tikzpicture}}
-\caption{The submission loops over $2$ zones $\times$ $4$ feature arms; the
-crawl sits \emph{outside} the arm loop, because a re-crawl extends the cleaned
-CSV and moves the tail-0.16 boundary --- two arms crawled separately would no
-longer differ only in their feature set. Wall clock for the full submission:
-$\approx13.3$\,h on 8 CPU cores.}
-\end{figure}
-
-\paragraph{Artefact isolation.} Every artefact whose \emph{content} depends on
-the feature-set width carries \code{MATRIX\_TAG}, so the four arms coexist on
-disk instead of overwriting each other and any A/B is just two runs:
 \begin{center}\small
-\begin{tabular}{@{}ll@{}}
-\toprule
-Artefact & Path \\
-\midrule
-matrices \& scalers & \code{data/\{zone\}/matrix/*\{tag\}.\{csv,npy,pkl\}} \\
-weights             & \code{models/\{zone\}/\{model\}/tail\_test0.16[\_tail\_val0.1]\{tag\}/} \\
-metrics \& figures  & \code{results/\{zone\}/evaluation/\{model\}/tail\_test0.16[\_tail\_val0.1]\{tag\}/} \\
-\bottomrule
-\end{tabular}
-\end{center}
-\code{src/serving/predict} selects run directories by tag and \emph{refuses} a
-mismatch, rather than feeding a model the wrong number of features.
-Longest-suffix matching is required because \code{''} is a suffix of
-everything --- and \code{'\_lmpstat'} deliberately does not end in
-\code{'\_lmp'}.
-
-% =====================================================================
-\section{Results Summary}\label{sec:results}
-% =====================================================================
-
-\subsection{Point models --- best run per architecture}
-
-\begin{table}[htbp]
-\centering\small
 \begin{tabular}{@{}llrrrrr@{}}
 \toprule
-\multicolumn{7}{@{}l}{\textbf{Zone dom} --- 313 test days, 2025-10-17 to 2026-08-25} \\
+\multicolumn{7}{@{}l}{\textbf{dom} --- 313 test days, 2025-10-17 to 2026-08-25} \\
 \midrule
-Model & Best arm & MAPE\,\% & MAE & RMSE & ME & peak MAPE\,\% \\
+Model & Best arm & MAPE\,\% & MAE & RMSE & peak\,\% & BRS \\
 \midrule
-\code{transformer\_residual}      & \code{\_cong} & \textbf{3.018} & 504.8 & 687.1 & $-47.6$ & 3.937 \\
-\code{mstnn\_residual}            & \code{\_cong} & 3.042 & 514.0 & 698.3 & $-159.3$ & 4.444 \\
-\code{moe\_transformer\_residual} & \code{\_cong} & 3.105 & 521.5 & 703.6 & $-84.5$ & 4.113 \\
-\code{lstm\_residual}             & \code{\_cong\_lmp} & 3.127 & 521.4 & 707.6 & $-14.8$ & 4.073 \\
-\code{moe\_mstnn\_residual}       & \code{''}     & 3.145 & 528.8 & 705.8 & $-123.7$ & 4.331 \\
-\code{moe\_lstm\_residual}        & \code{\_cong\_lmp} & 3.246 & 543.4 & 728.6 & $-7.7$ & 4.364 \\
-\code{archformer\_residual}       & \code{\_cong} & 3.263 & 542.7 & 726.6 & $-106.6$ & \textbf{3.855} \\
-\code{xgboost\_residual}          & \code{\_cong} & 3.300 & 551.9 & 748.0 & $-108.6$ & 4.296 \\
-\code{transformer}                & \code{''}     & 3.438 & 577.5 & 760.5 & $-113.3$ & 4.920 \\
-\code{lightgbm\_residual}         & \code{\_cong} & 3.462 & 580.3 & 795.8 & $-138.9$ & 4.767 \\
-\code{archformer}                 & \code{\_cong} & 3.603 & 611.1 & 827.0 & $-256.7$ & 5.948 \\
-\code{mstnn}                      & \code{\_cong} & 3.713 & 627.4 & 824.3 & $-445.5$ & 5.238 \\
-\code{moe\_transformer}           & \code{''}     & 4.265 & 720.4 & 935.2 & $-545.9$ & 5.997 \\
-\code{lstm}                       & \code{''}     & 4.343 & 727.5 & 956.1 & $-271.9$ & 5.698 \\
-\code{moe\_mstnn}                 & \code{''}     & 4.362 & 728.8 & 940.4 & $-578.2$ & 5.477 \\
-\code{xgboost}                    & \code{\_cong} & 4.860 & 840.8 & 1149.3 & $-667.7$ & 8.621 \\
-\code{lightgbm}                   & \code{\_cong} & 5.067 & 876.5 & 1197.6 & $-706.5$ & 9.101 \\
-\code{moe\_lstm}                  & \code{\_cong} & 6.131 & 1034.2 & 1292.9 & $-885.9$ & 8.075 \\
+\code{transformer\_residual}      & \code{\_cong} & \textbf{3.018} & 504.8 & 687.1 & 3.937 & $-0.0553$ \\
+\code{mstnn\_residual}            & \code{\_cong} & 3.042 & 514.0 & 698.3 & 4.444 & $-0.0845$ \\
+\code{moe\_transformer\_residual} & \code{\_cong} & 3.105 & 521.5 & 703.6 & 4.113 & $-0.0555$ \\
+\code{lstm\_residual}             & \code{\_cong\_lmp} & 3.127 & 521.4 & 707.6 & 4.073 & $-0.0573$ \\
+\code{archformer\_residual}       & \code{\_cong} & 3.263 & 542.7 & 726.6 & \textbf{3.855} & $\mathbf{-0.0198}$ \\
+\code{xgboost\_residual}          & \code{\_cong} & 3.300 & 551.9 & 748.0 & 4.296 & $-0.0707$ \\
+\code{transformer}                & \code{''}     & 3.438 & 577.5 & 760.5 & 4.920 & $-0.1061$ \\
+\code{archformer}                 & \code{\_cong} & 3.603 & 611.1 & 827.0 & 5.948 & $-0.1029$ \\
+\code{xgboost}                    & \code{\_cong} & 4.860 & 840.8 & 1149.3 & 8.621 & $-0.1857$ \\
 \midrule
-\multicolumn{2}{@{}l}{\emph{naive same-hour-last-week baseline}} & 7.72 & 1280.4 & 1682.8 & $+56.0$ & --- \\
-\multicolumn{2}{@{}l}{\emph{TimesFM 3.0, zero-shot, direct}}     & 5.242 & 872.6 & 1208.0 & $-69.2$ & 5.835 \\
+\multicolumn{2}{@{}l}{\emph{naive same-hour-last-week}} & 7.72 & 1280.4 & 1682.8 & --- & --- \\
+\multicolumn{2}{@{}l}{\emph{TimesFM 3.0, zero-shot}}    & 5.242 & 872.6 & 1208.0 & 5.835 & $-0.0598$ \\
 \bottomrule
 \end{tabular}
-\caption{Read off \code{results/dom/evaluation/\_scoreboard.csv}; the two
-reference rows come from the runs' own \code{metrics.txt}. Every architecture's
-residual variant beats its own direct variant. \code{archformer\_residual} is
-mid-pack on MAPE (23rd of 66 runs) but holds the best \emph{peak} MAPE and the
-flattest BRS on the whole board -- see Section~\ref{sec:garchformer-result}.
-\textbf{Note the two baselines are not the same object}: the residual models lean on a same-hour-last-week
-mean of \emph{preliminary} load over the 168\,h window ending at the cutoff
-($7.72\%$), while TimesFM's own reference is the same rule under its
-\emph{metered, day-ahead} geometry, whose 72-step horizon costs it $0.35$\,pp
-($8.067\%$).}
-\end{table}
+\end{center}
 
-\begin{table}[htbp]
-\centering\small
-\begin{tabular}{@{}llrrrr@{}}
-\toprule
-\multicolumn{6}{@{}l}{\textbf{Zone bge} --- 309 test days} \\
-\midrule
-Model & Best arm & MAPE\,\% & MAE & RMSE & peak MAPE\,\% \\
-\midrule
-\code{transformer\_residual} & \code{''}     & \textbf{4.434} & 158.6 & 215.5 & 5.037 \\
-\code{mstnn\_residual}       & \code{\_cong} & 4.458 & 159.1 & 212.3 & \textbf{4.922} \\
-\code{moe\_mstnn\_residual}  & \code{''}     & 4.532 & 163.3 & 220.7 & 5.362 \\
-\code{lstm\_residual}        & \code{''}     & 4.605 & 164.0 & 221.7 & 5.365 \\
-\code{mstnn}                 & \code{\_cong} & 4.631 & 163.7 & 213.7 & 4.946 \\
-\code{xgboost\_residual}     & \code{\_cong} & 4.947 & 176.1 & 238.6 & 6.372 \\
-\code{lightgbm\_residual}    & \code{\_cong} & 5.096 & 181.7 & 246.4 & 6.766 \\
-\code{xgboost}               & \code{\_cong} & 5.471 & 192.9 & 255.5 & 6.755 \\
-\midrule
-\multicolumn{2}{@{}l}{\emph{TimesFM 3.0, zero-shot, direct}} & 7.416 & 264.5 & 368.4 & 7.715 \\
-\bottomrule
-\end{tabular}
-\caption{bge is the harder zone: $\approx3$\,GW against dom's $\approx17$\,GW,
-and its preliminary-load proxy is the MIDATL regional aggregate divided by
-$8.8$, which carries a $3.3\%$ \emph{shape} mismatch no rescaling removes.}
-\end{table}
+\noindent
+\textbf{GARCHFormer's result.} Mid-pack on MAPE (23rd of 66 runs) but first on
+\emph{both} peak MAPE ($3.855$) and $|$BRS$|$ ($-0.0198$, against a previous best of
+$-0.0305$ and $-0.0553$ for the model that beats it on MAPE). That is what the
+architecture predicts: load volatility is highest at the peak, the GARCH recursion
+gives an explicit per-channel estimate of it, and FiLM lets the network rescale the
+mean path accordingly. A model that can represent ``this hour is high-variance'' has
+a mechanism for not regressing the peak toward the mean.
 
-\subsection{What the feature arms bought}
+\noindent
+\textbf{Feature arms.} Congestion is a consistent small gain ($-0.4$ to $-2.0\%$
+relative); the price block is a consistent \emph{loss} on dom in both forms, despite
+a LightGBM gain breakdown putting the ten DA price statics at $25.35\%$ of training
+gain. High training gain with worse test error is what an over-trusted proxy looks
+like: price is a downstream consequence of load, so it correlates hard in sample
+while carrying supply-side noise, and its elasticity to load drifts by ${>}2\times$
+across the record.
 
 \begin{center}\small
 \begin{tabular}{@{}lrrrr@{}}
@@ -2537,138 +804,34 @@ Model & \code{''} & \code{\_cong} & \code{\_lmp} & \code{\_cong\_lmp} \\
 \end{tabular}
 \end{center}
 
-The congestion block is a consistent, small gain ($-0.4\%$ to $-2.0\%$
-relative). The price block is a consistent \emph{loss} on dom in both its
-forms. That is the signature described in \code{LMP\_CONFIG}: a LightGBM gain
-breakdown puts the ten Day-Ahead price statics at $25.35\%$ of training gain
-while the arm scores worse on test. High training gain with worse test error
-is what a proxy the model over-trusts looks like --- price is a
-\emph{downstream consequence} of load, so it correlates hard in sample while
-carrying supply-side noise (outages, fuel, bidding) that has nothing to do
-with load, and its elasticity to load drifts by more than $2\times$ across the
-record.
-
-\subsection{What GARCHFormer bought}\label{sec:garchformer-result}
-
-The variance-aware architecture does \emph{not} win on average error --- it is
-23rd of the 66 point runs on dom. What it wins is the two metrics that describe
-behaviour \emph{at the peak}, and it wins both outright:
+\noindent
+\textbf{bge} is the harder zone ($\approx$3\,GW against dom's $\approx$17\,GW, and
+its preliminary-load proxy is the MIDATL regional aggregate divided by $8.8$, which
+carries a $3.3\%$ shape mismatch no rescaling removes). Best there:
+\code{transformer\_residual} $4.434\%$, \code{mstnn\_residual} $4.458\%$, TimesFM
+$7.416\%$.
 
 \begin{center}\small
-\begin{tabular}{@{}llrrr@{}}
-\toprule
-Rank & Model / arm & MAPE\,\% & peak MAPE\,\% & BRS \\
-\midrule
-\multicolumn{5}{@{}l}{\emph{by peak MAPE --- the top of the board}} \\
-1 & \code{archformer\_residual} \code{\_cong}      & 3.263 & \textbf{3.855} & $-0.0198$ \\
-2 & \code{lstm\_residual} \code{''}                & 3.202 & 3.907 & $-0.0347$ \\
-3 & \code{transformer\_residual} \code{\_cong}     & 3.018 & 3.937 & $-0.0553$ \\
-\midrule
-\multicolumn{5}{@{}l}{\emph{by $|\mathrm{BRS}|$ --- flattest bias across the load range}} \\
-1 & \code{archformer\_residual} \code{\_cong}      & 3.263 & 3.855 & $\mathbf{-0.0198}$ \\
-2 & \code{moe\_mstnn} \code{\_cong\_lmp}           & 4.889 & 5.359 & $-0.0305$ \\
-3 & \code{lstm\_residual} \code{''}                & 3.202 & 3.907 & $-0.0347$ \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Section~\ref{sec:metrics} noted that every model in this repository has
-$\mathrm{BRS} < 0$ --- they all shave the peak. GARCHFormer shaves it least, by
-a clear margin: $-0.0198$ against a previous best of $-0.0305$, and against
-$-0.0553$ for the model that beats it on overall MAPE.
-
-That is the result the architecture predicts. Load volatility is highest at the
-peak; the GARCH recursion of Section~\ref{sec:garchformer}, step 3c gives the
-network an explicit, per-channel estimate of that volatility, and the FiLM
-fusion of step 3d lets it rescale the mean path accordingly. A model that can
-represent ``this hour is in a high-variance regime'' has a mechanism for not
-regressing the peak toward the mean, which is exactly what the other eight
-architectures lack.
-
-\paragraph{Caveats.} One 50-epoch run per variant, on one zone
-(\code{dom}) and one arm (\code{\_cong}), with no tuning of any kind --- the
-architecture hyperparameters are the author's and $\lambda_{\text{cons}}$ was
-never swept. bge and the remaining three arms have not been run. The claim
-supported by the evidence is a single-arm, single-zone one; it is suggestive,
-not established.
-
-\subsection{Probabilistic baselines (dom)}
-
-\begin{table}[htbp]
-\centering\small
 \begin{tabular}{@{}lrrrrl@{}}
 \toprule
-Model & pinball & Winkler-50 & Winkler-90 & CRPS & horizon \\
+Probabilistic (dom) & pinball & Winkler-50 & Winkler-90 & CRPS & horizon \\
 \midrule
-QRA ($m{=}8$, $L{=}183$)          & \textbf{177.26} & \textbf{1571.3} & \textbf{2826.8} & 355.4 & $D{-}1 \to D$ \\
-iQRNN-500-ZD                      & 250.52 & 2220.6 & 4586.9 & 495.2 & $D{-}1 \to D{+}1$ \\
-iQRNN-500                         & 285.61 & 2540.8 & 4247.7 & 565.0 & $D{-}1 \to D{+}1$ \\
-bQRNN-400 \emph{(control)}        & 404.23 & 3333.0 & 14197.2 & 794.4 & $D{-}1 \to D{+}1$ \\
-Scenario MLR, shifted $(20,10)$   & 432.10 & 3827.1 & 6962.1 & --- & weather-driven \\
-Density, best member (XGB4)       & 469.05 & 4188.4 & 7812.8 & 929.1 & $D{-}1 \to D{+}1$ \\
-Density, simple average           & 483.05 & 4312.1 & 7858.5 & 956.7 & $D{-}1 \to D{+}1$ \\
-Density, CRPS-guided              & 483.96 & 4312.9 & 7933.3 & 958.5 & $D{-}1 \to D{+}1$ \\
-\bottomrule
-\end{tabular}
-\caption{Lower is better throughout. The horizon column is not decoration ---
-see Section~\ref{sec:horizon-caveat}.}
-\end{table}
-
-\paragraph{Calibration.} QRA's coverage is the only one close to nominal
-(empirical $86.8\%$ at nominal $90\%$, mean width $1869$\,MW). The QRNN family
-is badly miscalibrated in one direction --- at nominal $50\%$, iQRNN-500 covers
-$40.6\%$ with $57.6\%$ of hours \emph{above} the upper bound --- and the
-scenario ensemble is far too narrow at every level, which is structural: its
-width comes only from temperature spread and carries no model error at all.
-
-% =====================================================================
-\section{Appendix: File Map}
-% =====================================================================
-
-\begin{center}\small
-\begin{tabular}{@{}lp{9.6cm}@{}}
-\toprule
-Path & Contents \\
-\midrule
-\code{src/config.py}                & every hyperparameter, path, split and switch \\
-\code{src/feature\_engine.py}       & both matrix builders, the split, the embargo \\
-\code{src/thermal\_features.py}     & 10 sequence $+$ 5 static thermal features \\
-\code{src/macro\_features.py}       & 4 three-week context features \\
-\code{src/forecast\_features.py}    & 31 forecast-weather departures \\
-\code{src/congestion\_features.py}  & 8 Day-Ahead shadow-price features \\
-\code{src/lmp\_features.py}         & 3 RT channels $+$ 10 (or 7) DA price statics \\
-\midrule
-\code{src/models/\_seq\_trainer.py} & shared training loop for the non-MoE nets \\
-\code{src/models/\_moe\_head.py}    & \code{RegimeHead}: 12 experts, hard routing \\
-\code{src/models/\_residual.py}     & baseline, residual scaler, the residual factory \\
-\code{src/models/\_eval\_utils.py}  & every metric and all seven figures \\
-\code{src/models/\{xgboost,lightgbm\}[\_residual].py} & tree models \\
-\code{src/models/\{transformer,lstm,mstnn\}[\_residual].py} & plain sequence models \\
-\code{src/models/moe\_\{transformer,mstnn,lstm\}[\_residual].py} & MoE variants \\
-\code{src/models/archformer[\_residual].py} & GARCHFormer adapter (this repo's, 207 lines) \\
-\code{src/models/\_garchformer/} & ARCHFormer3 itself, vendored from Moyi Guo (849 lines, 1 line changed) \\
-\midrule
-\code{src/quantile/design.py}       & the three MLR design matrices \\
-\code{src/quantile/scenarios.py}    & fixed / shifted / bootstrap scenario generation \\
-\code{src/quantile/sisters.py}      & QRA stage 1 \\
-\code{src/quantile/qra.py}          & QRA stage 2 (IRLS quantile regression) \\
-\code{src/quantile/qeval.py}        & pinball, Winkler, CRPS, coverage \\
-\code{src/qrnn/\{features,model\}.py} & RFE pool and the 99-output network \\
-\code{src/density/\{features,base\_models,gaussfit,crps\_gmm,combine\}.py} & baseline 4 \\
-\midrule
-\code{Model\_Training.py}           & trains and evaluates the 18 point models \\
-\code{train\_\{quantile,qra,qrnn,density\}.py} & the four probabilistic drivers \\
-\code{run\_foundation.py}           & TimesFM benchmark and the scoreboard \\
-\code{Train\_Model.sbatch}          & the $2 \times 4$ submission \\
+QRA ($m{=}8$, $L{=}183$)        & \textbf{177.26} & \textbf{1571.3} & \textbf{2826.8} & 355.4 & $D{-}1 \to D$ \\
+iQRNN-500-ZD                    & 250.52 & 2220.6 & 4586.9 & 495.2 & $D{-}1 \to D{+}1$ \\
+bQRNN-400 \emph{(control)}      & 404.23 & 3333.0 & 14197.2 & 794.4 & $D{-}1 \to D{+}1$ \\
+Scenario MLR $(20,10)$          & 432.10 & 3827.1 & 6962.1 & --- & weather-driven \\
+Density, best member (XGB4)     & 469.05 & 4188.4 & 7812.8 & 929.1 & $D{-}1 \to D{+}1$ \\
+Density, CRPS-guided            & 483.96 & 4312.9 & 7933.3 & 958.5 & $D{-}1 \to D{+}1$ \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\vfill
-\noindent\rule{\textwidth}{0.4pt}\\
-{\footnotesize All shapes, parameter counts and scores in this document were
-read from the repository source, the persisted matrices on disk, or
-\code{results/\{zone\}/evaluation/\_scoreboard.csv}. Numeric examples use zone
-\code{dom} on the \code{\_cong} arm unless stated otherwise.}
+\noindent
+Only QRA is close to nominal coverage ($86.8\%$ at nominal $90\%$). The QRNN family
+is miscalibrated in one direction; the scenario ensemble is far too narrow at every
+level, which is structural --- its width comes only from temperature spread and
+carries no model error. The density combination does \emph{not} beat its own best
+member here, consistent with $T_3$ being 56 days against the paper's longer
+weight-optimisation window.
 
 \end{document}

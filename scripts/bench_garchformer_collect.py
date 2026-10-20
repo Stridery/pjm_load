@@ -45,8 +45,9 @@ KEYS = ['d_model', 'num_heads', 'layers', 'lambda_cons']
 METRICS = ['MAPE', 'SMAPE', 'MAE', 'RMSE', 'MSE', 'Pinball', 'PICP', 'MPIW', 'Winkler']
 
 
-def read_cells(dataset, out_root):
-    d = os.path.join(out_root, dataset, 'garchformer', 'cells')
+def read_cells(dataset, out_root, mode='gaussian'):
+    model_dir = 'garchformer' if mode == 'gaussian' else f'garchformer_{mode}'
+    d = os.path.join(out_root, dataset, model_dir, 'cells')
     rows = []
     for p in sorted(glob.glob(os.path.join(d, '*.json'))):
         with open(p) as fh:
@@ -80,6 +81,8 @@ def main():
     ap.add_argument('--metric', default='MAPE', choices=METRICS,
                     help='selected on its VALIDATION value (default MAPE)')
     ap.add_argument('--out', default='results/bench')
+    ap.add_argument('--mode', default='gaussian', choices=['gaussian', 'sigma_scaled'],
+                    help='which result tree to read: garchformer/ or garchformer_<mode>/')
     ap.add_argument('--top', type=int, default=10, help='rows to print per dataset')
     a = ap.parse_args()
 
@@ -94,7 +97,7 @@ def main():
 
     best_all = {}
     for name in a.dataset:
-        df, cdir = read_cells(name, a.out)
+        df, cdir = read_cells(name, a.out, a.mode)
         print(f"\n{'=' * 78}\n{name}\n{'=' * 78}")
         if df.empty:
             print(f"  no cells under {cdir}")

@@ -9,14 +9,14 @@
 #   PJM_CONGESTION  arms      0 or 1 for python, a list here                 default "1"
 #   PJM_LMP         arms      0 or 1 for python, a list here                 default "0"
 #   SMOE_MODES      modes     "direct residual" | "residual" | "direct"      default both
-#   SMOE_SEEDS      seeds     how many per variant                           default 3
+#   SMOE_SEEDS      seeds     how many per variant                           default 5
 #   SMOE_ONLY       variants  subset, space separated                        default all four
 #
 # Quote the WHOLE --export when any value contains a space:
 #
 #   sbatch Bench_SMoE.sbatch                                              # dom+bge, _cong, both modes
 #   sbatch --export="ALL,PJM_DATASET=dom" Bench_SMoE.sbatch               # one zone
-#   sbatch --export="ALL,SMOE_SEEDS=5" Bench_SMoE.sbatch
+#   sbatch --export="ALL,SMOE_SEEDS=3" Bench_SMoE.sbatch                  # quicker, wider error bars
 #   sbatch --export="ALL,SMOE_ONLY=smoe_z smoe_cal" Bench_SMoE.sbatch     # skip the controls
 #
 # WHAT IS BEING COMPARED, AND WHY TWO OF THE FOUR ARE CONTROLS
@@ -51,8 +51,9 @@
 #   fix has the most room to show. Dropping it to save an hour drops the informative half.
 #
 # COST
-#   4 variants x 2 modes x SEEDS runs PER zone-arm. The transformer takes 280-390 s per run,
-#   so the default (2 zones, 1 arm, 3 seeds) is 48 runs, about 5 h. --time is set past that.
+#   4 variants x 2 modes x SEEDS runs PER zone-arm. The transformer takes 280-390 s per
+#   run, so the default (2 zones, 1 arm, 5 seeds) is 80 runs, about 7.5 h. Five to match
+#   ARCHFORMER_PARAMS['n_seeds'], so a seed count means the same thing in both bench jobs.
 
 #SBATCH --job-name=pjm_smoe
 #SBATCH --account=gts-sd111
@@ -60,7 +61,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=16:00:00
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
@@ -75,7 +76,7 @@ _zones="${PJM_DATASET:-dom bge}"
 _congs="${PJM_CONGESTION:-1}"
 _lmps="${PJM_LMP:-0}"
 _modes="${SMOE_MODES:-direct residual}"
-_seeds="${SMOE_SEEDS:-3}"
+_seeds="${SMOE_SEEDS:-5}"
 _only="${SMOE_ONLY:-}"
 unset PJM_DATASET PJM_CONGESTION PJM_LMP
 

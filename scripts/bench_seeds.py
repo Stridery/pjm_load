@@ -27,9 +27,11 @@ The ensemble is the finding. Averaging 5 seeds' predictions scores 2.993, better
 mean by 0.287 pp and better than every single-seed run of every other model. That gain is large
 *because* the seed variance is large -- there is more to average away.
 
-`skip` is deliberately not benchmarked: it was measured at 3.380 against hp's 3.242 on the same
-arm, and routing the statics past the tokenizer is the one variant that changes where features
-enter, so a seed study on it would be measuring a design that already lost.
+`archformer_skip` is registered but not in the default list. It is the one variant whose
+WIRING differs -- the 54 broadcast constants skip the patch tokenizer and join at the decoder
+output through a fused ReLU -- so averaging it in with the two recipe variants would answer
+neither question. Run it with `--variant archformer_skip` when that is what is being asked.
+Its earlier additive form scored 3.380 against hp's 3.242; that implementation is gone.
 
 WHAT IT WRITES
 --------------
@@ -66,9 +68,19 @@ from tune_archformer import SEED, load_split, targets_for, train_one
 
 # The two variants worth repeating, by the name their results directory uses.
 VARIANTS = {
-    'archformer':    cfg.ARCHFORMER_PARAMS,        # Moyi Guo's recipe, the baseline
-    'archformer_hp': cfg.ARCHFORMER_HP_PARAMS,     # same architecture, this dataset's recipe
+    'archformer':      cfg.ARCHFORMER_PARAMS,      # Moyi Guo's recipe, the baseline
+    'archformer_hp':   cfg.ARCHFORMER_HP_PARAMS,   # same architecture, this dataset's recipe
+    # hp's recipe, different WIRING: the 54 broadcast constants skip the patch tokenizer and
+    # join at the decoder output through a fused ReLU. 345,103 parameters against 504,725,
+    # the saving taken out of the two patch projections. Not in the default list -- it is the
+    # one variant whose architecture differs, so it is opted into rather than swept past.
+    'archformer_skip': cfg.ARCHFORMER_SKIP_PARAMS,
 }
+
+# Benchmarked unless --variant says otherwise. skip stays out: a seed study is for comparing
+# recipes on one architecture, and mixing a rewired model into that average would answer
+# neither question.
+DEFAULT_VARIANTS = ('archformer', 'archformer_hp')
 
 
 def run_dir_name(mode):
@@ -82,7 +94,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--mode', nargs='*', default=['direct', 'residual'],
                     choices=['direct', 'residual'])
-    ap.add_argument('--variant', nargs='*', default=list(VARIANTS), choices=list(VARIANTS))
+    ap.add_argument('--variant', nargs='*', default=list(DEFAULT_VARIANTS),
+                    choices=list(VARIANTS))
     ap.add_argument('--seeds', type=int, default=cfg.ARCHFORMER_PARAMS['n_seeds'],
                     help='how many seeds; the default lives in ARCHFORMER_PARAMS')
     ap.add_argument('--epochs', type=int, default=None,

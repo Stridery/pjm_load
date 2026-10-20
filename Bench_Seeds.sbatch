@@ -10,11 +10,13 @@
 #   PJM_LMP         arms      0 or 1 for python, a list here                 default "0"
 #   SEED_MODES      modes     "direct residual" | "residual" | "direct"      default both
 #   SEED_N          seeds     how many per variant; default from config      default ""
-#   SEED_ONLY       variants  archformer | archformer_hp                     default both
+#   SEED_ONLY       variants  archformer | archformer_hp | archformer_skip   default: the
+#                             first two; skip is opt-in
 #
 #   sbatch Bench_Seeds.sbatch                                          # dom+bge, _cong, both modes
 #   sbatch --export="ALL,PJM_DATASET=bge" Bench_Seeds.sbatch           # one zone
 #   sbatch --export="ALL,SEED_N=10" Bench_Seeds.sbatch                 # tighter error bars
+#   sbatch --export="ALL,SEED_ONLY=archformer_skip" Bench_Seeds.sbatch # the rewired variant only
 #   sbatch --export="ALL,PJM_CONGESTION=1 0,PJM_LMP=1 0" Bench_Seeds.sbatch   # all four arms
 #
 # WHY THIS EXISTS
@@ -28,16 +30,19 @@
 #   (not their scores) gains 0.23-0.60 pp in every zone and mode measured so far, and on dom
 #   puts archformer_hp_residual at 2.987, below every single-seed transformer_residual run.
 #
-# TWO VARIANTS, NOT THREE
-#   archformer      Moyi Guo's recipe, the baseline. Architecture untouched.
-#   archformer_hp   same architecture, this dataset's recipe (huber / 5e-4 / wd 1e-4 / dr 0.2).
-#   archformer_skip is deliberately excluded: it scored 3.380 against hp's 3.242 on the same
-#   arm, and it is the one variant that changes where features enter, so repeating it would be
-#   measuring a design that already lost.
+# THREE VARIANTS, TWO OF THEM BY DEFAULT
+#   archformer       Moyi Guo's recipe, the baseline. Architecture untouched.
+#   archformer_hp    same architecture, this dataset's recipe (huber / 5e-4 / wd 1e-4 / dr 0.2).
+#   archformer_skip  hp's recipe, different WIRING: the 54 broadcast constants skip the patch
+#                    tokenizer and join at the decoder output through a fused ReLU. 345,103
+#                    parameters against 504,725. OPT IN with SEED_ONLY -- averaging a rewired
+#                    model in with the two recipe variants would answer neither question.
+#                    Its earlier additive form scored 3.380; that implementation is gone.
 #
 # COST
-#   2 variants x 2 modes x SEED_N runs per zone-arm. ARCHFormer takes 32-66 s per run, so the
-#   default (2 zones, 1 arm, 5 seeds) is 40 runs, well under an hour.
+#   (variants) x 2 modes x SEED_N runs per zone-arm. ARCHFormer takes 32-66 s per run, so the
+#   default (2 variants, 2 zones, 1 arm, 5 seeds) is 40 runs, well under an hour; one variant
+#   on one zone is 10 runs, about 8 minutes.
 
 #SBATCH --job-name=pjm_seeds
 #SBATCH --account=gts-sd111

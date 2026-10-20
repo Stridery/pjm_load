@@ -15,6 +15,12 @@ is the cell's own metrics file:
 
     results/bench/{dataset}/garchformer/cells/d{d}_h{h}_L{l}_lam{lam}_s{seed}.json
 
+`--mode` picks how the interval is built from the variance head (src/bench/garchformer.MODES):
+`gaussian` is the raw head, `sigma_scaled` rescales it by one scalar fitted on validation.
+Each mode writes to ITS OWN tree -- `garchformer/` for gaussian, `garchformer_{mode}/`
+otherwise -- so a sigma_scaled run never overwrites a gaussian cell; the two are separate rows
+in the paper's table, as they are for ProbGF and SparseTF there.
+
 One file per cell rather than one shared CSV, because 192 jobs appending to the same file
 over NFS interleave their rows. The write is to a .tmp and then an os.replace, which is
 atomic on one filesystem, so a killed job leaves either the old file or the new one and never
@@ -63,6 +69,8 @@ def main():
     ap.add_argument('--patience', type=int, default=None)
     ap.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'])
     ap.add_argument('--out', default='results/bench')
+    ap.add_argument('--mode', default='gaussian', choices=['gaussian', 'sigma_scaled'],
+                    help='interval construction; writes under garchformer/ or garchformer_<mode>/')
     ap.add_argument('--force', action='store_true', help='retrain even if the cell exists')
     a = ap.parse_args()
 
@@ -78,7 +86,8 @@ def main():
               f"Both ArchQAttentionBlock and MuCrossAttentionBlock assert divisibility.")
         return 2
 
-    out_dir = os.path.join(a.out, a.dataset, 'garchformer', 'cells')
+    model_dir = 'garchformer' if a.mode == 'gaussian' else f'garchformer_{a.mode}'
+    out_dir = os.path.join(a.out, a.dataset, model_dir, 'cells')
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, cell_tag(cell, a.seed) + '.json')
     if os.path.exists(path) and not a.force:
@@ -98,7 +107,7 @@ def main():
     if a.patience is not None:
         params['patience'] = a.patience
 
-    row = G.run(ds, cell, params=params or None, seed=a.seed, device=a.device)
+    row = G.run(ds, cell, params=params or None, seed=a.seed, device=a.device, mode=a.mode)
     row['cell'] = cell_tag(cell, a.seed)
 
     tmp = path + '.tmp'
@@ -111,7 +120,8 @@ def main():
     print(f"  val  MAPE {row['val_MAPE']:7.3f}  MAE {row['val_MAE']:.4f}  "
           f"RMSE {row['val_RMSE']:.4f}  PICP {row['val_PICP']:5.1f}")
     print(f"  test MAPE {row['test_MAPE']:7.3f}  MAE {row['test_MAE']:.4f}  "
-          f"RMSE {row['test_RMSE']:.4f}  PICP {row['test_PICP']:5.1f}")
+          f"RMSE {row['test_RMSE']:.4f}  PICP {row['test_PICP']:5.1f}"
+          + (f"   [sigma x {row['sigma_scale']:.3f}, fitted on val]" if a.mode == 'sigma_scaled' else ""))
     print(f"  -> {path}")
     return 0
 

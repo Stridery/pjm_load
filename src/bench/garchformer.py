@@ -90,6 +90,21 @@ import torch.nn.functional as F
 from src.models._garchformer.pointmodels import ARCHFormer3
 
 LEVELS = np.array([0.05, 0.50, 0.95])
+
+# How the interval is built from the model's own (y_hat, sigma_sq). Both are REPORTED; neither
+# touches training or model selection, so the two modes share every point metric and the
+# grid's val_MAPE ranking, and differ only in PICP / MPIW / Winkler / Pinball.
+#
+#   gaussian      y_hat +- z * sigma, sigma straight from the variance head. The head is
+#                 trained with L1(sigma^2, eps^2) on TRAINING residuals, which is not a
+#                 calibration objective (it targets a median of eps^2 and never sees held-out
+#                 error), and the measured result is under-coverage: PICP 60-78 against a
+#                 nominal 90, with sigma nearly constant and uncorrelated with |residual|.
+#   sigma_scaled  the same sigma times ONE scalar c fitted on the validation split,
+#                 c = RMSE(val residuals) / RMS(sigma_val), applied unchanged to test. This
+#                 is the post-hoc variance scaling the chapter's own table labels
+#                 "sigma-scaled" for ProbGF and SparseTF, so the row lands in that column.
+MODES = ('gaussian', 'sigma_scaled')
 # Gaussian quantiles of those levels. sigma_sq is trained to match the squared error, so
 # (y_hat, sqrt(sigma_sq)) is a conditional Gaussian and these are its 5/50/95 points. The
 # interval metrics derived from it are REPORTED, not optimised -- nothing in the loss asks
@@ -288,13 +303,16 @@ def _forward_all(model, X, device, batch=256):
     return np.concatenate(yh), np.concatenate(ss)
 
 
-def run(ds, cell, params=None, seed=0, device='auto', verbose=True):
+def run(ds, cell, params=None, seed=0, device='auto', verbose=True, mode='gaussian'):
     """Train one grid cell and score it on validation and test. Writes nothing.
 
-    Returns a flat dict: the cell, the run facts, and `val_*` / `test_*` metrics.
+    Returns a flat dict: the cell, the run facts, and `val_*` / `test_*` metrics. `mode` picks
+    how the interval is formed (see MODES); it changes nothing before scoring.
     """
     from src.bench import metrics as M
 
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
     params = {**DEFAULT_PARAMS, **(params or {})}
     dev = torch.device(('cuda' if torch.cuda.is_available() else 'cpu')
                        if device == 'auto' else device)
@@ -373,8 +391,10 @@ def run(ds, cell, params=None, seed=0, device='auto', verbose=True):
            'dataset': ds.name, 'seed': seed, 'n_params': n_params,
            'epochs_run': epoch + 1, 'best_epoch': best_epoch,
            'val_mse_model_units': best_val, 'seconds': secs,
-           'n_features': len(cols), 'patch_len': ds.H, 'device': str(dev)}
+           'n_features': len(cols), 'patch_len': ds.H, 'device': str(dev),
+           'mode': mode, 'sigma_scale': 1.0}
 
+    # val is scored first on purpose: sigma_scaled fits its one scalar there and test reuses it.
     for part, (X, y) in (('val', (Xva, yva)), ('test', (Xte, yte))):
         y_hat, sigma_sq = _forward_all(model, X, dev)
         # model units -> physical -> bench z
@@ -384,6 +404,12 @@ def run(ds, cell, params=None, seed=0, device='auto', verbose=True):
         z_hat = ((phys_hat - mean_d) / sd_d).ravel()
         z_sig = (phys_sig / sd_d).ravel()
         z_act = ((phys_act - mean_d) / sd_d).ravel()
+        if mode == 'sigma_scaled':
+            if part == 'val':
+                resid_rms = float(np.sqrt(np.mean((z_act - z_hat) ** 2)))
+                sig_rms = float(np.sqrt(np.mean(z_sig ** 2)))
+                out['sigma_scale'] = resid_rms / max(sig_rms, 1e-12)
+            z_sig = z_sig * out['sigma_scale']
         q = z_hat[None, :] + ZS[:, None] * z_sig[None, :]
         q = np.sort(q, axis=0)
         s = M.score(z_act, q, LEVELS, scale=(mean_d, sd_d))

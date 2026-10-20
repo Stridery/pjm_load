@@ -353,6 +353,41 @@ PJM_SUBSCRIPTION_KEY = os.environ.get('PJM_API_KEY') or '6a75d9f6d933401dbb4f36f
 # verifies for ~weeks into the next year; weather/forecast revise for a few days).
 UPDATE_YEARS = [2025, 2026]   # metered, preliminary, observed weather, weather-forecast archive
 
+# --- Segmented evaluation ------------------------------------------------------------------
+# A single MAPE over the whole test set hides where a model actually differs. Two cuts are
+# reported alongside it, both computed from the TRUE target so every model is scored on the
+# identical set of points -- a split derived from predictions would give each model its own
+# bands and the comparison would be meaningless.
+#
+# LOAD BANDS. Fixed thresholds, not quantiles: a tercile split moves with the test period and
+# with the zone, so "high band MAPE" would not mean the same thing twice. These are physical
+# MW levels, chosen per zone. The cost is that the bands are not equally populated -- on the
+# 313-day test period the top band holds 4.3 % of dom's hours and 5.8 % of bge's -- so the
+# high-band number is the noisiest of the three. Every output carries n for that reason.
+LOAD_BANDS = {
+    'dom': (16000.0, 22000.0),
+    'bge': (3500.0, 5000.0),
+}
+LOAD_BAND_LABELS = ('low', 'mid', 'high')
+
+# RELATIVE VOLATILITY. How unsettled an hour is compared with how unsettled that same clock
+# hour has been lately:
+#
+#     v[d,h] = |y[d,h] - y[d-1,h]|                        this hour's day-over-day move
+#     V[d,h] = mean over the previous VOL_WINDOW_DAYS of the same quantity, same clock hour
+#     r[d,h] = v / (V + eps)
+#
+# Per CLOCK HOUR on purpose. Pooling the hours would make r track time of day -- evenings move
+# more than small hours in absolute MW -- and the subset would then be a second time-of-day
+# filter rather than a volatility one, duplicating the load bands.
+#
+# Only data strictly before the point enters V, so the subset is reproducible and causal even
+# though it is an evaluation-time grouping that never reaches a model.
+VOL_WINDOW_DAYS = 30
+VOL_TOP_FRACTION = 0.25        # report the most volatile quarter
+VOL_SERIES_COL = 'Load'        # metered, not preliminary: this is after-the-fact analysis,
+                               # so accuracy beats real-time availability
+
 # --- Models to Train (1 = train, 0 = skip) ---
 TRAIN_CONFIG = {
     'xgboost':              1,
@@ -771,38 +806,39 @@ ARCHFORMER_HP_PARAMS = {
     **_ARCHFORMER_TUNED,
 }
 
-# skip: the same recipe, plus the static block routed past the patch tokenizer to its own
-#     out_dim head (see src/models/archformer.py). That cuts the tokenizer's input from
-#     24 x C to 24 x n_seq, so the compression it performs drops from ~28:1 to ~8:1 -- which
-#     means the recipe tuned ON the 28:1 model is not necessarily right for this one. Treat
-#     these four values as a starting point and re-run `--group 3` against this variant
-#     before trusting them.
-# skip's own recipe. NOT hp's: the two are different optimisation problems, and one of the
-# differences is structural rather than a matter of degree.
+# skip: hp's recipe, plus the static block routed past the encoder-decoder stack entirely.
 #
-#   the shortcut.  Routing the statics to their own head makes them an ADDITIVE path two
-#       layers deep, against ten-odd transformations on the main path. Short paths fit first.
-#       If the statics -- which include the 24 hourly forecast-weather departures, the
-#       strongest single block in the feature set -- are absorbed by that head early, the
-#       GARCH machinery never has to learn anything, and the variant would post a decent
-#       number while measuring nothing about the architecture. Hence a lower step (3e-4
-#       rather than hp's 5e-4) and a heavier dropout on the shortcut alone (0.3).
-#   less to regularise.  The main path carries 347k parameters against 504k, and its
-#       tokenizer compresses 8:1 rather than 28:1. Its own dropout comes DOWN to 0.15.
-#   huber stays.  That choice is about the target's outlier days, not about the wiring.
+# WHAT CHANGED, AND WHY THE OLD ONE WAS DISCARDED
+# Upstream tokenises every channel. On this tensor 54 of 76 are broadcast constants repeated
+# 24 times inside each patch, so 71 % of the tokenizer's 1824 inputs are duplicate copies.
+# Here only the 22 time-varying channels are tokenised, and the statics join at the DECODER
+# OUTPUT, fused by Linear(d_model + S -> d_model) + ReLU before the inverse tokenizer.
 #
-# DESIGNED, NOT MEASURED. hp's four values came out of a one-at-a-time sweep on the baseline;
-# these are reasoned from what changed and have not been swept. The obvious first check is
-# whether 3e-4/0.3 is over-correcting -- the broken first version of this variant underfit
-# badly, so erring toward regularisation deserves a look before it is trusted:
-#     python scripts/tune_archformer.py --group 3 --mode residual     (then compare against this row)
+# The ReLU is the part that is easy to get wrong and was wrong twice:
+#   v1  a separate 2-layer head emitting out_dim, ADDED to the finished y_hat. 54 features
+#       collapse to one offset per hour; the forecast can be shifted, never modulated. 3.380
+#       against hp's 3.242 on the same arm.
+#   v2  concatenated straight into the inverse tokenizer. Better -- each static gets its own
+#       per-hour weight -- but Linear([h || s]) = W_h h + W_s s + b is still additively
+#       separable, so the static effect does not depend on the sequence at all. Measured: the
+#       same static perturbation moved two different sequences by byte-identical amounts.
+#   v3  the fusion ReLU. Same test now separates them.
+# This is what the other six nets have had all along -- their heads are Linear -> ReLU ->
+# Linear over [z || s], and the ReLU is where the interaction lives.
+#
+# sigma^2 skips the fusion, so the statics never reach it: how volatile an hour is should be
+# a property of the series, and the variance path is what buys this architecture its peak
+# MAPE and its flat BRS.
+#
+# 504,725 -> 345,103 parameters (-31.6 %), with the saving taken out of the two patch
+# projections and part of it put back into a head that actually decides something.
+#
+# RECIPE: hp's, unchanged. The old skip carried its own (lr 3e-4, dropout 0.15,
+# static_dropout 0.3) which was reasoned rather than measured, and it was never re-run after
+# hp's recipe was confirmed over 5 seeds. One variable at a time: this changes the wiring.
 ARCHFORMER_SKIP_PARAMS = {
     **ARCHFORMER_PARAMS,
-    'loss': 'huber', 'huber_delta': 1.0,
-    'learning_rate': 3e-4,
-    'weight_decay': 1e-4,
-    'dropout': 0.15,
-    'static_dropout': 0.3,
+    **_ARCHFORMER_TUNED,
     'n_seq_features': N_SEQ_FEATURES,
 }
 

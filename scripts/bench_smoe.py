@@ -110,7 +110,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--mode', nargs='*', default=['direct', 'residual'],
                     choices=['direct', 'residual'])
-    ap.add_argument('--seeds', type=int, default=3)
+    ap.add_argument('--seeds', type=int, default=cfg.ARCHFORMER_PARAMS['n_seeds'],
+                    help="how many seeds; the default lives in ARCHFORMER_PARAMS so a\n"
+                         "seed count means the same thing in every bench driver")
     ap.add_argument('--epochs', type=int, default=None)
     ap.add_argument('--only', nargs='*', default=None,
                     help='subset of variant names to run')
