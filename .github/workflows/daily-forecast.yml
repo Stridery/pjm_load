@@ -46,16 +46,13 @@ jobs:
 
       - name: Forecast + refresh site
         run: |
-          # Once per (zone, congestion arm). MATRIX_TAG is baked from PJM_CONGESTION at config
-          # import and src/serving/predict refuses weights whose tag disagrees, so one process
-          # serves exactly one arm; table.update merges the two column sets (each run writes
-          # only its own {model}_{arm}_pred columns). The store carries the same sixteen
-          # prediction columns it always did — eight residual models x two feature sets, rather
-          # than the old sixteen models x one. All four runs are CPU-only inference.
+          # Once per zone. The congestion A/B used to run two arms per zone; it is settled
+          # (_cong wins on every model) so the daily job runs that arm only, and src.serving.run
+          # refuses to start if MATRIX_TAG and SERVING_ARM disagree. Each process serves the
+          # twelve models in src.config.SERVING_MODELS -- six architectures, direct and residual
+          # -- and writes only its own columns. CPU-only inference throughout.
           for zone in dom bge; do
-            for cong in 1 0; do
-              PJM_DATASET=$zone PJM_CONGESTION=$cong python -m src.serving.run
-            done
+            PJM_DATASET=$zone PJM_CONGESTION=1 PJM_LMP=0 python -m src.serving.run
           done
           python generate_web.py
 
