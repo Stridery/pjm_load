@@ -32,14 +32,17 @@ from src.data_crawler.pipeline import load_metered, load_preliminary, _fetch_or_
 from src.data_processor import clean_and_engineer, clean_forecast
 
 
-# The daily job serves TWO congestion arms per zone, and MATRIX_TAG is baked from
-# PJM_CONGESTION at config import — so each arm is its own process, and each would otherwise
+# The daily job runs ONE arm per zone now (src.config.SERVING_ARM), so a scheduled run fetches
+# once and this window only matters on a retry or a manual run following a failed scheduled
+# one. It was earned when the job served two congestion arms per zone: MATRIX_TAG is baked from
+# PJM_CONGESTION at config import, so each arm was its own process and each would otherwise
 # re-pull two years of PJM load, both Open-Meteo archives and the DA marginal value to produce
-# byte-identical inputs. That doubles the runtime and the load placed on APIs we do not own.
+# byte-identical inputs.
 #
-# So artifacts younger than this are reused instead of re-fetched. Freshness is checked PER
-# ARTIFACT, not behind one flag, so the arms may run in either order: a nocong run never touches
-# congestion.csv, and a cong run that follows it still refreshes that one file.
+# Kept because the asymmetry still favours it: a stale-by-minutes reuse costs a few seconds of
+# accuracy on data that updates hourly, and an unnecessary refetch costs quota on APIs we do
+# not own. Freshness is checked PER ARTIFACT rather than behind one flag, so a run that needs
+# only some of them refreshes only those.
 #
 # 180 min is far longer than a daily job takes end to end and far shorter than a day, so
 # consecutive arms share one fetch while tomorrow's run always fetches afresh.
