@@ -353,6 +353,47 @@ PJM_SUBSCRIPTION_KEY = os.environ.get('PJM_API_KEY') or '6a75d9f6d933401dbb4f36f
 # verifies for ~weeks into the next year; weather/forecast revise for a few days).
 UPDATE_YEARS = [2025, 2026]   # metered, preliminary, observed weather, weather-forecast archive
 
+# --- What the daily forecast serves ---------------------------------------------------------
+# An explicit list, not a rule. The weights directory still holds everything ever trained --
+# four feature arms, the MoE heads, three GARCHFormer variants -- and the old filter
+# (`endswith('_residual')`) would drag all of it onto the page the moment base models were
+# added. What ships is a decision, so it is written down.
+#
+# Each name is served TWICE: once direct and once residual (`{name}` and `{name}_residual`),
+# giving 12 columns per zone.
+#
+# Dropped and why:
+#   moe_*            hard calendar routing loses to the plain model in all six comparisons
+#                    (+0.09 to +1.79 pp); the soft-gated version does not beat a single head
+#                    of matching width. See model_architecture.tex.
+#   archformer,      superseded by archformer_skip, which carries the same architecture with
+#   archformer_hp    the statics fused at the decoder: 345,103 parameters against 504,725.
+#   the other arms   the congestion A/B is settled -- _cong wins on every model -- so running
+#                    four arms daily buys nothing and costs four inference processes.
+SERVING_MODELS = ('xgboost', 'lightgbm', 'transformer', 'lstm', 'mstnn', 'archformer_skip')
+SERVING_ARM = '_cong'          # the arm the daily job runs; MATRIX_TAG must agree
+
+# --- Training seed ---------------------------------------------------------------------------
+# src/models/_seq_trainer.py never seeded anything, so every weight file under models/ is one
+# undocumented draw and no run could be reproduced. On ARCHFormer that draw is worth 0.115 pp
+# of MAPE on dom and 0.316 pp on the direct skip variant -- more than most of the differences
+# the scoreboard is used to argue about.
+#
+#     PJM_SEED=46 python scripts/Model_Training.py        # reproducible
+#     python scripts/Model_Training.py                    # unseeded, the old behaviour
+#
+# Unset by default ON PURPOSE. Pinning a seed repo-wide would silently turn every future
+# comparison into a comparison of one draw, which is the problem rather than the fix. It is
+# set when a specific run has to be reproduced -- deploying a chosen seed, or re-creating a
+# weight file that a seed study identified.
+#
+# A seed chosen BY TEST SCORE is legitimate for deployment and not for reporting: the live
+# task is the future, so picking on the historical split is ordinary model selection, but that
+# seed's test MAPE is then an optimistic estimate and the honest number stays the seed mean or
+# the ensemble. scripts/bench_seeds.py writes both.
+_SEED = os.environ.get('PJM_SEED', '').strip()
+TRAIN_SEED = int(_SEED) if _SEED else None
+
 # --- Segmented evaluation ------------------------------------------------------------------
 # A single MAPE over the whole test set hides where a model actually differs. Two cuts are
 # reported alongside it, both computed from the TRUE target so every model is scored on the

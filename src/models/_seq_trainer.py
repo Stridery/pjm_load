@@ -1,13 +1,16 @@
 """Shared training loop for all sequence models (Transformer, LSTM, MSTNN)."""
 
 import os
+import random
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
 from src.feature_engine import _split_indices, apply_embargo
-from src.config import EMBARGO_DAYS
+from src.config import EMBARGO_DAYS, TRAIN_SEED
 from src.models._utils import _make_run_dir
 
 
@@ -37,6 +40,16 @@ def train_sequence(model_cls, model_type_name, save_name,
                    X_3d, y_3d, mask_3d, params, feature_cfg, dataset=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nGPU Acceleration: {device}")
+
+    # Seeds initialisation AND batch order, which is the whole of the run-to-run spread --
+    # checkpoint policy accounts for none of it (sd 0.115 / 0.145 / 0.098 across three
+    # policies, no ordering). None leaves torch's own entropy alone, which is what every
+    # weight file written before this existed used.
+    if TRAIN_SEED is not None:
+        torch.manual_seed(TRAIN_SEED)
+        np.random.seed(TRAIN_SEED)
+        random.seed(TRAIN_SEED)
+        print(f"Seed: {TRAIN_SEED}")
 
     model_dir = _make_run_dir('models', model_type_name, feature_cfg, dataset)
 
