@@ -38,3 +38,4 @@ condor/*.condor.sub
 condor/train.run.dag
 .venv.old.*
 .venv.stale.*
+web/*.bak
