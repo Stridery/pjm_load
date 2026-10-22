@@ -85,6 +85,12 @@ def train_sequence(model_cls, model_type_name, save_name,
     optimizer = optim.AdamW(model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'])
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
+    # A seeded run writes its own file so the five members of an ensemble coexist with the
+    # unseeded single-seed weight instead of overwriting it and each other. serving's
+    # _weights_for globs them back together; see src.config.SERVING_ENSEMBLES.
+    if TRAIN_SEED is not None:
+        stem, ext = os.path.splitext(save_name)
+        save_name = f'{stem}_seed{TRAIN_SEED}{ext}'
     save_path           = os.path.join(model_dir, save_name)
     best_val_loss       = float('inf')
     epochs_no_improve   = 0

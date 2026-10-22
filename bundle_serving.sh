@@ -22,6 +22,8 @@ ARM_TAG="_cong"
 RUN_SEQ="tail_test0.16_tail_val0.1${ARM_TAG}"      # sequence models carry a validation tag
 RUN_TREE="tail_test0.16${ARM_TAG}"                 # tree models do not
 MODELS="xgboost lightgbm transformer lstm mstnn archformer_skip"
+# The run dirs are copied whole, so the per-seed files an ensemble needs ride along
+# with the single weight -- nothing extra to enumerate here.
 
 PATHS=()
 for z in dom bge; do
