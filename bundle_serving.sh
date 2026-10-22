@@ -43,6 +43,17 @@ tar -czf "$BUNDLE" "${PATHS[@]}"
 
 echo "Bundle: $BUNDLE  ($(du -h "$BUNDLE" | cut -f1))"
 
+# Upload if gh is here, otherwise stop and say where to drop the file. The cluster nodes have
+# no gh and no sudo to install one, and the bundle is already written by this point -- exiting
+# with "command not found" made a finished job look like a failed one.
+if ! command -v gh >/dev/null 2>&1; then
+    echo
+    echo "gh not installed — bundle is built, upload it by hand:"
+    echo "  https://github.com/Stridery/pjm_load/releases/tag/$TAG  ->  Edit release  ->  drop"
+    echo "  $(pwd)/$BUNDLE"
+    exit 0
+fi
+
 # Create the release if it does not exist, then overwrite the asset.
 gh release view "$TAG" >/dev/null 2>&1 || \
     gh release create "$TAG" --title "Serving artifacts (latest)" \
