@@ -4,7 +4,7 @@ import joblib
 import lightgbm as lgb
 from tqdm import tqdm
 
-from src.models._utils import _make_run_dir
+from src.models._utils import _make_run_dir, booster_matrix
 from src.models._eval_utils import EvalUtils
 from src.config import TREE_FEATURE_CONFIG, LGBM_PARAMS
 
@@ -42,7 +42,10 @@ def train(X_train, y_train, params=None, feature_cfg=None):
 def predict(model_path, X):
     """Load saved models and return predictions (N, 24)."""
     models = joblib.load(model_path)
-    return np.array([m.predict(X) for m in models]).T
+    # Hoisted: inside the comprehension the frame would be converted once per booster, which
+    # is 24 conversions of the same 3750 columns for one day's forecast.
+    Xb = booster_matrix(X, models)
+    return np.array([m.predict(Xb) for m in models]).T
 
 
 # ---------------------------------------------------------------------------

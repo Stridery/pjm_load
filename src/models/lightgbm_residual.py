@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from src.models._eval_utils import EvalUtils
 from src.models._residual import assert_baseline_available, tree_baseline, print_metrics
-from src.models._utils import _make_run_dir
+from src.models._utils import _make_run_dir, booster_matrix
 from src.config import TREE_FEATURE_CONFIG, LGBM_RESIDUAL_PARAMS
 
 NAME = 'LGBM_RESIDUAL'
@@ -67,7 +67,10 @@ def predict(model_path, X):
     else:
         models, mode, lookback = bundle['models'], bundle['baseline'], bundle['lookback']
 
-    residual = np.array([m.predict(X) for m in models]).T          # (N, 24)
+    # tree_baseline still reads the FRAME: it looks the lookback window up by column name.
+    # Only the boosters get the positional array.
+    Xb = booster_matrix(X, models)
+    residual = np.array([m.predict(Xb) for m in models]).T          # (N, 24)
     return residual + tree_baseline(X, mode, lookback)
 
 
