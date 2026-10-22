@@ -898,11 +898,56 @@ ARCHFORMER_HP_PARAMS = {
 # RECIPE: hp's, unchanged. The old skip carried its own (lr 3e-4, dropout 0.15,
 # static_dropout 0.3) which was reasoned rather than measured, and it was never re-run after
 # hp's recipe was confirmed over 5 seeds. One variable at a time: this changes the wiring.
-ARCHFORMER_SKIP_PARAMS = {
-    **ARCHFORMER_PARAMS,
-    **_ARCHFORMER_TUNED,
-    'n_seq_features': N_SEQ_FEATURES,
+# ARCHITECTURE: the grid's optimum for THIS zone and THIS target mode, not the author's
+# 64 / 4 heads / 2+2 / lambda 0.1. scripts/grid_archformer.py swept d_model x num_heads x
+# layers x lambda_cons, 64 cells per wiring x 5 seeds, and scored each cell as the 5-seed
+# ENSEMBLE -- which is what the site serves, so the grid optimises the thing being shipped.
+# The author's configuration rode along as a 65th reference cell (num_heads=4 is not in the
+# grid) so the optimum could be read against the scoreboard. Selected on VALIDATION ens5
+# MAPE; the test column is reported only to show what the selection bought:
+#
+#   zone mode      grid optimum (by val)      val    test   | reference (64/4/2/0.1)  test
+#   dom  residual  d128 h32 L1 lam0.0        2.869  2.946   |                        2.988
+#   dom  direct    d128 h16 L2 lam0.0        3.123  3.731   |                        3.760
+#   bge  residual  d128 h16 L1 lam0.0        4.565  4.372   |                        4.442
+#   bge  direct    d128 h32 L1 lam0.05       4.506  4.852   |                        5.069
+#
+# Three of the four gains (0.03-0.07 pp) are inside the seed sd of 0.115 pp; only bge direct
+# moves clearly (0.217 pp). The reason to ship the optimum anyway is not the margin -- it is
+# that "grid-searched over 64 cells x 5 seeds" is a claim the scoreboard can stand behind and
+# "the author's defaults" is not. The cells disagree across zones and modes, so the cell is
+# chosen per (zone, mode) rather than averaged into one compromise.
+#
+# SELECTED ON VALIDATION, deliberately. by_test would have picked d128/h64/L1/lam0.1 on dom
+# residual (test 2.910) -- 0.036 pp better on the test set and chosen using it, which is the
+# number that would not survive a live window. results/{zone}/_tuning/archgrid_*/best.json
+# carries both selections.
+_SKIP_GRID_BEST = {
+    ('dom', 'direct'):   {'d_model': 128, 'num_heads': 16, 'layers': 2, 'lambda_cons': 0.0},
+    ('dom', 'residual'): {'d_model': 128, 'num_heads': 32, 'layers': 1, 'lambda_cons': 0.0},
+    ('bge', 'direct'):   {'d_model': 128, 'num_heads': 32, 'layers': 1, 'lambda_cons': 0.05},
+    ('bge', 'residual'): {'d_model': 128, 'num_heads': 16, 'layers': 1, 'lambda_cons': 0.0},
 }
+
+
+def archformer_skip_params(mode='direct'):
+    """skip's parameters for one target mode, with this zone's grid cell applied.
+
+    A zone the grid has not covered (rt_price, joint) falls back to the reference cell, so
+    adding a target does not silently inherit dom's architecture. `layers` sets the encoder
+    and the decoder together, exactly as scripts/grid_archformer.py's params_for does -- the
+    grid never varied them independently, so neither does this.
+    """
+    p = {**ARCHFORMER_PARAMS, **_ARCHFORMER_TUNED, 'n_seq_features': N_SEQ_FEATURES}
+    cell = _SKIP_GRID_BEST.get((DATASET, mode))
+    if cell is not None:
+        p.update({'d_model': cell['d_model'], 'num_heads': cell['num_heads'],
+                  'num_encoder_layers': cell['layers'], 'num_decoder_layers': cell['layers'],
+                  'lambda_cons': cell['lambda_cons']})
+    return p
+
+
+ARCHFORMER_SKIP_PARAMS = archformer_skip_params('direct')
 
 ARCHFORMER_RESIDUAL_PARAMS = {
     **ARCHFORMER_PARAMS,
@@ -914,8 +959,10 @@ ARCHFORMER_HP_RESIDUAL_PARAMS = {
     'baseline': 'hourly',
 }
 
+# NOT {**ARCHFORMER_SKIP_PARAMS, ...}: the two modes get different grid cells, so the
+# residual variant resolves its own rather than inheriting direct's.
 ARCHFORMER_SKIP_RESIDUAL_PARAMS = {
-    **ARCHFORMER_SKIP_PARAMS,
+    **archformer_skip_params('residual'),
     'baseline': 'hourly',
 }
 

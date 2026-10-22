@@ -125,7 +125,11 @@ def main():
         print(f"{'=' * 96}\nMODE {mode.upper()}\n{'=' * 96}", flush=True)
         rows = []
         for vname in args.variant:
-            params = dict(VARIANTS[vname])
+            # skip's architecture is the grid's optimum for this (zone, mode), so its
+            # parameters have to be resolved INSIDE the mode loop -- VARIANTS holds one dict
+            # per variant and reusing it would benchmark the residual mode on direct's cell.
+            params = (cfg.archformer_skip_params(mode) if vname == 'archformer_skip'
+                      else dict(VARIANTS[vname]))
             epochs = args.epochs or params['epochs']
             preds, mets = [], []
             for sd in seeds:
