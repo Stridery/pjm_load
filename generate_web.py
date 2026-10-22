@@ -62,7 +62,12 @@ for _hue, (_fam, _label) in enumerate([
     ('transformer',     'Transformer'),
     ('lstm',            'LSTM'),
     ('mstnn',           'MSTNN'),
-    ('archformer_skip', 'skip'),
+    ('archformer_skip', 'archformer_skip'),
+    # The 5-seed mean, carried beside its own single-seed member so the page shows what the
+    # extra weights bought rather than asserting it. Its own family bucket, not a third line
+    # style on skip's: dashed is already the direct/residual channel, and a reader should be
+    # able to switch the comparison off in one click.
+    ('archformer_skip_ens5', 'archformer_skip_ens5'),
 ]):
     # residual first in each pair: dict order is the default legend and table order, and it is
     # the better of the two everywhere.
@@ -72,7 +77,11 @@ for _hue, (_fam, _label) in enumerate([
 
 # The 6 Family-filter buckets, in reading order, with display labels.
 FAMILY_ORDER = [('xgboost', 'XGBoost'), ('lightgbm', 'LightGBM'), ('transformer', 'Transformer'),
-                ('lstm', 'LSTM'), ('mstnn', 'MSTNN'), ('archformer_skip', 'skip')]
+                ('lstm', 'LSTM'), ('mstnn', 'MSTNN'),
+                # The chips are a row of buttons, so the family labels are abbreviated where
+                # the legend and the table spell the model out in full.
+                ('archformer_skip', 'archformer'),
+                ('archformer_skip_ens5', 'archformer ens5')]
 
 # The dataviz reference palette, in its published slot order — that order IS the
 # colourblind-safety mechanism (worst adjacent CVD ΔE 24.2 light / 10.3 dark), not decoration.
@@ -248,6 +257,31 @@ header p { margin:0; color:var(--muted); font-size:13px; }
 .seg button + button { border-left:1px solid var(--border); }
 .seg button:hover { background:var(--hover); color:var(--ink); }
 .seg button[aria-pressed="true"] { background:var(--ink); color:var(--surface); font-weight:600; }
+
+/* Calendar date picker. The scored window is ~90 days, which is far past what a row of
+   segmented buttons can hold, and the days inside it are not contiguous -- a model with no
+   metered value yet, or a gap in the feed, leaves holes. So the control is a month grid where
+   only days that actually have data are selectable; the rest are visible but inert, which is
+   what tells a reader "that day is missing" rather than silently omitting it. */
+.cal { border:1px solid var(--border); border-radius:7px; background:var(--surface);
+       padding:8px 10px 10px; display:inline-block; }
+.cal-head { display:flex; align-items:center; justify-content:space-between; gap:10px;
+            margin-bottom:6px; }
+.cal-title { font-weight:600; font-size:13px; color:var(--ink); }
+.cal-nav { appearance:none; border:1px solid var(--border); background:var(--surface);
+           color:var(--ink-2); border-radius:5px; width:24px; height:24px; cursor:pointer;
+           line-height:1; font-size:13px; }
+.cal-nav:hover:not(:disabled) { background:var(--hover); color:var(--ink); }
+.cal-nav:disabled { opacity:.3; cursor:default; }
+.cal-grid { display:grid; grid-template-columns:repeat(7, 28px); gap:2px; }
+.cal-dow { font-size:10px; color:var(--ink-3, var(--ink-2)); text-align:center;
+           padding-bottom:2px; }
+.cal-day { appearance:none; border:0; background:transparent; color:var(--ink-2);
+           height:26px; border-radius:5px; font-size:12px; cursor:pointer; padding:0; }
+.cal-day:hover:not(:disabled) { background:var(--hover); color:var(--ink); }
+.cal-day:disabled { color:var(--border); cursor:default; }
+.cal-day[aria-pressed="true"] { background:var(--ink); color:var(--surface); font-weight:600; }
+.cal-day.blank { visibility:hidden; }
 .spacer { flex:1; }
 
 /* Filter chips — narrow which models are eligible to appear (class / family). Separate
@@ -398,7 +432,7 @@ td .dir { color:var(--muted); font-size:11px; }
     </div>
 
     <div class="controls" id="r-controls" style="margin-top:18px">
-      <div class="field"><label>Day</label><div class="seg" id="r-date"></div></div>
+      <div class="field"><label>Day</label><div id="r-date"></div></div>
     </div>
     <div class="layout">
       <div class="stack" id="r-charts">
@@ -525,6 +559,58 @@ function renderZoneTabs() {
     };
     el.appendChild(b);
   }
+}
+
+/* A month grid over `available` (ISO date strings). Only those days are clickable; every
+   other cell renders but is disabled, so a gap in the data reads as a gap rather than as a
+   date that never existed. The month shown follows the selection, and the arrows stop at the
+   first and last month that contain data -- paging into empty months is a dead end. */
+function calendar(el, available, current, pick) {
+  const have = new Set(available);
+  if (!available.length) { el.innerHTML = ''; return; }
+  const first = available[0], last = available[available.length - 1];
+  const mk = s => ({ y: +s.slice(0, 4), m: +s.slice(5, 7) });
+  const idx = o => o.y * 12 + (o.m - 1);
+  const lo = idx(mk(first)), hi = idx(mk(last));
+  // `current` may be absent from `available` on the first render; fall back to the newest day.
+  const cur = have.has(current) ? current : last;
+  let shown = idx(mk(cur));
+
+  const draw = () => {
+    const y = Math.floor(shown / 12), m = shown % 12;          // m is 0-based here
+    const pad = new Date(Date.UTC(y, m, 1)).getUTCDay();       // 0 = Sunday
+    const ndays = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+    const title = new Date(Date.UTC(y, m, 1))
+      .toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+    const iso = d => `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+
+    let cells = '';
+    for (let i = 0; i < pad; i++) cells += '<button class="cal-day blank" disabled></button>';
+    for (let d = 1; d <= ndays; d++) {
+      const s = iso(d), on = have.has(s);
+      cells += `<button class="cal-day" data-d="${s}"${on ? '' : ' disabled'}`
+             + ` aria-pressed="${s === cur}">${d}</button>`;
+    }
+    el.innerHTML =
+      `<div class="cal">
+         <div class="cal-head">
+           <button class="cal-nav" data-step="-1"${shown <= lo ? ' disabled' : ''}>&lsaquo;</button>
+           <span class="cal-title">${title}</span>
+           <button class="cal-nav" data-step="1"${shown >= hi ? ' disabled' : ''}>&rsaquo;</button>
+         </div>
+         <div class="cal-grid">
+           ${['S', 'M', 'T', 'W', 'T', 'F', 'S'].map(d => `<div class="cal-dow">${d}</div>`).join('')}
+           ${cells}
+         </div>
+       </div>`;
+    el.querySelectorAll('.cal-nav').forEach(b => b.onclick = () => {
+      shown += +b.dataset.step; draw();
+    });
+    el.querySelectorAll('.cal-day[data-d]').forEach(b => {
+      if (!b.disabled) b.onclick = () => pick(b.dataset.d);
+    });
+  };
+  draw();
 }
 
 function seg(el, items, current, pick) {
@@ -951,7 +1037,7 @@ function renderRT(paintOnly) {
   renderChips($('r-chips'), R.filt, renderRT);
   renderScoreboard();
 
-  seg($('r-date'), s.map(d => [d, dayLabel(d)]), R.date, v => { R.date = v; renderRT(); });
+  calendar($('r-date'), s, R.date, v => { R.date = v; renderRT(); });
   renderRLegend();
   $('r-legend-note').textContent = "Ranked by this day's MAPE. Selection is shared with the scoreboard.";
 

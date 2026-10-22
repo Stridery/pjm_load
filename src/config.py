@@ -373,6 +373,27 @@ UPDATE_YEARS = [2025, 2026]   # metered, preliminary, observed weather, weather-
 SERVING_MODELS = ('xgboost', 'lightgbm', 'transformer', 'lstm', 'mstnn', 'archformer_skip')
 SERVING_ARM = '_cong'          # the arm the daily job runs; MATRIX_TAG must agree
 
+# Names here are ALSO served as a K-seed ensemble, under `{name}_ens{K}`, alongside the single
+# weight. The single one stays as the control: it is the comparison that says whether the
+# ensemble earned its extra weights, and it costs one column.
+#
+# Only GARCHFormer, because only GARCHFormer has the seed spread to make it worth anything.
+# Measured on the 89-day live window, which selected neither the seeds nor the architecture:
+#
+#            deployed single seed    5-seed ensemble     gain
+#     dom            2.608                2.570         0.038
+#     bge            4.258                4.121         0.138
+#
+# bge gains 3.6x what dom does, and the seed spread there is 3x wider (test-set range 0.38
+# against 0.12) -- the ensemble cancels the part of the error that differs between seeds, so
+# the more there is to cancel the more it returns. transformer's spread is sd 0.029; averaging
+# five of those would buy almost nothing for five times the weights.
+#
+# The gain is not a better pick. On bge the ensemble also beats the best member of its own
+# five (4.226) by 0.105, and the deployed seed -- chosen on the test set -- came third on the
+# live window, so picking is not reliable either.
+SERVING_ENSEMBLES = {'archformer_skip': 5}
+
 # --- Training seed ---------------------------------------------------------------------------
 # src/models/_seq_trainer.py never seeded anything, so every weight file under models/ is one
 # undocumented draw and no run could be reproduced. On ARCHFormer that draw is worth 0.115 pp

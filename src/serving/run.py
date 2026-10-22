@@ -20,7 +20,37 @@ from src.serving.fetch import fetch_recent
 from src.serving.predict import forecast_day, available_models
 
 HORIZON_DAYS = 2      # forecast reaches this many days past the last complete day of data
-WINDOW_DAYS  = 8      # how many recent days to (re)forecast each run — self-seeds the store
+
+# How many recent days to (re)forecast each run. This is the SCORED window: the Real-Time
+# panel's metrics are computed over it, so its length is what decides whether the page's
+# ranking is a measurement or a coin flip. Measured on the dom/bge test sets, the gap between
+# two adjacent models over a sliding 7-day window has sd 0.48-0.60 pp against a true gap of
+# 0.11 -- at eight days the order on the page was mostly noise. Ninety brings that sd to about
+# 0.17.
+#
+# THE CEILING. Scoring is only honest on days the models never fitted. Test-set days qualify:
+# they were held out, and the offline scoreboard scores exactly them. Validation days do not
+# (early stopping and checkpoint selection used them) and training days certainly do not. The
+# window is measured back from TODAY while the splits sit at fixed dates, so the margin grows
+# on its own: as of 2026-10-21 the validation blocks end 384 days back on dom and 405 on bge.
+# MAX_WINDOW_DAYS is well inside that and asserted below, so raising WINDOW_DAYS past the
+# point where it would start scoring fitted days fails loudly instead of quietly flattering
+# every model.
+WINDOW_DAYS     = 90
+MAX_WINDOW_DAYS = 300
+assert WINDOW_DAYS <= MAX_WINDOW_DAYS, (
+    f"WINDOW_DAYS={WINDOW_DAYS} would reach toward the validation block; re-check the split "
+    f"dates before raising MAX_WINDOW_DAYS.")
+
+# Retained in the store. Larger than WINDOW_DAYS on purpose: the window is re-forecast every
+# run, and everything older than it is kept as it was, so the scored history grows by a day a
+# day instead of being capped at the re-forecast depth.
+KEEP_DAYS = 150
+
+# Tail handed back by fetch_recent. Needs the window PLUS the 21-day macro lookback and a
+# margin for the heat-streak features, or the earliest target day in the window has no
+# features to build from.
+FETCH_DAYS = WINDOW_DAYS + 30
 
 # Only the residual models are served. The direct ones lost to their residual twins on every
 # WHAT IS SERVED, AND WHY THERE IS NO ARM SUFFIX ANY MORE
@@ -81,23 +111,30 @@ def _serving_models(cfg):
     are reported and skipped rather than raised -- one untrained model should cost one line on
     the chart, not the whole daily run.
     """
+    from src.serving.predict import _seed_weights
     have = set(available_models())
     want, missing = [], []
     for m in cfg.SERVING_MODELS:
         for name in (m, f'{m}_residual'):
             (want if name in have else missing).append(name)
+        k = cfg.SERVING_ENSEMBLES.get(m)
+        if not k:
+            continue
+        # The ensemble needs K per-seed files of its own; the single weight does not cover it.
+        for name, base in ((f'{m}_ens{k}', m), (f'{m}_ens{k}_residual', f'{m}_residual')):
+            (want if len(_seed_weights(cfg.MODEL_ROOT, base)) >= k else missing).append(name)
     if missing:
         print(f"  no weights, skipped: {', '.join(missing)}")
     return want
 
 
-def run_zone(zone, keep_days=10):
+def run_zone(zone, keep_days=KEEP_DAYS):
     import src.config as cfg
     if cfg.MATRIX_TAG != cfg.SERVING_ARM:
         raise SystemExit(f"MATRIX_TAG is {cfg.MATRIX_TAG!r} but SERVING_ARM is "
                          f"{cfg.SERVING_ARM!r}. The daily job runs one arm; set "
                          f"PJM_CONGESTION/PJM_LMP to match, or change SERVING_ARM.")
-    frame, metered = fetch_recent(zone)   # metered = best-available (incl. unverified), for scoring
+    frame, metered = fetch_recent(zone, days=FETCH_DAYS)   # metered = best-available (incl. unverified), for scoring
     models = _serving_models(cfg)
     if not models:
         raise SystemExit(f"No serving weights under models/{zone}/ for arm "
@@ -143,7 +180,7 @@ def run_zone(zone, keep_days=10):
     return table.update(zone, fresh, keep_days=keep_days)
 
 
-def main(keep_days=10):
+def main(keep_days=KEEP_DAYS):
     # One zone AND one arm per process: config (MATRIX_DIR / MODEL_ROOT / FORECAST_PATH /
     # MATRIX_TAG) is fixed from PJM_DATASET and PJM_CONGESTION at import, so the workflow
     # invokes this once per (zone, arm) with both set.
