@@ -918,6 +918,16 @@ ARCHFORMER_HP_PARAMS = {
 # "the author's defaults" is not. The cells disagree across zones and modes, so the cell is
 # chosen per (zone, mode) rather than averaged into one compromise.
 #
+# RETRAINED AND RECONCILED (2026-10-22). The grid measured these cells with
+# scripts/tune_archformer.py's loop; the shipped weights come from src/models/_seq_trainer.
+# Those are two training paths, so the grid's numbers would mean nothing here if they
+# disagreed. Retrained on seeds 42-46 against the grid's seeds 0-4, 5-seed ensemble test MAPE:
+#
+#   dom residual  grid 2.946  shipped 2.982     bge residual  grid 4.372  shipped 4.362
+#   dom direct    grid 3.731  shipped 3.750     bge direct    grid 4.852  shipped 4.878
+#
+# Inside 0.04 pp everywhere, against a seed sd of 0.08-0.19. The paths agree.
+#
 # SELECTED ON VALIDATION, deliberately. by_test would have picked d128/h64/L1/lam0.1 on dom
 # residual (test 2.910) -- 0.036 pp better on the test set and chosen using it, which is the
 # number that would not survive a live window. results/{zone}/_tuning/archgrid_*/best.json
